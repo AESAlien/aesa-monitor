@@ -1,7 +1,8 @@
 """분석 탭 — 녹화와 처리부 로그로 "무슨 일이 있었나?"를 본다.
 
 - 통계 요약: 빔 스케줄, 추적, 통신, 처리부 로그 항목별 값·기준·판정. 항목을 누르면 분포를 그린다.
-- 트랙별 요약: 시작, 수명, 미탐, 빔-탐지 차이.
+  빔 점유율·탐색 프레임별 점유율 항목은 분포 대신 프레임별 점유율 꺾은선을 그린다.
+- 트랙별 요약: 시작, 수명, 미탐, 빔-탐지 차이 평균.
 - 처리부 이벤트 타임라인: 메시지 로그의 운용·자세·요청 거부·경고를 처리부 시각에 놓는다.
   이벤트를 누르면 녹화 재생 위치를 그 시각 직전으로 옮긴다.
 """
@@ -19,10 +20,12 @@ from aesa_monitor.io.processor_log import (
 )
 from aesa_monitor.io.session import Session
 from aesa_monitor.ui.style import (
-    BACKGROUND, BAD, FONT_BODY, FONT_SMALL, GRID_LINE, LEVEL_COLORS, LEVEL_NAMES, MUTED, OK, PANEL, TEXT, WARN,
-    format_time,
+    BACKGROUND, BAD, CHART_COLOR, FONT_BODY, FONT_SMALL, GRID_LINE, LEVEL_COLORS, LEVEL_NAMES, MUTED, OK, PANEL, TEXT,
+    WARN, format_time,
 )
-from aesa_monitor.ui.widgets import LabelPlacer, Table, canvas_size, empty_message, histogram, nice_ticks, section_title
+from aesa_monitor.ui.widgets import (
+    LabelPlacer, Table, canvas_size, empty_message, frame_share_chart, histogram, nice_ticks, section_title,
+)
 
 TIMELINE_LANES = (CATEGORY_OPERATION, CATEGORY_ATTITUDE, CATEGORY_REJECTED, CATEGORY_PROBLEM, CATEGORY_LIFECYCLE)
 EVENT_FILTERS = {
@@ -101,12 +104,13 @@ class AnalysisTab:
             ("level", "판정", 60, tk.CENTER),
         ), height=8, on_select=self._on_stat_selected)
         self._stats.tree.tag_configure("group", font="AesaBold", background=PANEL)
-        self._stats.frame.pack(fill=tk.BOTH, expand=True)
         self._note = tk.Label(left, text="", font=FONT_SMALL, background=BACKGROUND, foreground=MUTED, anchor="w",
                               justify=tk.LEFT)
-        self._note.pack(fill=tk.X)
         self._histogram = tk.Canvas(left, background=BACKGROUND, highlightthickness=0, height=140)
-        self._histogram.pack(fill=tk.X)
+        # 창이 낮을 때 그래프가 잘리지 않고 표가 줄어들도록 그래프와 설명을 먼저 아래에 붙인다.
+        self._histogram.pack(side=tk.BOTTOM, fill=tk.X)
+        self._note.pack(side=tk.BOTTOM, fill=tk.X)
+        self._stats.frame.pack(fill=tk.BOTH, expand=True)
         self._histogram.bind("<Configure>", lambda _event: self._draw_histogram())
         self._selected_stat: Optional[int] = None
 
@@ -117,7 +121,7 @@ class AnalysisTab:
                       "행을 두 번 누르면 재생 위치를 그 트랙의 마지막 빔 직전으로 옮깁니다.")
         self._tracks = Table(right, (
             ("id", "ID", 50, tk.CENTER), ("start", "시작", 80, tk.E), ("life", "수명", 70, tk.E),
-            ("beams", "추적 빔", 70, tk.E), ("misses", "미탐/최대연속", 110, tk.E), ("rms", "RMS", 70, tk.E),
+            ("beams", "추적 빔", 70, tk.E), ("misses", "미탐/최대연속", 110, tk.E), ("difference", "차이 평균", 80, tk.E),
             ("state", "상태", 80, tk.CENTER),
         ), height=12, on_double=self._on_track_double)
         self._tracks.frame.pack(fill=tk.BOTH, expand=True)
@@ -202,7 +206,7 @@ class AnalysisTab:
                 rows.append((str(index), (
                     f"#{track.track_id}", f"{track.first_ms / 1000:.1f} s", f"{track.lifetime_s:.0f} s",
                     track.tracking_beams, f"{track.misses} / {track.max_consecutive_misses}",
-                    "-" if track.rms_angle_error_m is None else f"{track.rms_angle_error_m:.1f} m", state,
+                    "-" if track.mean_angle_error_m is None else f"{track.mean_angle_error_m:.1f} m", state,
                 ), tag))
         self._tracks.set_rows(rows)
 
@@ -222,6 +226,9 @@ class AnalysisTab:
             empty_message(canvas, "통계 항목을 누르면 값의 분포를 여기에 그립니다")
             return
         item = report.items[self._selected_stat]
+        if item.chart == "frames":
+            frame_share_chart(canvas, report.frames, f"탐색 프레임별 점유율 ({len(report.frames)}개)")
+            return
         if not item.samples:
             empty_message(canvas, "이 항목은 분포가 없습니다")
             return
@@ -232,7 +239,7 @@ class AnalysisTab:
             except ValueError:
                 reference = None
         histogram(canvas, item.samples, item.unit, reference,
-                  LEVEL_COLORS.get(item.level, "#378add") if item.level != "idle" else "#378add",
+                  LEVEL_COLORS.get(item.level, CHART_COLOR) if item.level != "idle" else CHART_COLOR,
                   f"{item.name} 분포 ({len(item.samples)}개)")
 
     def _on_track_double(self, iid: str) -> None:

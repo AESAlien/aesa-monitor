@@ -111,7 +111,7 @@ def beam_verdict(state: MonitorState, parameters: TrackingParameters) -> Verdict
     gaps = gap_check(state)
     problems = []
     if sweep.level in (WARN, BAD):
-        problems.append(f"탐색 한 바퀴 {sweep.value / 1000:.2f} s (기대 {sweep.expected / 1000:.2f} s)")
+        problems.append(f"탐색 프레임 시간 {sweep.value / 1000:.2f} s (기대 {sweep.expected / 1000:.2f} s)")
     if period.level in (WARN, BAD):
         problems.append(f"추적 주기 오차 최대 {period.value:.0f} ms")
     if confirmation.level in (WARN, BAD):
@@ -124,7 +124,7 @@ def beam_verdict(state: MonitorState, parameters: TrackingParameters) -> Verdict
 
     parts = []
     if sweep.value is not None:
-        parts.append(f"탐색 한 바퀴 {sweep.value / 1000:.2f} s")
+        parts.append(f"탐색 프레임 시간 {sweep.value / 1000:.2f} s")
     if period.value is not None:
         parts.append(f"추적 주기 오차 {period.value:.0f} ms")
     parts.append("빠진 빔 없음")

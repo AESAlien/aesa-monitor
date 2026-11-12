@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from aesa_monitor.core.config import TrackingParameters
 from aesa_monitor.core.events import ConnectionChanged, Event
+from aesa_monitor.core.frames import FrameCounter, FrameShare
 from aesa_monitor.core.geometry import wrap_degrees
 from aesa_monitor.core.protocol import Beam, BeamType, Detection, TrackList
 from aesa_monitor.core.state import BEAM_SLOT_MS, TIME_RESET_THRESHOLD_MS
@@ -52,6 +53,7 @@ class StatItem:
     samples: List[float] = field(default_factory=list)
     unit: str = ""
     note: str = ""
+    chart: str = ""   # "frames"면 분석 탭이 분포 대신 탐색 프레임별 점유율을 그린다
 
 
 @dataclass
@@ -64,7 +66,7 @@ class TrackStat:
     tracking_beams: int
     misses: int
     max_consecutive_misses: int
-    rms_angle_error_m: Optional[float]
+    mean_angle_error_m: Optional[float]
     ended: bool
 
     @property
@@ -79,6 +81,7 @@ class StatsReport:
     span_ms: Tuple[int, int]
     items: List[StatItem]
     tracks: List[TrackStat]
+    frames: List[FrameShare] = field(default_factory=list)   # 다 돈 탐색 프레임
 
 
 # 입력 변환
@@ -180,8 +183,8 @@ def _summary(values: Sequence[float], unit: str, digits: int = 0) -> str:
             f"{len(values)}개)")
 
 
-def _rms(values: Sequence[float]) -> Optional[float]:
-    return math.sqrt(sum(value * value for value in values) / len(values)) if values else None
+def _mean(values: Sequence[float]) -> Optional[float]:
+    return sum(values) / len(values) if values else None
 
 
 def _by_segment(records: Sequence[BeamRecord]) -> Dict[int, List[BeamRecord]]:
@@ -252,7 +255,7 @@ def _track_stats(records: Sequence[BeamRecord], end_ms: int, interval_ms: int,
         has_confirmation = any(item.beam_type == BeamType.CONFIRMATION for item in items)
         result.append(TrackStat(track_id, items[0].time_ms, last, has_confirmation, bool(tracking),
                                 len(tracking), misses,
-                                longest, _rms(errors), ended))
+                                longest, _mean(errors), ended))
     return result
 
 
@@ -282,7 +285,24 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
     shares = {beam_type: counts[beam_type] / total for beam_type in BeamType}
     items.append(StatItem(group, "빔 점유율", " / ".join(
         f"{name} {shares[beam_type] * 100:.1f}%" for beam_type, name in
-        ((BeamType.SEARCH, "탐색"), (BeamType.CONFIRMATION, "확인"), (BeamType.TRACKING, "추적")))))
+        ((BeamType.SEARCH, "탐색"), (BeamType.CONFIRMATION, "확인"), (BeamType.TRACKING, "추적"))),
+        chart="frames", note="전체 기록 기준. 누르면 탐색 프레임별 점유율 변화를 그린다"))
+
+    counter = FrameCounter()
+    for segment in _by_segment(records).values():
+        for record in segment:
+            counter.add(record.beam_type, record.beam_id, record.time_ms)
+        counter.break_frame()
+    frames = counter.complete_frames()
+    if frames:
+        search_shares = [frame.share(BeamType.SEARCH) * 100 for frame in frames]
+        frame_value = (f"{len(frames)}개 · 탐색 평균 {sum(search_shares) / len(search_shares):.1f}% "
+                       f"(최소 {min(search_shares):.1f}, 최대 {max(search_shares):.1f})")
+    else:
+        frame_value = "완료된 프레임 없음"
+    items.append(StatItem(group, "탐색 프레임별 점유율", frame_value, chart="frames",
+                          note="탐색 프레임 = 탐색 격자를 처음부터 끝까지 한 번 다 도는 구간. "
+                               "녹화 시작·끝에 걸려 잘린 프레임은 뺀다"))
 
     intervals: List[float] = []
     for segment in _by_segment(records).values():
@@ -310,7 +330,7 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
     if sweeps and expected_sweep:
         mean = sum(sweeps) / len(sweeps)
         level = _grade(abs(mean - expected_sweep) / expected_sweep, SWEEP_TOLERANCE)
-    items.append(StatItem(group, "탐색 한 바퀴", _summary(sweeps, " ms"),
+    items.append(StatItem(group, "탐색 프레임 시간", _summary(sweeps, " ms"),
                           f"{expected_sweep:.0f} ms" if expected_sweep else "",
                           level, sweeps, "ms", note=f"기준 = 격자 {cells}칸 × {BEAM_SLOT_MS} ms ÷ 탐색 점유율"))
 
@@ -367,12 +387,13 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
               if record.angle_error_m is not None and record.beam_type == BeamType.TRACKING]
     if has_direction:
         gate = math.sqrt(parameters.position_nds_threshold) * parameters.measurement_standard_deviation_m
-        rms = _rms(errors)
+        mean = _mean(errors)
         items.append(StatItem(group, "빔 축-탐지 차이 (추적 빔)",
-                              "-" if rms is None else f"RMS {rms:.1f} m (최대 {max(errors):.1f} m)",
+                              "-" if mean is None else f"평균 {mean:.1f} m (최대 {max(errors):.1f} m)",
                               f"게이트 하한 약 {gate:.0f} m",
-                              IDLE if rms is None else _grade(rms / gate, (0.8, 1.5)), errors, "m",
-                              note="예측 방향과 연관 탐지 사이 수직 거리(모니터 추정)"))
+                              IDLE if mean is None else _grade(mean / gate, (0.8, 1.5)), errors, "m",
+                              note="예측 방향(추정치)과 연관 탐지(측정치) 사이 수직 거리(모니터 추정). "
+                                   "둘 다 오차가 있으므로 참값 대비 오차(RMSE)가 아니다"))
     multi = sum(1 for record in records if record.plots and len(record.plots) >= 2)
     items.append(StatItem(group, "플롯 2개 이상인 빔", f"{multi}개", note="한 빔에 표적이 둘 이상 들어온 경우"))
 
@@ -405,4 +426,4 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
                               note="운용 OFF 중 수신 또는 이미 설정됨"))
         items.append(StatItem(group, "경고·오류", f"{counted[CATEGORY_PROBLEM]}건", "",
                               BAD if counted[CATEGORY_PROBLEM] else OK))
-    return StatsReport(source, len(records), (start, end), items, tracks)
+    return StatsReport(source, len(records), (start, end), items, tracks, frames)

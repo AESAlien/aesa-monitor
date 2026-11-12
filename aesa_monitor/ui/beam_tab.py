@@ -19,7 +19,9 @@ from aesa_monitor.ui.style import (
     BACKGROUND, BEAM_COLORS, BEAM_NAMES, FONT_SMALL, GRID_LINE, LEVEL_COLORS, MUTED, PANEL, TEXT,
     beam_color, beam_name, blend, format_time, track_color,
 )
-from aesa_monitor.ui.widgets import KpiCard, LabelPlacer, Table, VerdictBar, canvas_size, nice_ticks, section_title
+from aesa_monitor.ui.widgets import (
+    KpiCard, LabelPlacer, Table, VerdictBar, canvas_size, frame_share_chart, nice_ticks, section_title,
+)
 
 SEARCH_AFTERGLOW_MS = {ViewMode.FLOW: 500, ViewMode.DETAIL: 150}
 REQUEST_AFTERGLOW_MS = {ViewMode.FLOW: 2000, ViewMode.DETAIL: 400}
@@ -29,9 +31,10 @@ COVERAGE_AZIMUTH = (-60.0, 60.0)
 COVERAGE_ELEVATION = (-10.0, 60.0)
 
 HELP_SWEEP = (
-    "탐색 격자의 같은 칸을 다시 방문하는 데 걸린 시간입니다.\n\n"
+    "탐색 프레임: 탐색 격자(189칸)를 처음부터 끝까지 한 번 다 도는 것입니다.\n"
+    "탐색 프레임 시간은 한 프레임에 걸린 시간으로, 같은 탐색 칸을 다시 방문하기까지의 간격으로 잽니다.\n\n"
     "기대값 = 격자 칸 수 × 10 ms ÷ 최근 5초 탐색 점유율.\n"
-    "확인·추적 빔이 끼어든 만큼 한 바퀴가 길어지므로 점유율로 보정합니다.\n"
+    "확인·추적 빔이 끼어든 만큼 프레임 시간이 길어지므로 점유율로 보정합니다.\n"
     "기대값과 10% 넘게 다르면 주의, 30% 넘게 다르면 이상입니다."
 )
 HELP_SHARE = "최근 5초 동안 나간 빔 중 탐색·확인·추적이 차지한 비율입니다. 추적 트랙이 늘면 탐색 비율이 줄어듭니다."
@@ -48,6 +51,12 @@ HELP_GAPS = (
     "처리부는 10 ms마다 빔을 하나씩 보냅니다. 최근 5초 동안 빔이 오지 않은 10 ms 칸 수입니다.\n\n"
     "처리부가 늦었거나, 처리부의 모니터 큐(1000개)가 넘쳐 복사본이 버려진 경우입니다.\n"
     "1~5칸은 주의, 6칸 이상은 이상입니다."
+)
+HELP_FRAMES = (
+    "탐색 프레임마다 나간 빔 중 탐색·확인·추적 빔의 비율입니다.\n\n"
+    "탐색 프레임은 탐색 격자를 처음(탐색 빔 0번)부터 끝까지 한 번 다 도는 구간이고, 사이에 끼어든 확인·추적 빔도 "
+    "그 프레임에 셉니다. 처음에는 탐색이 거의 100%이고, 추적 트랙이 늘수록 탐색 비율이 줄고 추적 비율이 늘어납니다.\n"
+    "모니터를 켠 뒤 처음 잘린 프레임과 처리부 재시작으로 끊긴 프레임은 그리지 않습니다. 맨 위 숫자는 마지막 프레임 값입니다."
 )
 HELP_MAP = (
     "처리부가 보낸 빔의 방위·고각(ENU, 북쪽 0°, 시계방향)입니다.\n\n"
@@ -74,7 +83,7 @@ class BeamTab:
 
         cards = tk.Frame(self.frame, background=BACKGROUND)
         cards.pack(fill=tk.X, pady=(8, 0))
-        self._sweep = KpiCard(cards, "탐색 한 바퀴", HELP_SWEEP)
+        self._sweep = KpiCard(cards, "탐색 프레임 시간", HELP_SWEEP)
         self._share = KpiCard(cards, "빔 점유율 (최근 5초)", HELP_SHARE)
         self._confirm = KpiCard(cards, "탐색 → 확인", HELP_CONFIRM)
         self._period = KpiCard(cards, "추적 주기 오차", HELP_PERIOD)
@@ -120,8 +129,11 @@ class BeamTab:
             ("id", "트랙", 60, tk.CENTER), ("type", "마지막 빔", 80, tk.CENTER),
             ("last", "송신 시각", 110, tk.E), ("interval", "직전 간격", 90, tk.E),
             ("deviation", "주기 차이", 90, tk.E), ("next", "다음 예정", 110, tk.E),
-        ), height=8)
+        ), height=5)
         self._schedule.frame.pack(fill=tk.BOTH, expand=True)
+        section_title(right, "탐색 프레임별 빔 점유율", HELP_FRAMES)
+        self._frames = tk.Canvas(right, background=BACKGROUND, highlightthickness=0, height=150)
+        self._frames.pack(fill=tk.BOTH, expand=True)
 
         self._timeline_title = section_title(self.frame, "빔 타임라인")
         self._timeline = tk.Canvas(self.frame, background=BACKGROUND, highlightthickness=0, height=110)
@@ -135,6 +147,7 @@ class BeamTab:
         self._draw_cards(state)
         self._draw_plane(state, mode)
         self._draw_schedule(state)
+        frame_share_chart(self._frames, state.frames.complete_frames())
         self._draw_timeline(state, mode)
 
     def _draw_cards(self, state: MonitorState) -> None:

@@ -53,7 +53,7 @@ class VerdictTest(unittest.TestCase):
         self.feed_search(0, 200)
         verdict = beam_verdict(self.state, PARAMETERS)
         self.assertEqual(verdict.level, OK, verdict.text)
-        self.assertIn("탐색 한 바퀴 0.04 s", verdict.text)
+        self.assertIn("탐색 프레임 시간 0.04 s", verdict.text)
 
     def test_missing_beams_are_reported(self):
         self.feed_search(0, 200, skip=(1000, 1010, 1020, 1030, 1040, 1050, 1060))

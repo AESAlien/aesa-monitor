@@ -1,7 +1,7 @@
 """수신한 메시지를 누적하고 화면에 필요한 값을 계산한다.
 
 모든 시간 계산은 처리부 시각(빔 송신 명령과 상태 메시지의 시각)을 기준으로 한다.
-그래야 처리부 속도를 바꿔도 점유율과 탐색 한 바퀴 시간이 같은 값으로 나온다.
+그래야 처리부 속도를 바꿔도 점유율과 탐색 프레임 시간이 같은 값으로 나온다.
 연결 유지 시간, 수신 속도처럼 모니터 쪽 시간이 필요한 값은 clock으로 잰다.
 실시간에서는 단조 시계, 녹화 재생에서는 재생 위치(녹화 시작 후 초)를 clock으로 쓴다.
 """
@@ -18,6 +18,7 @@ from aesa_monitor.core.events import (
     PEER_CONSOLE, PEER_NAMES, PEER_SIMULATOR, SOURCE_CAPTURE, SOURCE_COPY, ConnectionChanged, Event,
     PeerLinkChanged,
 )
+from aesa_monitor.core.frames import FrameCounter
 from aesa_monitor.core.geometry import wrap_degrees
 from aesa_monitor.core.protocol import (
     Beam, BeamType, Detection, MonitorStatus, OperatorControl, RadarAttitude, SimulatorAttitude, Track,
@@ -35,12 +36,14 @@ STATUS_TIMEOUT_SECONDS = 1.0
 DETAIL_VIEW_TIME_SCALE = 0.25
 # 처리부가 빔을 보내는 간격
 BEAM_SLOT_MS = 10
-# 확인 빔이 어느 탐색 탐지에서 나왔는지 찾을 때 보는 범위. 탐색 한 바퀴(약 1.9 s)보다 짧아야
-# 앞 바퀴의 탐지와 짝이 지어지지 않는다.
+# 확인 빔이 어느 탐색 탐지에서 나왔는지 찾을 때 보는 범위. 탐색 프레임 시간(약 1.9 s)보다 짧아야
+# 앞 프레임의 탐지와 짝이 지어지지 않는다.
 CONFIRMATION_SEARCH_WINDOW_MS = 1000
 CONFIRMATION_MATCH_DEG = 0.5
 EVENT_LOG_SIZE = 200
 GAP_HISTORY_SIZE = 2000
+# 보관할 탐색 프레임 수. 프레임 하나가 약 1.9 s이므로 1시간 남짓이다.
+FRAME_HISTORY_SIZE = 2000
 
 
 @dataclass
@@ -115,6 +118,8 @@ class MonitorState:
         # (확인 빔 시각, 탐색 탐지에서 확인 빔까지 걸린 시간)
         self.confirmation_delays: Deque[Tuple[int, int]] = deque(maxlen=200)
         self.processor_restarts = 0
+        # 탐색 프레임별 빔 종류 수
+        self.frames = FrameCounter(FRAME_HISTORY_SIZE)
 
     # 입력
 
@@ -216,6 +221,7 @@ class MonitorState:
         self.beam_gaps.clear()
         self._search_hits.clear()
         self.confirmation_delays.clear()
+        self.frames.clear()
 
     def _apply_beam(self, beam: Beam) -> None:
         if (self._latest_beam_ms is not None and
@@ -231,6 +237,7 @@ class MonitorState:
 
         self.beams.append(beam)
         self.tracking.apply_beam(beam)
+        self.frames.add(beam.beam_type, beam.beam_id, beam.timestamp_ms)
         if self._latest_beam_ms is None or beam.timestamp_ms > self._latest_beam_ms:
             self._latest_beam_ms = beam.timestamp_ms
 
@@ -370,13 +377,13 @@ class MonitorState:
         return {beam_type: count / total for beam_type, count in counts.items()}
 
     def search_sweep_ms(self) -> Optional[int]:
-        """가장 최근에 다시 방문한 탐색 칸의 방문 간격. 탐색 한 바퀴 시간에 해당한다."""
+        """가장 최근에 다시 방문한 탐색 칸의 방문 간격. 탐색 프레임 시간(탐색 격자 전체를 한 번 도는 시간)에 해당한다."""
         return self._last_search_interval_ms
 
     def expected_sweep_ms(self, window_ms: int = 5000) -> Optional[float]:
-        """격자 칸 수와 최근 탐색 점유율로 계산한 탐색 한 바퀴 기대 시간.
+        """격자 칸 수와 최근 탐색 점유율로 계산한 탐색 프레임 시간의 기대값.
 
-        확인·추적 빔이 끼어든 만큼 한 바퀴가 길어진다.
+        확인·추적 빔이 끼어든 만큼 탐색 프레임 시간이 길어진다.
         """
         if not self.search_cells:
             return None

@@ -71,7 +71,7 @@ class ComputeStatsTest(unittest.TestCase):
         self.assertEqual(item(report, "탐색→확인 지연").samples, [100.0])
         self.assertEqual(item(report, "추적 주기").samples, [1000.0, 1000.0])
         self.assertEqual(item(report, "추적 주기").level, OK)
-        self.assertEqual(item(report, "탐색 한 바퀴").level, OK)
+        self.assertEqual(item(report, "탐색 프레임 시간").level, OK)
         self.assertEqual(report.tracks[0].track_id, 1)
         self.assertTrue(report.tracks[0].confirmed)
         self.assertTrue(report.tracks[0].has_confirmation)

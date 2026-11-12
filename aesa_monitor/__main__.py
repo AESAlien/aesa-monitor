@@ -118,15 +118,15 @@ def print_stats(path: Path, parameters: TrackingParameters) -> int:
             print(f"      - {item.note}")
     if report.tracks:
         print("\n[트랙별]")
-        print("  ID  시작(s)  수명(s)  추적빔  미탐  최대연속  RMS(m)  상태")
+        print("  ID  시작(s)  수명(s)  추적빔  미탐  최대연속  차이평균(m)  상태")
         for track in report.tracks:
-            rms = "-" if track.rms_angle_error_m is None else f"{track.rms_angle_error_m:.1f}"
+            difference = "-" if track.mean_angle_error_m is None else f"{track.mean_angle_error_m:.1f}"
             state = "종료" if track.ended else "진행"
             if not track.confirmed:
                 state = "확인 실패"
             print(f"  {track.track_id:<3} {track.first_ms / 1000:7.1f}  {track.lifetime_s:7.1f}  "
                   f"{track.tracking_beams:6d}  {track.misses:4d}  {track.max_consecutive_misses:8d}  "
-                  f"{rms:>6}  {state}")
+                  f"{difference:>11}  {state}")
     return 0
 
 

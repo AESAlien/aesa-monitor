@@ -29,8 +29,8 @@ from aesa_monitor.ui.beam_tab import BeamTab
 from aesa_monitor.ui.comm_tab import CommTab
 from aesa_monitor.ui.fetch_dialog import FetchDialog
 from aesa_monitor.ui.style import (
-    BACKGROUND, BAD, FONT_BODY, FONT_SMALL, FONT_TITLE, Fonts, MUTED, OK, PANEL, TEXT, UNKNOWN, WARN,
-    format_bytes, format_duration, format_scale, format_time,
+    ACCENT, BACKGROUND, BAD, FONT_BODY, FONT_SMALL, FONT_TITLE, Fonts, MUTED, OK, PANEL, TEXT, UNKNOWN, WARN,
+    apply_theme, format_bytes, format_duration, format_scale, format_time,
 )
 from aesa_monitor.ui.track_tab import TrackTab
 
@@ -63,6 +63,7 @@ class MonitorApp:
         root.configure(background=BACKGROUND)
         root.geometry("1440x920")
         root.minsize(1100, 720)
+        apply_theme(root)
         self.fonts = Fonts(root, settings.font_size)
         self._initial_font_size = settings.font_size
 
@@ -96,6 +97,8 @@ class MonitorApp:
     # 화면 구성
 
     def _build_top_bar(self) -> None:
+        # 창 맨 위 CI 파랑 띠. 상태 표시(초록·빨강 글자)는 흰 바탕에 그대로 두고 띠로만 브랜드 색을 보인다.
+        tk.Frame(self._root, background=ACCENT, height=4).pack(fill=tk.X)
         bar = tk.Frame(self._root, background=BACKGROUND, padx=12, pady=6)
         bar.pack(fill=tk.X)
         self._processor_label = self._status_label(bar, "처리부")
