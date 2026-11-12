@@ -110,7 +110,7 @@ class TrackingHistoryTest(unittest.TestCase):
 
         self.assertEqual(history.cycles(5)[0].outcome, Outcome.UPDATED)
 
-    def test_summary_counts_consecutive_misses_and_rms_error(self):
+    def test_summary_counts_consecutive_misses_and_mean_difference(self):
         history = TrackingHistory()
         for time_ms in (1000, 2000, 3000):
             history.apply_beam(request_beam(time_ms))
@@ -121,7 +121,7 @@ class TrackingHistoryTest(unittest.TestCase):
 
         self.assertEqual((summary.cycles, summary.updated, summary.missed), (3, 1, 2))
         self.assertEqual(summary.consecutive_misses, 2)
-        self.assertAlmostEqual(summary.rms_angle_error_m, 0.0, places=6)
+        self.assertAlmostEqual(summary.mean_angle_error_m, 0.0, places=6)
 
 
 class TrafficTest(unittest.TestCase):

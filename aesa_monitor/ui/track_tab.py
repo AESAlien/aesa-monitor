@@ -108,11 +108,11 @@ class TrackTab:
         left = tk.Frame(body, background=BACKGROUND)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         section_title(left, "트랙 목록", "처리부가 확인·추적 빔을 보낸 요청 ID별 요약입니다.\n"
-                      "갱신/미탐: 추적 빔 결과 수. 차이 RMS: 빔 축과 연관 탐지 사이 거리의 RMS(m).\n"
+                      "갱신/미탐: 추적 빔 결과 수. 차이 평균: 빔 축(예측)과 연관 탐지(측정) 사이 거리의 평균(m). 참값 대비 오차가 아닙니다.\n"
                       "행을 누르면 오른쪽에 그 트랙을 보여줍니다.")
         self._table = Table(left, (
             ("id", "ID", 50, tk.CENTER), ("status", "상태", 60, tk.CENTER), ("life", "수명", 70, tk.E),
-            ("result", "갱신/미탐", 90, tk.E), ("misses", "연속 미탐", 80, tk.E), ("rms", "차이 RMS", 90, tk.E),
+            ("result", "갱신/미탐", 90, tk.E), ("misses", "연속 미탐", 80, tk.E), ("difference", "차이 평균", 90, tk.E),
         ), height=7, on_select=self._on_track_selected)
         self._table.frame.pack(fill=tk.BOTH, expand=False)
         section_title(left, "위에서 본 트랙 (동·북)", "처리부 트랙 목록의 갱신 위치를 위에서 본 그림입니다. "
@@ -246,7 +246,7 @@ class TrackTab:
                 tag = "ok"
             rows.append((str(track_id), (
                 f"#{track_id}", status, f"{life:.0f} s", f"{summary.updated}/{summary.missed}",
-                f"{summary.consecutive_misses}/{limit}", format_number(summary.rms_angle_error_m, 1, " m"),
+                f"{summary.consecutive_misses}/{limit}", format_number(summary.mean_angle_error_m, 1, " m"),
             ), tag))
         self._table.set_rows(rows)
 

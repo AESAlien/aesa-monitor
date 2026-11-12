@@ -45,7 +45,7 @@ class OccupancyTest(unittest.TestCase):
 class SearchSweepTest(unittest.TestCase):
     def test_sweep_time_is_revisit_interval_of_search_cell(self):
         state = MonitorState()
-        # 탐색 칸 3개를 10ms 간격으로 두 바퀴 돈다.
+        # 탐색 칸 3개를 10ms 간격으로 두 프레임 돈다.
         for index in range(6):
             state.apply(beam(index * 10, BeamType.SEARCH, index % 3))
 

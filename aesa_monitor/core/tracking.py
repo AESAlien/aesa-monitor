@@ -118,7 +118,8 @@ class TrackSummary:
     updated: int
     missed: int
     consecutive_misses: int
-    rms_angle_error_m: Optional[float]
+    # 빔 축(예측 방향)과 연관 탐지 사이 수직 거리의 평균. 측정치와 추정치의 차이이며 참값 대비 오차(RMSE)가 아니다.
+    mean_angle_error_m: Optional[float]
     max_beam_offset: Optional[float]
     ended: bool
 
@@ -248,7 +249,7 @@ class TrackingHistory:
             updated=sum(cycle.outcome == Outcome.UPDATED for cycle in cycles),
             missed=sum(cycle.outcome == Outcome.MISSED for cycle in cycles),
             consecutive_misses=consecutive,
-            rms_angle_error_m=math.sqrt(sum(e * e for e in errors) / len(errors)) if errors else None,
+            mean_angle_error_m=sum(errors) / len(errors) if errors else None,
             max_beam_offset=max(offsets) if offsets else None,
             ended=bool(cycles) and cycles[-1].outcome == Outcome.ENDED,
         )

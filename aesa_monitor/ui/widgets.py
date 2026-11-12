@@ -7,9 +7,11 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from aesa_monitor.core.frames import FrameShare
+from aesa_monitor.core.protocol import BeamType
 from aesa_monitor.core.verdict import Verdict
 from aesa_monitor.ui.style import (
-    BACKGROUND, FONT_BODY, FONT_SMALL, FONT_TITLE, FONT_VALUE, FONT_VERDICT, GRID_LINE, LEVEL_BACKGROUNDS,
+    BACKGROUND, BEAM_COLORS, BEAM_NAMES, FONT_BODY, FONT_SMALL, FONT_TITLE, FONT_VALUE, FONT_VERDICT, GRID_LINE, LEVEL_BACKGROUNDS,
     LEVEL_COLORS, LEVEL_NAMES, MUTED, PANEL, TEXT,
 )
 
@@ -352,6 +354,52 @@ def histogram(canvas: tk.Canvas, values: Sequence[float], unit: str, reference: 
         canvas.create_text(x + 4, area.top + 2, text=f"기준 {reference:g}", anchor="nw", fill=TEXT, font=FONT_SMALL)
     if title:
         canvas.create_text(56, 4, text=title + " · 세로축은 개수", anchor="nw", fill=TEXT, font=FONT_SMALL)
+
+
+def frame_share_chart(canvas: tk.Canvas, frames: Sequence[FrameShare], title: str = "") -> None:
+    """탐색 프레임별 빔 점유율(%) 꺾은선. 가로축은 프레임 번호, 세로축은 그 프레임의 빔 중 비율이다.
+
+    빠진 프레임(잘렸거나 흐름이 끊긴 프레임)이 있으면 그 자리에서 선을 끊는다.
+    """
+    canvas.delete("all")
+    width, height = canvas_size(canvas, 200, 120)
+    if not frames:
+        empty_message(canvas, "탐색 프레임이 한 번 다 돌면 프레임별 점유율을 그립니다")
+        return
+    first, last = frames[0].index, frames[-1].index
+    x_range = (first - 0.5, last + 0.5) if last > first else (first - 1.0, first + 1.0)
+    area = ChartArea(canvas, (52, 38, width - 16, height - 22), x_range, (0.0, 100.0))
+
+    def frame_label(value: float) -> str:
+        return f"{value:.0f}" if abs(value - round(value)) < 1e-6 else ""
+
+    area.draw_axes(frame_label, lambda value: f"{value:.0f}%", "", "탐색 프레임 번호", y_count=4)
+    beam_types = (BeamType.SEARCH, BeamType.CONFIRMATION, BeamType.TRACKING)
+    for beam_type in beam_types:
+        points: List[Tuple[float, float]] = []
+        previous: Optional[int] = None
+        for frame in frames:
+            if previous is not None and frame.index != previous + 1:
+                points.append((math.nan, math.nan))
+            points.append((float(frame.index), frame.share(beam_type) * 100.0))
+            previous = frame.index
+        area.line(points, BEAM_COLORS[beam_type], width=2)
+        if len(frames) <= 60:
+            area.markers([point for point in points if math.isfinite(point[0])], BEAM_COLORS[beam_type], 2.5)
+
+    # 맨 위 한 줄: 제목과 마지막 프레임 값
+    latest = frames[-1]
+    x = 52.0
+    pieces = [(f"{title}  " if title else "", TEXT)]
+    pieces += [(f"{BEAM_NAMES[beam_type]} {latest.share(beam_type) * 100:.0f}%  ", BEAM_COLORS[beam_type])
+               for beam_type in beam_types]
+    pieces.append((f"(프레임 #{latest.index}, {latest.duration_ms / 1000:.2f} s)", MUTED))
+    for text, color in pieces:
+        if not text:
+            continue
+        item = canvas.create_text(x, 4, text=text, anchor="nw", fill=color, font=FONT_SMALL)
+        box = canvas.bbox(item)
+        x = box[2] if box else x + len(text) * 7
 
 
 def bind_tree_colors(tree: ttk.Treeview, colors: Dict[str, str]) -> None:
