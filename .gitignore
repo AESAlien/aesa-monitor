@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# 개인 설정 (monitor.env.example을 복사해서 쓴다. 종료할 때 자동 저장된다)
+monitor.env
+# 처리부 설정을 이 폴더에 복사해 둔 경우
+.env
+
+# 모니터 녹화·세션 (기본 위치는 ~/aesa-records 이지만 이 폴더에 둔 경우)
+*.aesarec
+aesa-records/
+
+# 통신 캡처 파일
+*.pcap
+*.pcapng
+*.cap
+
+# 처리부 로그를 이 폴더로 가져온 경우
+processor_logs/
+adp_*.log
+adp_detection_*.csv
+
+# 화면 캡처·임시 파일
+*.tmp
+*.temp
+
+# 편집기·OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
