@@ -15,12 +15,12 @@ from aesa_monitor.core.state import MonitorState
 from aesa_monitor.core.traffic import CAPTURE_ONLY_MESSAGES, MESSAGE_NAMES, MESSAGE_ROUTES
 from aesa_monitor.core.verdict import comm_verdict, expected_beam_rate
 from aesa_monitor.ui.style import (
-    BACKGROUND, BAD, FONT_BODY, FONT_TITLE, FONT_VALUE, MUTED, OK, PANEL, TEXT, UNKNOWN,
+    BACKGROUND, BAD, FONT_BODY, FONT_TITLE, FONT_VALUE, MUTED, OK, PANEL, TEXT, UNKNOWN, WARN,
     format_duration, format_scale, format_time,
 )
 from aesa_monitor.ui.widgets import Table, VerdictBar, section_title
 
-LEVEL_FOREGROUND = {"ok": OK, "bad": BAD, "warn": "#b26a00", "info": TEXT}
+LEVEL_FOREGROUND = {"ok": OK, "bad": BAD, "warn": WARN, "info": TEXT}
 
 
 class LinkCard:

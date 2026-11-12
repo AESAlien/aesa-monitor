@@ -20,8 +20,8 @@ from aesa_monitor.io.processor_log import (
 )
 from aesa_monitor.io.session import Session
 from aesa_monitor.ui.style import (
-    BACKGROUND, BAD, FONT_BODY, FONT_SMALL, GRID_LINE, LEVEL_COLORS, LEVEL_NAMES, MUTED, OK, PANEL, TEXT, WARN,
-    format_time,
+    BACKGROUND, BAD, CHART_COLOR, FONT_BODY, FONT_SMALL, GRID_LINE, LEVEL_COLORS, LEVEL_NAMES, MUTED, OK, PANEL, TEXT,
+    WARN, format_time,
 )
 from aesa_monitor.ui.widgets import (
     LabelPlacer, Table, canvas_size, empty_message, frame_share_chart, histogram, nice_ticks, section_title,
@@ -239,7 +239,7 @@ class AnalysisTab:
             except ValueError:
                 reference = None
         histogram(canvas, item.samples, item.unit, reference,
-                  LEVEL_COLORS.get(item.level, "#378add") if item.level != "idle" else "#378add",
+                  LEVEL_COLORS.get(item.level, CHART_COLOR) if item.level != "idle" else CHART_COLOR,
                   f"{item.name} 분포 ({len(item.samples)}개)")
 
     def _on_track_double(self, iid: str) -> None:

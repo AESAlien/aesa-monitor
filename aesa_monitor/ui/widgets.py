@@ -12,7 +12,7 @@ from aesa_monitor.core.protocol import BeamType
 from aesa_monitor.core.verdict import Verdict
 from aesa_monitor.ui.style import (
     BACKGROUND, BEAM_COLORS, BEAM_NAMES, FONT_BODY, FONT_SMALL, FONT_TITLE, FONT_VALUE, FONT_VERDICT, GRID_LINE, LEVEL_BACKGROUNDS,
-    LEVEL_COLORS, LEVEL_NAMES, MUTED, PANEL, TEXT,
+    CHART_COLOR, LEVEL_COLORS, LEVEL_NAMES, MUTED, PANEL, TEXT,
 )
 
 Box = Tuple[float, float, float, float]
@@ -322,7 +322,7 @@ class ChartArea:
 
 
 def histogram(canvas: tk.Canvas, values: Sequence[float], unit: str, reference: Optional[float] = None,
-              color: str = "#378add", title: str = "") -> None:
+              color: str = CHART_COLOR, title: str = "") -> None:
     """값 분포 막대그래프. reference가 있으면 기준선을 그린다."""
     canvas.delete("all")
     width, height = canvas_size(canvas, 200, 120)
