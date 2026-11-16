@@ -15,6 +15,7 @@ from typing import List, Optional
 
 from aesa_monitor.core.config import TrackingParameters
 from aesa_monitor.core.stats import StatsReport, compute_stats, records_from_csv, records_from_events
+from aesa_monitor.io.bookmarks import Bookmark, BookmarkError, bookmark_path, load_bookmarks, save_bookmarks
 from aesa_monitor.io.capture import is_capture_file, read_capture_file
 from aesa_monitor.io.pcap import PcapError
 from aesa_monitor.io.processor_log import (
@@ -36,6 +37,22 @@ class Session:
     detection_log: Optional[DetectionLog] = None
     report: Optional[StatsReport] = None
     errors: List[str] = field(default_factory=list)
+    bookmarks: List[Bookmark] = field(default_factory=list)
+
+    @property
+    def bookmark_file(self) -> Path:
+        return bookmark_path(self.path)
+
+    def load_bookmarks(self) -> None:
+        try:
+            self.bookmarks = load_bookmarks(self.bookmark_file)
+        except BookmarkError as error:
+            self.bookmarks = []
+            self.errors.append(f"북마크: {error}")
+
+    def save_bookmarks(self) -> None:
+        """북마크를 세션 옆 파일에 쓴다. 실패하면 OSError를 그대로 올린다(화면에서 알린다)."""
+        save_bookmarks(self.bookmark_file, self.bookmarks)
 
     def select_run(self, index: Optional[int]) -> None:
         """처리부 실행(로그 묶음)을 고르고 통계를 다시 계산한다."""
@@ -111,6 +128,7 @@ def load_session(path: Path, parameters: TrackingParameters) -> Session:
         except (OSError, PcapError) as error:
             session.errors.append(f"캡처 파일을 읽지 못함: {error}")
         session.compute()
+        session.load_bookmarks()
         return session
     elif path.is_file():
         log_files = [path]
@@ -137,4 +155,5 @@ def load_session(path: Path, parameters: TrackingParameters) -> Session:
         session.select_run(index)
     else:
         session.compute()
+    session.load_bookmarks()
     return session

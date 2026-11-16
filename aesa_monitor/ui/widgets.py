@@ -1,4 +1,4 @@
-"""여러 탭이 함께 쓰는 화면 부품: 판정 줄, 지표 카드, 표, 도움말, 캔버스 라벨 배치."""
+"""여러 탭이 함께 쓰는 화면 부품: 판정 줄, 판정 카드 줄, 표, 도움말, 캔버스 라벨 배치, 그래프."""
 
 from __future__ import annotations
 
@@ -51,31 +51,133 @@ class VerdictBar:
         self._text.configure(text=verdict.text)
 
 
-class KpiCard:
-    """지표 하나: 제목, 큰 값, 기준이나 설명. 왼쪽 띠 색이 판정이다."""
+LEVEL_SYMBOLS = {"ok": "●", "warn": "▲", "bad": "■", "idle": "●"}
+
+
+class StatusCard:
+    """판정 카드 줄의 지표 하나: 제목, 큰 값, 기준 설명.
+
+    정상·대기면 무채색으로 두고, 주의·이상이면 이 카드만 바탕·제목·값에 판정 색과 기호(▲ 주의, ■ 이상)를 넣는다.
+    색약이나 흑백 출력에서도 구분되게 색과 기호를 함께 쓴다.
+    """
 
     def __init__(self, parent: tk.Widget, title: str, help_text: str = "") -> None:
+        self.title = title
+        self.level = "idle"
+        self.value_text = "-"
         self.frame = tk.Frame(parent, background=PANEL)
-        self._stripe = tk.Frame(self.frame, background=LEVEL_COLORS["idle"], width=6)
+        self._stripe = tk.Frame(self.frame, background=PANEL, width=6)
         self._stripe.pack(side=tk.LEFT, fill=tk.Y)
-        body = tk.Frame(self.frame, background=PANEL, padx=10, pady=6)
-        body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        header = tk.Frame(body, background=PANEL)
+        self._body = tk.Frame(self.frame, background=PANEL, padx=10, pady=6)
+        self._body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        header = tk.Frame(self._body, background=PANEL)
         header.pack(fill=tk.X)
-        tk.Label(header, text=title, font=FONT_BODY, background=PANEL, foreground=MUTED,
-                 anchor="w").pack(side=tk.LEFT)
-        if help_text:
-            HelpButton(header, title, help_text, background=PANEL).pack(side=tk.RIGHT)
-        self._value = tk.Label(body, text="-", font=FONT_VALUE, background=PANEL, foreground=TEXT, anchor="w")
+        self._title = tk.Label(header, text=title, font=FONT_BODY, background=PANEL, foreground=MUTED, anchor="w")
+        self._title.pack(side=tk.LEFT)
+        self._help = HelpButton(header, title, help_text, background=PANEL) if help_text else None
+        if self._help is not None:
+            self._help.pack(side=tk.RIGHT)
+        self._value = tk.Label(self._body, text="-", font=FONT_VALUE, background=PANEL, foreground=TEXT, anchor="w")
         self._value.pack(fill=tk.X)
-        self._detail = tk.Label(body, text="", font=FONT_SMALL, background=PANEL, foreground=MUTED,
+        self._detail = tk.Label(self._body, text="", font=FONT_SMALL, background=PANEL, foreground=MUTED,
                                 anchor="w", justify=tk.LEFT)
         self._detail.pack(fill=tk.X)
+        self._backgrounds = (self.frame, self._body, header, self._title, self._value, self._detail)
+        self._last: Tuple = ()
 
     def set(self, value: str, detail: str = "", level: str = "idle") -> None:
-        self._value.configure(text=value)
-        self._detail.configure(text=detail)
-        self._stripe.configure(background=LEVEL_COLORS[level])
+        key = (value, detail, level)
+        if key == self._last:
+            return
+        self._last = key
+        self.level, self.value_text = level, value
+        problem = level in ("warn", "bad")
+        background = LEVEL_BACKGROUNDS[level] if problem else PANEL
+        for widget in self._backgrounds:
+            widget.configure(background=background)
+        self._stripe.configure(background=LEVEL_COLORS[level] if problem else PANEL)
+        self._title.configure(foreground=LEVEL_COLORS[level] if problem else MUTED)
+        self._value.configure(text=f"{LEVEL_SYMBOLS[level]} {value}" if problem else value,
+                              foreground=LEVEL_COLORS[level] if problem else TEXT)
+        self._detail.configure(text=detail, foreground=TEXT if problem else MUTED)
+
+
+class VerdictCardRow:
+    """탭 맨 위 판정과 지표 카드를 한 줄로 합친 것: [판정 배지] [지표 카드 …].
+
+    - 배지: 탭 전체 판정(지표 중 가장 나쁜 값)과 탭의 질문.
+    - 지표 카드: 문제인 카드만 색이 들어온다(StatusCard).
+    - 판정이 정상이 아닌데 문제인 카드가 없으면 탭 전체 상태(연결 끊김, 처리부 정지, 빔 없음 등)다.
+      이때는 카드 대신 판정 문구와 마지막 값을 보여준다.
+    set()보다 카드 값(add_card로 받은 StatusCard.set)을 먼저 갱신해야 한다.
+    """
+
+    def __init__(self, parent: tk.Widget, question: str) -> None:
+        self.frame = tk.Frame(parent, background=BACKGROUND)
+        self._badge = tk.Frame(self.frame, background=LEVEL_COLORS["idle"], padx=14, pady=6)
+        self._badge.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
+        self._badge_text = tk.Label(self._badge, text="● 대기", font=FONT_VERDICT, background=LEVEL_COLORS["idle"],
+                                    foreground=BACKGROUND, anchor="w", width=6)
+        self._badge_text.pack(fill=tk.X, expand=True)
+        self._question = tk.Label(self._badge, text=question, font=FONT_SMALL, background=LEVEL_COLORS["idle"],
+                                  foreground=BACKGROUND, anchor="w", justify=tk.LEFT)
+        self._question.pack(fill=tk.X)
+        self._cards = tk.Frame(self.frame, background=BACKGROUND)
+        self._cards.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._message_frame = tk.Frame(self.frame, background=LEVEL_BACKGROUNDS["idle"], padx=14, pady=6)
+        self._message = tk.Label(self._message_frame, text="", font=FONT_VERDICT, background=LEVEL_BACKGROUNDS["idle"],
+                                 foreground=TEXT, anchor="w", justify=tk.LEFT)
+        self._message.pack(fill=tk.X)
+        self._last_values = tk.Label(self._message_frame, text="", font=FONT_SMALL,
+                                     background=LEVEL_BACKGROUNDS["idle"], foreground=MUTED, anchor="w",
+                                     justify=tk.LEFT)
+        self._last_values.pack(fill=tk.X, pady=(4, 0))
+        self._message_frame.bind("<Configure>", self._wrap)
+        self.cards: List[StatusCard] = []
+        self._showing_message = False
+        self._last: Tuple = ()
+
+    def _wrap(self, event: tk.Event) -> None:
+        width = max(event.width - 30, 200)
+        self._message.configure(wraplength=width)
+        self._last_values.configure(wraplength=width)
+
+    def add_card(self, title: str, help_text: str = "") -> StatusCard:
+        card = StatusCard(self._cards, title, help_text)
+        index = len(self.cards)
+        card.frame.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 8, 0))
+        self._cards.columnconfigure(index, weight=1, uniform="status")
+        self._cards.rowconfigure(0, weight=1)
+        self.cards.append(card)
+        return card
+
+    def set(self, verdict: Verdict) -> None:
+        level = verdict.level
+        message = level != "ok" and not any(card.level in ("warn", "bad") for card in self.cards)
+        last_values = " · ".join(f"{card.title} {card.value_text}" for card in self.cards
+                                 if card.value_text not in ("", "-"))
+        key = (level, verdict.text, message, last_values if message else "")
+        if key == self._last:
+            return
+        self._last = key
+        color = LEVEL_COLORS[level]
+        for widget in (self._badge, self._badge_text, self._question):
+            widget.configure(background=color)
+        self._badge_text.configure(text=f"{LEVEL_SYMBOLS[level]} {LEVEL_NAMES[level]}")
+        if message:
+            background = LEVEL_BACKGROUNDS[level]
+            for widget in (self._message_frame, self._message, self._last_values):
+                widget.configure(background=background)
+            self._message.configure(text=verdict.text)
+            self._last_values.configure(text=f"마지막 값  {last_values}" if last_values else "")
+        if message != self._showing_message:
+            self._showing_message = message
+            if message:
+                self._cards.pack_forget()
+                self._message_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            else:
+                self._message_frame.pack_forget()
+                self._cards.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
 
 class HelpButton(tk.Label):
@@ -356,50 +458,75 @@ def histogram(canvas: tk.Canvas, values: Sequence[float], unit: str, reference: 
         canvas.create_text(56, 4, text=title + " · 세로축은 개수", anchor="nw", fill=TEXT, font=FONT_SMALL)
 
 
-def frame_share_chart(canvas: tk.Canvas, frames: Sequence[FrameShare], title: str = "") -> None:
-    """탐색 프레임별 빔 점유율(%) 꺾은선. 가로축은 프레임 번호, 세로축은 그 프레임의 빔 중 비율이다.
+def frame_request_chart(canvas: tk.Canvas, frames: Sequence[FrameShare], grid_cells: int = 0,
+                        expected: Optional[float] = None, expected_text: str = "", max_frames: Optional[int] = None,
+                        title: str = "") -> None:
+    """탐색 프레임마다 끼어든 확인·추적 빔 수를 쌓은 막대. 가로축은 프레임 번호, 세로축은 빔 수(개)다.
 
-    빠진 프레임(잘렸거나 흐름이 끊긴 프레임)이 있으면 그 자리에서 선을 끊는다.
+    탐색 빔은 프레임마다 격자 칸 수로 거의 일정해서(점유율 97% 안팎) 비율 그래프로는 변화가 보이지 않는다.
+    그래서 탐색 빔은 빼고 확인·추적 빔 수만 그리며, 뺐다는 것을 맨 위 부제로 밝힌다.
+    expected(기대 추적 빔 수)를 주면 점선을 긋고, 세로축 위쪽을 기대값의 2배 이상으로 잡아
+    정상일 때 막대가 그래프 가운데쯤에 오게 한다. 빠진 프레임 번호 자리는 비워 둔다.
     """
     canvas.delete("all")
     width, height = canvas_size(canvas, 200, 120)
     if not frames:
-        empty_message(canvas, "탐색 프레임이 한 번 다 돌면 프레임별 점유율을 그립니다")
+        empty_message(canvas, "탐색 프레임이 한 번 다 돌면 프레임별 확인·추적 빔 수를 그립니다")
         return
+    frames = list(frames)
+    if max_frames is not None:
+        frames = frames[-max_frames:]
     first, last = frames[0].index, frames[-1].index
-    x_range = (first - 0.5, last + 0.5) if last > first else (first - 1.0, first + 1.0)
-    area = ChartArea(canvas, (52, 38, width - 16, height - 22), x_range, (0.0, 100.0))
-
-    def frame_label(value: float) -> str:
-        return f"{value:.0f}" if abs(value - round(value)) < 1e-6 else ""
-
-    area.draw_axes(frame_label, lambda value: f"{value:.0f}%", "", "탐색 프레임 번호", y_count=4)
-    beam_types = (BeamType.SEARCH, BeamType.CONFIRMATION, BeamType.TRACKING)
-    for beam_type in beam_types:
-        points: List[Tuple[float, float]] = []
-        previous: Optional[int] = None
-        for frame in frames:
-            if previous is not None and frame.index != previous + 1:
-                points.append((math.nan, math.nan))
-            points.append((float(frame.index), frame.share(beam_type) * 100.0))
-            previous = frame.index
-        area.line(points, BEAM_COLORS[beam_type], width=2)
-        if len(frames) <= 60:
-            area.markers([point for point in points if math.isfinite(point[0])], BEAM_COLORS[beam_type], 2.5)
-
-    # 맨 위 한 줄: 제목과 마지막 프레임 값
     latest = frames[-1]
-    x = 52.0
-    pieces = [(f"{title}  " if title else "", TEXT)]
-    pieces += [(f"{BEAM_NAMES[beam_type]} {latest.share(beam_type) * 100:.0f}%  ", BEAM_COLORS[beam_type])
-               for beam_type in beam_types]
-    pieces.append((f"(프레임 #{latest.index}, {latest.duration_ms / 1000:.2f} s)", MUTED))
+    observed = max(frame.request_beams for frame in frames)
+    high = max(observed * 1.15, (expected or 0.0) * 2.0, 4.0)
+
+    left = 44.0
+    cells = f"{grid_cells}개" if grid_cells else "격자 칸 수만큼"
+    prefix = f"{title} — " if title else ""
+    canvas.create_text(left, 2, text=f"{prefix}탐색 빔(프레임당 {cells})은 빼고, 프레임 사이에 끼어든 확인·추적 빔만 셉니다",
+                       anchor="nw", fill=MUTED, font=FONT_SMALL)
+    pieces = [("마지막 프레임  ", TEXT)]
+    pieces += [(f"{BEAM_NAMES[beam_type]} {latest.count(beam_type)}개({latest.share(beam_type) * 100:.0f}%)  ",
+                BEAM_COLORS[beam_type]) for beam_type in (BeamType.SEARCH, BeamType.CONFIRMATION, BeamType.TRACKING)]
+    pieces.append((f"#{latest.index}, {latest.duration_ms / 1000:.2f} s", MUTED))
+    x = left
+    second_line_y = 2.0
+    first_line = canvas.bbox("all")
+    if first_line:
+        second_line_y = first_line[3] + 2
     for text, color in pieces:
-        if not text:
-            continue
-        item = canvas.create_text(x, 4, text=text, anchor="nw", fill=color, font=FONT_SMALL)
+        item = canvas.create_text(x, second_line_y, text=text, anchor="nw", fill=color, font=FONT_SMALL)
         box = canvas.bbox(item)
         x = box[2] if box else x + len(text) * 7
+    header = canvas.bbox("all")
+    top = (header[3] if header else 36) + 22
+
+    x_range = (first - 0.5, last + 0.5)
+    area = ChartArea(canvas, (left, top, width - 16, height - 22), x_range, (0.0, high))
+    area.draw_axes(lambda value: f"{value:.0f}" if abs(value - round(value)) < 1e-6 else "",
+                   lambda value: f"{value:.0f}", "빔 수(개)", "탐색 프레임 번호", y_count=3)
+    slot = (area.right - area.left) / max(last - first + 1, 1)
+    bar = max(min(slot * 0.7, 18.0), 1.0)
+    for frame in frames:
+        center = area.x(frame.index)
+        bottom = 0
+        for beam_type in (BeamType.TRACKING, BeamType.CONFIRMATION):
+            count = frame.count(beam_type)
+            if count:
+                canvas.create_rectangle(center - bar / 2, area.y(bottom + count), center + bar / 2, area.y(bottom),
+                                        fill=BEAM_COLORS[beam_type], outline="")
+                bottom += count
+    if expected is not None:
+        y = area.y(expected)
+        canvas.create_line(area.left, y, area.right, y, fill=TEXT, dash=(5, 3), width=2)
+        if expected_text:
+            item = canvas.create_text(area.right - 4, y - 3, text=expected_text, anchor="se", fill=TEXT,
+                                      font=FONT_SMALL)
+            box = canvas.bbox(item)
+            if box:
+                back = canvas.create_rectangle(box[0] - 3, box[1], box[2] + 3, box[3], fill=BACKGROUND, outline="")
+                canvas.tag_lower(back, item)
 
 
 def bind_tree_colors(tree: ttk.Treeview, colors: Dict[str, str]) -> None:

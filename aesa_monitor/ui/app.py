@@ -76,7 +76,7 @@ class MonitorApp:
             "track": TrackTab(self._notebook, parameters),
             "comm": CommTab(self._notebook, server_text),
             "analysis": AnalysisTab(self._notebook, self.choose_folder, self.choose_file, self.fetch_logs,
-                                    self.focus_event, self.select_run),
+                                    self.focus_event, self.select_run, self.focus_time),
         }
         for key, tab in self._tabs.items():
             self._notebook.add(tab.frame, text=TAB_TITLES[key])
@@ -89,6 +89,8 @@ class MonitorApp:
         root.bind("<Control-KP_Subtract>", lambda _event: self.change_font(-1))
         root.bind("<Control-Key-0>", lambda _event: self.set_font_size(12))
         root.bind("<space>", self._on_space)
+        root.bind("<KeyPress-b>", self._on_bookmark_key)
+        root.bind("<KeyPress-B>", self._on_bookmark_key)
         root.protocol("WM_DELETE_WINDOW", self.close)
         if settings.auto_record and connection is not None:
             root.after(200, self.start_recording)
@@ -303,6 +305,16 @@ class MonitorApp:
         if self._replaying and not isinstance(event.widget, (tk.Entry, ttk.Entry)):
             self._toggle_play()
 
+    def _on_bookmark_key(self, event: tk.Event) -> None:
+        """B 키: 세션을 열었으면 어느 탭에서든 지금 재생 위치로 북마크 추가 창을 연다. 글자 입력 칸에서는 무시한다."""
+        if self._session is None or isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox)):
+            return
+        if event.widget.winfo_toplevel() is not self._root:
+            return
+        if self._session.player is not None:
+            self._session.player.pause()
+        self._tabs["analysis"].add_bookmark()
+
     def _on_speed(self, _event: object) -> None:
         if self._session is not None and self._session.player is not None:
             self._session.player.speed = SPEEDS[self._speed_box.current()]
@@ -326,18 +338,27 @@ class MonitorApp:
 
     def focus_event(self, event: LogEvent) -> None:
         """분석 탭에서 고른 이벤트의 1초 전으로 재생 위치를 옮긴다."""
-        player = self._session.player if self._session else None
-        if player is None or event.processor_ms is None:
+        if event.processor_ms is None:
             return
-        position = player.time_for_processor_ms(int(event.processor_ms) - 1000)
+        track_id = None
+        if event.category == CATEGORY_REJECTED and event.details.get("requestId", "").isdigit():
+            track_id = int(event.details["requestId"])
+        self.focus_time(int(event.processor_ms) - 1000, track_id)
+
+    def focus_time(self, processor_ms: int, track_id: Optional[int] = None) -> None:
+        """재생 위치를 처리부 시각 processor_ms로 옮기고 멈춘다. track_id를 주면 추적 탭에서 그 트랙을 고른다."""
+        player = self._session.player if self._session else None
+        if player is None:
+            return
+        position = player.time_for_processor_ms(int(processor_ms))
         if position is None:
             return
         player.pause()
         self._replaying = True
         self._replay_bar.pack(fill=tk.X, after=self._root.pack_slaves()[0])
         self._seek(position)
-        if event.category == CATEGORY_REJECTED and event.details.get("requestId", "").isdigit():
-            self._tabs["track"]._on_track_selected(event.details["requestId"])
+        if track_id is not None:
+            self._tabs["track"]._on_track_selected(str(track_id))
 
     # 갱신
 

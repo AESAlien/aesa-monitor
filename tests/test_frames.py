@@ -1,7 +1,7 @@
 import unittest
 
 from aesa_monitor.core.config import TrackingParameters
-from aesa_monitor.core.frames import FrameCounter
+from aesa_monitor.core.frames import FrameCounter, expected_tracking_beams
 from aesa_monitor.core.protocol import Beam, BeamType
 from aesa_monitor.core.state import MonitorState
 from aesa_monitor.core.stats import BeamRecord, compute_stats
@@ -13,6 +13,17 @@ def feed(counter, beams, start_ms=0):
     """(종류, 번호) 목록을 10 ms 간격으로 넣는다."""
     for offset, (beam_type, beam_id) in enumerate(beams):
         counter.add(beam_type, beam_id, start_ms + offset * 10)
+
+
+class ExpectedTrackingBeamsTest(unittest.TestCase):
+    def test_tracks_times_frame_time_over_interval(self):
+        self.assertAlmostEqual(expected_tracking_beams(3, 1950, 1000), 5.85)
+        self.assertAlmostEqual(expected_tracking_beams(1, 2000, 500), 4.0)
+
+    def test_no_tracks_or_bad_values_give_none(self):
+        self.assertIsNone(expected_tracking_beams(0, 1950, 1000))
+        self.assertIsNone(expected_tracking_beams(3, 0, 1000))
+        self.assertIsNone(expected_tracking_beams(3, 1950, 0))
 
 
 class FrameCounterTest(unittest.TestCase):
@@ -31,6 +42,8 @@ class FrameCounterTest(unittest.TestCase):
         self.assertEqual(frames[1].total, 6)
         self.assertAlmostEqual(frames[1].share(BeamType.TRACKING), 2 / 6)
         self.assertEqual(frames[1].duration_ms, 60)
+        self.assertEqual((frames[0].request_beams, frames[1].request_beams), (0, 2))
+        self.assertEqual(frames[1].count(BeamType.TRACKING), 2)
 
     def test_first_frame_started_mid_grid_is_not_complete(self):
         counter = FrameCounter()
