@@ -1,13 +1,17 @@
 """분석 북마크: 사람이 찾은 문제 시점(또는 구간)에 제목·분류·트랙·메모를 붙여 세션과 함께 저장한다.
 
 시각은 처리부 시각(ms)이다. 녹화와 처리부 로그가 같은 기준을 쓰므로 이벤트 타임라인과 바로 겹쳐 그릴 수 있다.
+처리부가 녹화 중 다시 시작하면 처리부 시각이 0부터 다시 세서 같은 시각이 두 번 나온다. 그래서 녹화가 있으면
+녹화 위치(recording_s, 녹화 시작 후 초)와 처리부 실행 구간 번호(segment)를 함께 저장하고, 이동할 때는 녹화 위치를 쓴다.
 
 저장 위치
 - 세션 폴더를 열었으면 그 폴더의 bookmarks.json
 - 파일 하나(녹화, 로그, 캡처)를 열었으면 같은 폴더의 '<파일 이름>.bookmarks.json'
 
 파일 형식(JSON): {"version": 1, "bookmarks": [{"start_ms": 29150, "end_ms": null, "title": "...",
-"tag": "이슈", "track_id": 3, "note": "...", "created": "2026-11-16T23:10:00"}, ...]}
+"tag": "이슈", "track_id": 3, "note": "...", "created": "2026-11-16T23:10:00",
+"recording_s": 25.3, "end_recording_s": null, "segment": 0}, ...]}
+recording_s·end_recording_s·segment는 없어도 읽는다(이전 형식, 로그만 연 세션).
 """
 
 from __future__ import annotations
@@ -39,12 +43,17 @@ class Bookmark:
     track_id: Optional[int] = None
     note: str = ""
     created: str = field(default_factory=lambda: datetime.datetime.now().isoformat(timespec="seconds"))
+    recording_s: Optional[float] = None       # 녹화 위치(녹화 시작 후 초). 처리부 재시작이 있어도 위치가 하나로 정해진다
+    end_recording_s: Optional[float] = None
+    segment: Optional[int] = None             # 녹화의 처리부 실행 구간 번호(0부터)
 
     def __post_init__(self) -> None:
         if self.end_ms is not None and self.end_ms < self.start_ms:
             self.start_ms, self.end_ms = self.end_ms, self.start_ms
+            self.recording_s, self.end_recording_s = self.end_recording_s, self.recording_s
         if self.end_ms == self.start_ms:
             self.end_ms = None
+            self.end_recording_s = None
 
     @property
     def is_range(self) -> bool:
@@ -77,6 +86,9 @@ def load_bookmarks(path: Path) -> List[Bookmark]:
                 track_id=None if item.get("track_id") is None else int(item["track_id"]),
                 note=str(item.get("note", "")),
                 created=str(item.get("created", "")),
+                recording_s=_optional_float(item.get("recording_s")),
+                end_recording_s=_optional_float(item.get("end_recording_s")),
+                segment=None if item.get("segment") is None else int(item["segment"]),
             ))
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise BookmarkError(f"{path.name}을(를) 읽지 못함: {error}") from error
@@ -93,7 +105,15 @@ def save_bookmarks(path: Path, bookmarks: List[Bookmark]) -> None:
 
 
 def sort_bookmarks(bookmarks: List[Bookmark]) -> List[Bookmark]:
-    return sorted(bookmarks, key=lambda bookmark: (bookmark.start_ms, bookmark.end_ms or bookmark.start_ms))
+    """녹화 위치가 있으면 녹화 순서(처리부 재시작 뒤 북마크가 뒤로 감), 없으면 처리부 시각 순서."""
+    return sorted(bookmarks, key=lambda bookmark: (
+        bookmark.segment if bookmark.segment is not None else 0,
+        bookmark.recording_s if bookmark.recording_s is not None else bookmark.start_ms / 1000,
+        bookmark.end_ms or bookmark.start_ms))
+
+
+def _optional_float(value) -> Optional[float]:
+    return None if value is None else float(value)
 
 
 _TIME_PATTERN = re.compile(r"^\s*(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d*)?)\s*$")

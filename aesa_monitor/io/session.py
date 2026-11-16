@@ -14,12 +14,14 @@ from pathlib import Path
 from typing import List, Optional
 
 from aesa_monitor.core.config import TrackingParameters
+from aesa_monitor.core.problems import BAD, CATEGORY_LOG, WARN, Problem, level_counts, scan_events
 from aesa_monitor.core.stats import StatsReport, compute_stats, records_from_csv, records_from_events
 from aesa_monitor.io.bookmarks import Bookmark, BookmarkError, bookmark_path, load_bookmarks, save_bookmarks
 from aesa_monitor.io.capture import is_capture_file, read_capture_file
 from aesa_monitor.io.pcap import PcapError
 from aesa_monitor.io.processor_log import (
-    DetectionLog, MessageLog, ProcessorRun, group_runs, read_detection_log, read_message_log,
+    CATEGORY_PROBLEM, CATEGORY_REJECTED, DetectionLog, MessageLog, ProcessorRun, group_runs, read_detection_log,
+    read_message_log,
 )
 from aesa_monitor.io.recording import Recording, RecordingError, find_session_files, read_recording
 from aesa_monitor.io.replay import ReplayPlayer
@@ -38,6 +40,55 @@ class Session:
     report: Optional[StatsReport] = None
     errors: List[str] = field(default_factory=list)
     bookmarks: List[Bookmark] = field(default_factory=list)
+    # 녹화를 처음부터 다시 계산해 찾은 문제(core/problems.py). 녹화가 없으면 비어 있다.
+    recording_problems: List[Problem] = field(default_factory=list)
+    _problems: Optional[List[Problem]] = field(default=None, repr=False)
+
+    def compute_problems(self) -> None:
+        if self.player is None:
+            self.recording_problems = []
+        else:
+            self.recording_problems = scan_events(self.player.events, self.parameters, self.player.segment_at)
+        self._problems = None
+
+    def log_problems(self) -> List[Problem]:
+        """고른 처리부 실행의 메시지 로그에서 요청 거부·경고·오류를 문제로 바꾼다.
+
+        로그는 처리부 시각만 있어 녹화 위치는 그 시각에 처음 닿은 곳으로 정한다(녹화 중 처리부가 다시 시작했으면
+        앞 실행으로 갈 수 있음, 한계).
+        """
+        if self.message_log is None:
+            return []
+        # 로그 실행 수와 녹화의 처리부 실행 구간 수가 같으면 순서대로 짝짓는다(추정: 둘 다 시간 순서이고
+        # 녹화가 모든 실행을 담았다고 봄). 다르면 구간을 모르므로 처리부 시각에 처음 닿은 곳으로 간다.
+        segment: Optional[int] = None
+        if self.player is not None and self.run in self.runs and len(self.runs) == self.player.segment_count:
+            segment = self.runs.index(self.run)
+        problems = []
+        for event in self.message_log.events:
+            if event.category not in (CATEGORY_REJECTED, CATEGORY_PROBLEM) or event.processor_ms is None:
+                continue
+            processor_ms = int(event.processor_ms)
+            request = event.details.get("requestId", "")
+            start_s = (self.player.time_for_processor_ms(processor_ms, segment) if self.player is not None
+                       else None)
+            problems.append(Problem(
+                "log", CATEGORY_LOG, BAD if event.level in ("error", "critical") else WARN, event.summary,
+                f"처리부 로그 {event.level}" + ("" if segment is not None or self.player is None or
+                                              self.player.segment_count <= 1 else " · 녹화 구간 추정 불가"),
+                processor_ms, processor_ms, start_s, start_s,
+                int(request) if request.isdigit() else None, open=False,
+                segment=None if start_s is None else self.player.segment_at(start_s)))
+        return problems
+
+    def problems(self) -> List[Problem]:
+        """녹화에서 찾은 문제와 처리부 로그 문제를 녹화 순서(없으면 처리부 시각)로 합친 목록."""
+        if self._problems is None:
+            merged = self.recording_problems + self.log_problems()
+            self._problems = sorted(merged, key=lambda problem: (
+                problem.start_s if problem.start_s is not None else (problem.start_ms or 0) / 1000,
+                problem.start_ms or 0))
+        return self._problems
 
     @property
     def bookmark_file(self) -> Path:
@@ -56,6 +107,7 @@ class Session:
 
     def select_run(self, index: Optional[int]) -> None:
         """처리부 실행(로그 묶음)을 고르고 통계를 다시 계산한다."""
+        self._problems = None
         self.run = None if index is None or not self.runs else self.runs[index]
         self.message_log = None
         self.detection_log = None
@@ -107,6 +159,9 @@ class Session:
             lines.append(f"처리부 로그: {self.run.label} — 실행 {len(self.runs)}개 중 선택")
         else:
             lines.append("처리부 로그: 없음")
+        if self.player is not None or self.message_log is not None:
+            counts = level_counts(self.problems())
+            lines.append(f"자동 기록 문제: 이상 {counts[BAD]}건 · 주의 {counts[WARN]}건 (분석 탭 [문제] 목록)")
         lines.extend(self.errors)
         return lines
 
@@ -128,6 +183,7 @@ def load_session(path: Path, parameters: TrackingParameters) -> Session:
         except (OSError, PcapError) as error:
             session.errors.append(f"캡처 파일을 읽지 못함: {error}")
         session.compute()
+        session.compute_problems()
         session.load_bookmarks()
         return session
     elif path.is_file():
@@ -155,5 +211,6 @@ def load_session(path: Path, parameters: TrackingParameters) -> Session:
         session.select_run(index)
     else:
         session.compute()
+    session.compute_problems()
     session.load_bookmarks()
     return session

@@ -5,7 +5,9 @@
 - 트랙별 요약: 시작, 수명, 미탐, 빔-탐지 차이 평균.
 - 처리부 이벤트 타임라인: 메시지 로그의 운용·자세·요청 거부·경고를 처리부 시각에 놓는다.
   이벤트를 누르면 녹화 재생 위치를 그 시각 직전으로 옮긴다.
-- 북마크: 사람이 찾은 문제 시점(또는 구간)에 제목·분류·트랙·메모를 달아 세션 옆 bookmarks.json에 저장한다.
+- 문제: 녹화를 열 때 처음부터 다시 계산해 자동으로 기록한 문제 사건(core/problems.py)과 처리부 로그의
+  요청 거부·경고·오류. 누르면 재생 위치를 그 1초 전으로 옮긴다. 세션이 없으면 실시간으로 감지한 문제를 보여준다.
+- 북마크(보조): 자동 기록이 못 잡은 것이나 원인 메모를 사람이 남긴다. 세션 옆 bookmarks.json에 저장한다.
   타임라인 맨 위 줄과 오른쪽 [북마크] 목록에 보이고, 누르면 재생 위치를 그 시각으로 옮긴다.
 - 위(통계·트랙)와 아래(타임라인·목록) 사이 경계를 끌어 높이를 나눌 수 있다.
 """
@@ -16,12 +18,14 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Callable, Dict, List, Optional
 
+from aesa_monitor.core.problems import BAD as LEVEL_BAD, Problem, level_counts
 from aesa_monitor.core.state import MonitorState
 from aesa_monitor.io.processor_log import (
     CATEGORY_ATTITUDE, CATEGORY_LIFECYCLE, CATEGORY_OPERATION, CATEGORY_OTHER, CATEGORY_PROBLEM,
     CATEGORY_REJECTED, LogEvent,
 )
 from aesa_monitor.io.bookmarks import Bookmark, sort_bookmarks
+from aesa_monitor.io.replay import ReplayPosition
 from aesa_monitor.io.session import Session
 from aesa_monitor.ui.bookmark_dialog import BookmarkDialog
 from aesa_monitor.ui.style import (
@@ -44,8 +48,21 @@ EVENT_FILTERS = {
 HISTOGRAM_REFERENCES = {"연속 빔 간격": 10.0, "연속 탐지 간격": 10.0}
 BOOKMARK_COLORS = {"이슈": BAD, "확인 필요": WARN, "참고": MUTED}
 BOOKMARK_TAGS = {"이슈": "bad", "확인 필요": "warn", "참고": "text"}
+PROBLEM_FILTERS = ("전체", "이상만", "빔", "추적", "통신", "처리부 로그")
+PROBLEM_LEAD_S = 1.0  # 문제를 누르면 이만큼 앞에서 재생을 시작해 직전 상황을 본다
+HELP_PROBLEMS = (
+    "모니터가 문제 상황을 자동으로 기록한 목록입니다. 사람이 누르지 않아도 남습니다.\n\n"
+    "• 기준은 실시간 판정과 같습니다: 빠진 빔, 빔 없음, 탐색 프레임 시간·추적 주기·탐색→확인 지연 이탈, 트랙 미탐·종료, "
+    "확인 실패, 빔 밖 탐지, 처리부 연결 끊김·상대 연결 안 됨, 처리부 재시작, 처리부 로그의 요청 거부·경고·오류.\n"
+    "• 모니터 추정이 섞인 값(예측-측정 잔차, 연관 탐지 선택)은 기록하지 않습니다.\n"
+    "• 같은 종류(트랙 문제는 같은 트랙)가 2초 안에 다시 생기면 한 건으로 합치고 '횟수'에 셉니다.\n"
+    "• 녹화를 열 때 처음부터 다시 계산합니다. 기준을 고치면 예전 녹화에도 그대로 적용됩니다.\n"
+    "• 행이나 타임라인 '문제' 줄을 누르면 재생 위치를 그 1초 전으로 옮기고, 트랙 문제면 추적 탭에서 그 트랙을 고릅니다.\n"
+    "• 오른쪽 클릭 → '북마크로 남기기'로 원인 메모를 달아 둘 수 있습니다.\n"
+    "• 세션을 열지 않았으면 모니터를 켠 뒤 실시간으로 감지한 문제를 보여줍니다(녹화해 두어야 나중에 그 위치로 갈 수 있음)."
+)
 HELP_BOOKMARKS = (
-    "직접 찾은 문제 시점(또는 구간)에 제목·분류·트랙·메모를 달아 둡니다.\n\n"
+    "자동 기록(문제 목록)을 돕는 기능입니다. 자동 기록이 못 잡은 시점(또는 구간)이나 원인 메모를 직접 남깁니다.\n\n"
     "• 추가: [+ 북마크] 버튼이나 B 키(글자 입력 칸 밖에서, 한글 입력 상태가 아닐 때). 시작 시각은 지금 재생 위치로 채워집니다.\n"
     "• 구간: 끝 시각도 넣으면 타임라인에 띠로 그립니다.\n"
     "• 이동: 목록 행이나 타임라인 ▼·띠를 누르면 재생 위치를 그 시각으로 옮기고, 트랙을 넣었으면 추적 탭에서 그 트랙을 고릅니다.\n"
@@ -75,11 +92,18 @@ def event_level(event: LogEvent) -> str:
 class AnalysisTab:
     def __init__(self, parent: tk.Widget, open_folder: Callable[[], None], open_file: Callable[[], None],
                  fetch_logs: Callable[[], None], focus_event: Callable[[LogEvent], None],
-                 select_run: Callable[[int], None],
-                 focus_time: Callable[[int, Optional[int]], None]) -> None:
+                 select_run: Callable[[int], None], focus_time: Callable[..., None],
+                 current_position: Callable[[], Optional[ReplayPosition]],
+                 live_problems: Callable[[], List[Problem]]) -> None:
         self.frame = tk.Frame(parent, background=BACKGROUND, padx=12, pady=8)
         self._focus_event = focus_event
         self._focus_time = focus_time
+        self._current_position = current_position
+        self._live_problems = live_problems
+        self._problems: List[Problem] = []
+        self._problem_signature: tuple = ()
+        self._problem_filter = tk.StringVar(value=PROBLEM_FILTERS[0])
+        self._problem_points: List[tuple] = []
         self._bookmark_points: List[tuple] = []
         self._select_run = select_run
         self._session: Optional[Session] = None
@@ -108,7 +132,7 @@ class AnalysisTab:
                  foreground=MUTED, font=FONT_SMALL).pack(side=tk.LEFT, padx=6)
 
         # 위(통계·트랙)와 아래(타임라인·목록)를 경계로 나눈다. 창이 낮으면 한쪽이 눌리므로 사람이 경계를 끌어 조절한다.
-        # 처음 경계는 위 58%로 둔다(_place_sash).
+        # 처음 경계는 위 50%로 둔다(_place_sash).
         self._panes = ttk.PanedWindow(self.frame, orient=tk.VERTICAL)
         self._panes.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
         body = tk.Frame(self._panes, background=BACKGROUND)
@@ -185,11 +209,38 @@ class AnalysisTab:
         # 오른쪽 목록: [이벤트 | 북마크]
         self._lists = ttk.Notebook(lower)
         self._lists.grid(row=0, column=1, sticky="nsew")
+        # [문제] 자동 기록
+        self._problem_page = tk.Frame(self._lists, background=BACKGROUND)
+        self._lists.add(self._problem_page, text="문제")
+        problem_bar = tk.Frame(self._problem_page, background=BACKGROUND)
+        problem_bar.pack(fill=tk.X)
+        ttk.Combobox(problem_bar, textvariable=self._problem_filter, values=PROBLEM_FILTERS, state="readonly",
+                     width=10).pack(side=tk.LEFT)
+        self._problem_filter.trace_add("write", lambda *_args: self._fill_problems(force=True))
+        self._problem_summary = tk.Label(problem_bar, text="", font=FONT_SMALL, background=BACKGROUND,
+                                         foreground=MUTED, anchor="w")
+        self._problem_summary.pack(side=tk.LEFT, padx=8)
+        HelpButton(problem_bar, "문제 자동 기록", HELP_PROBLEMS).pack(side=tk.RIGHT)
+        self._problem_note = tk.Label(self._problem_page, text="", font=FONT_SMALL, background=BACKGROUND,
+                                      foreground=MUTED, anchor="w", justify=tk.LEFT)
+        self._problem_note.pack(side=tk.BOTTOM, fill=tk.X)
+        self._problem_note.bind("<Configure>", lambda event: self._problem_note.configure(
+            wraplength=max(event.width - 8, 100)))
+        self._problem_table = Table(self._problem_page, (
+            ("time", "처리부 시각", 110, tk.E), ("level", "수준", 60, tk.CENTER), ("category", "분류", 60, tk.CENTER),
+            ("title", "내용", 260, tk.W), ("count", "횟수", 50, tk.E),
+        ), height=3, on_select=self._on_problem_selected)
+        self._problem_table.frame.pack(fill=tk.BOTH, expand=True)
+        self._problem_menu = tk.Menu(self.frame, tearoff=False)
+        self._problem_menu.add_command(label="북마크로 남기기 (원인 메모)", command=self._bookmark_selected_problem)
+        self._problem_table.tree.bind("<Button-3>", self._show_problem_menu)
+
         self._event_table = Table(self._lists, (
             ("time", "처리부 시각", 100, tk.E), ("category", "분류", 80, tk.CENTER), ("text", "내용", 320, tk.W),
         ), height=4, on_select=self._on_event_selected)
         self._lists.add(self._event_table.frame, text="이벤트")
         bookmark_page = tk.Frame(self._lists, background=BACKGROUND)
+        self._bookmark_page = bookmark_page
         self._lists.add(bookmark_page, text="북마크")
         # 버튼 줄은 두지 않는다(낮은 창에서 목록이 가려짐). 추가는 위 [+ 북마크]·B 키, 편집은 두 번 누르기,
         # 편집·삭제는 오른쪽 클릭 메뉴와 Delete 키로 한다.
@@ -223,6 +274,7 @@ class AnalysisTab:
             self._stats.set_rows([])
             self._tracks.set_rows([])
             self._fill_bookmarks()
+            self._fill_problems(force=True)
             self._refresh_events()
             return
         self._info.configure(text="\n".join(session.describe()))
@@ -235,6 +287,7 @@ class AnalysisTab:
         self._fill_stats()
         self._fill_tracks()
         self._fill_bookmarks()
+        self._fill_problems(force=True)
         self._refresh_events()
 
     def _fill_stats(self) -> None:
@@ -316,11 +369,11 @@ class AnalysisTab:
                                    {"requestId": str(track.track_id)}))
 
     def _place_sash(self, event: tk.Event) -> None:
-        """처음 한 번만 경계를 둔다: 위(통계·트랙) 60%. 그 뒤는 사람이 끈 대로 둔다."""
+        """처음 한 번만 경계를 둔다: 위(통계·트랙) 50%, 아래(타임라인·문제 목록) 50%. 그 뒤는 사람이 끈 대로 둔다."""
         if self._sash_placed or event.height < 200:
             return
         self._sash_placed = True
-        self._panes.sashpos(0, int(event.height * 0.60))
+        self._panes.sashpos(0, int(event.height * 0.50))
 
     def _place_left_sash(self, event: tk.Event) -> None:
         # 바깥 경계를 둔 뒤 안쪽 칸 크기가 정해졌을 때 한 번만 둔다(그 전에는 높이가 0~1이라 표가 사라진다).
@@ -348,7 +401,7 @@ class AnalysisTab:
                     "북마크 없음 — [+ 북마크]나 B 키로 추가")
             rows.append(("none", ("", "", text, ""), "muted"))
         self._bookmark_table.set_rows(rows)
-        self._lists.tab(1, text=f"북마크 ({len(self.bookmarks)})" if self.bookmarks else "북마크")
+        self._lists.tab(self._bookmark_page, text=f"북마크 ({len(self.bookmarks)})" if self.bookmarks else "북마크")
         self._bookmark_note.configure(text="")
 
     def _show_bookmark_menu(self, event: tk.Event) -> None:
@@ -373,8 +426,37 @@ class AnalysisTab:
             messagebox.showinfo("북마크", "녹화나 처리부 로그를 연 뒤에 북마크를 달 수 있습니다.",
                                 parent=self.frame)
             return
-        BookmarkDialog(self.frame, self._add_saved, start_ms=self._current_ms, track_ids=self._track_ids(),
+        # 어느 탭에서 불렀든(B 키) 지금 재생 위치를 그때 묻는다. 분석 탭이 마지막으로 그려진 시각을 쓰면 안 된다.
+        position = self._current_position()
+        start_ms = position.processor_ms if position is not None else None
+
+        def saved(bookmark: Bookmark) -> None:
+            self._place(bookmark, position)
+            self._add_saved(bookmark)
+
+        BookmarkDialog(self.frame, saved, start_ms=start_ms, track_ids=self._track_ids(),
                        save_path=str(self._session.bookmark_file))
+
+    def _place(self, bookmark: Bookmark, position: Optional[ReplayPosition] = None,
+               recording_s: Optional[float] = None, segment: Optional[int] = None) -> None:
+        """북마크에 녹화 위치와 처리부 실행 구간을 채운다(처리부 재시작이 있어도 위치가 하나로 정해지게).
+
+        창에서 시각을 바꾸지 않았으면 열 때의 녹화 위치를 그대로 쓰고, 바꿨으면 같은 구간 안에서 처리부 시각으로 다시 찾는다.
+        """
+        player = self._session.player if self._session else None
+        if position is not None:
+            recording_s, segment = position.recording_s, position.segment
+            if bookmark.start_ms != position.processor_ms:
+                recording_s = None
+        if player is None:
+            return
+        if segment is None and recording_s is not None:
+            segment = player.segment_at(recording_s)
+        bookmark.segment = segment
+        bookmark.recording_s = (recording_s if recording_s is not None else
+                                player.time_for_processor_ms(bookmark.start_ms, segment))
+        bookmark.end_recording_s = (None if bookmark.end_ms is None else
+                                    player.time_for_processor_ms(bookmark.end_ms, segment))
 
     def _track_ids(self) -> List[int]:
         report = self._session.report if self._session else None
@@ -390,6 +472,11 @@ class AnalysisTab:
         original = self.bookmarks[index]
 
         def saved(bookmark: Bookmark) -> None:
+            # 시각을 그대로 두었으면 원래 녹화 위치를, 바꿨으면 같은 처리부 실행 구간 안에서 다시 찾는다.
+            same = bookmark.start_ms == original.start_ms
+            self._place(bookmark, recording_s=original.recording_s if same else None, segment=original.segment)
+            if same and bookmark.end_ms == original.end_ms:
+                bookmark.end_recording_s = original.end_recording_s
             bookmarks = list(self.bookmarks)
             bookmarks[index] = bookmark
             self._store(bookmarks, bookmark)
@@ -416,7 +503,7 @@ class AnalysisTab:
             messagebox.showerror("북마크 저장 실패", f"{session.bookmark_file}\n{error}\n\n"
                                  "화면의 북마크는 남아 있지만 프로그램을 끄면 사라집니다.", parent=self.frame)
         self._fill_bookmarks()
-        self._lists.select(1)
+        self._lists.select(self._bookmark_page)
         if select is not None and select in session.bookmarks:
             self._bookmark_table.select(str(session.bookmarks.index(select)))
         self._draw_timeline()
@@ -426,7 +513,103 @@ class AnalysisTab:
             return
         bookmark = self.bookmarks[int(iid)]
         self._bookmark_note.configure(text=bookmark.note or "(메모 없음)")
-        self._focus_time(bookmark.start_ms, bookmark.track_id)
+        self._focus_time(bookmark.start_ms, bookmark.track_id, bookmark.recording_s, bookmark.segment)
+
+    # 문제 (자동 기록)
+
+    def _source_problems(self) -> List[Problem]:
+        if self._session is not None:
+            return self._session.problems()
+        return list(self._live_problems())
+
+    def _filtered(self, problems: List[Problem]) -> List[Problem]:
+        choice = self._problem_filter.get()
+        if choice == "이상만":
+            return [problem for problem in problems if problem.level == LEVEL_BAD]
+        if choice in ("빔", "추적", "통신", "처리부 로그"):
+            return [problem for problem in problems if problem.category == choice]
+        return problems
+
+    def _fill_problems(self, force: bool = False) -> None:
+        source = self._source_problems()
+        signature = (id(self._session), len(source),
+                     tuple((problem.count, problem.level, problem.end_ms) for problem in source[-5:]))
+        if not force and signature == self._problem_signature:
+            return
+        self._problem_signature = signature
+        self._problems = self._filtered(source)
+        rows = []
+        for index, problem in enumerate(self._problems):
+            time_text = format_time(problem.start_ms) if problem.start_ms is not None else "-"
+            if problem.is_range:
+                time_text += f" +{problem.duration_ms / 1000:.1f}s"
+            level = "■ 이상" if problem.level == LEVEL_BAD else "▲ 주의"
+            segment = f"[실행 {problem.segment + 1}] " if problem.segment else ""
+            rows.append((str(index), (time_text, level, problem.category, segment + problem.title,
+                                      problem.count), "bad" if problem.level == LEVEL_BAD else "warn"))
+        if not rows:
+            if self._session is None:
+                text = "실시간으로 감지한 문제 없음" if not source else "고른 분류의 문제 없음"
+            else:
+                text = "문제 없음" if not source else "고른 분류의 문제 없음"
+            rows.append(("none", ("", "", "", text, ""), "muted"))
+        self._problem_table.set_rows(rows)
+        counts = level_counts(source)
+        title = f"문제 ({counts['bad'] + counts['warn']})" if source else "문제"
+        self._lists.tab(self._problem_page, text=title)
+        origin = "녹화에서 다시 계산" if self._session is not None and self._session.player is not None else (
+            "처리부 로그" if self._session is not None else "실시간")
+        self._problem_summary.configure(text=f"이상 {counts['bad']} · 주의 {counts['warn']} · {origin}")
+        self._draw_timeline()
+
+    def _selected_problem(self) -> Optional[Problem]:
+        selection = self._problem_table.tree.selection()
+        if selection and selection[0].isdigit() and int(selection[0]) < len(self._problems):
+            return self._problems[int(selection[0])]
+        return None
+
+    def _on_problem_selected(self, iid: str) -> None:
+        if not iid.isdigit() or int(iid) >= len(self._problems):
+            return
+        problem = self._problems[int(iid)]
+        lines = [problem.detail] if problem.detail else []
+        if problem.count > 1:
+            lines.append(f"{problem.count}회 합침")
+        if self._session is None:
+            lines.append("실시간 기록 — 녹화해 둔 세션을 열면 이 위치로 이동할 수 있습니다")
+        elif problem.start_s is None:
+            lines.append("녹화가 없어 재생 위치로 이동할 수 없습니다")
+        self._problem_note.configure(text=" · ".join(lines))
+        if self._session is not None:
+            recording_s = None if problem.start_s is None else max(problem.start_s - PROBLEM_LEAD_S, 0.0)
+            lead_ms = None if problem.start_ms is None else problem.start_ms - int(PROBLEM_LEAD_S * 1000)
+            self._focus_time(lead_ms, problem.track_id, recording_s, problem.segment)
+
+    def _show_problem_menu(self, event: tk.Event) -> None:
+        tree = self._problem_table.tree
+        row = tree.identify_row(event.y)
+        if row and row.isdigit():
+            tree.selection_set(row)
+        state = tk.NORMAL if self._selected_problem() is not None and self._session is not None else tk.DISABLED
+        self._problem_menu.entryconfigure(0, state=state)
+        self._problem_menu.tk_popup(event.x_root, event.y_root)
+
+    def _bookmark_selected_problem(self) -> None:
+        problem = self._selected_problem()
+        if problem is None or self._session is None or problem.start_ms is None:
+            return
+        template = Bookmark(problem.start_ms, problem.title, end_ms=problem.end_ms if problem.is_range else None,
+                            tag="이슈" if problem.level == LEVEL_BAD else "확인 필요", track_id=problem.track_id,
+                            note=problem.detail)
+
+        def saved(bookmark: Bookmark) -> None:
+            same = bookmark.start_ms == problem.start_ms
+            self._place(bookmark, recording_s=problem.start_s if same else None, segment=problem.segment)
+            self._add_saved(bookmark)
+
+        dialog = BookmarkDialog(self.frame, saved, track_ids=self._track_ids(), bookmark=template,
+                                save_path=str(self._session.bookmark_file))
+        dialog.window.title("문제를 북마크로 남기기")
 
     # 이벤트
 
@@ -454,9 +637,16 @@ class AnalysisTab:
             self._focus_event(self._events[int(iid)])
 
     def _on_timeline_click(self, event: tk.Event) -> None:
+        hits = [item for item in self._problem_points if item[0] <= event.x <= item[2] and item[1] <= event.y <= item[3]]
+        if hits:
+            index = min(hits, key=lambda item: abs((item[0] + item[2]) / 2 - event.x))[4]
+            self._lists.select(self._problem_page)
+            self._problem_table.select(str(index))
+            self._on_problem_selected(str(index))
+            return
         for left, top, right, bottom, index in self._bookmark_points:
             if left - 4 <= event.x <= right + 4 and top <= event.y <= bottom:
-                self._lists.select(1)
+                self._lists.select(self._bookmark_page)
                 self._bookmark_table.select(str(index))
                 self._on_bookmark_selected(str(index))
                 return
@@ -468,7 +658,9 @@ class AnalysisTab:
             self._focus_event(self._events[index])
 
     def refresh(self, state: Optional[MonitorState]) -> None:
-        """재생 위치 선을 갱신한다."""
+        """재생 위치 선을 갱신한다. 세션이 없으면 실시간 문제 목록을 갱신한다."""
+        if self._session is None:
+            self._fill_problems()
         current = state.now_ms() if state is not None else None
         if current != self._current_ms:
             self._current_ms = current
@@ -486,6 +678,11 @@ class AnalysisTab:
         if recording_range:
             times.extend(recording_range)
         self._bookmark_points = []
+        self._problem_points = []
+        problems = self._problems if session is not None else []
+        for problem in problems:
+            if problem.start_ms is not None:
+                times.append(problem.start_ms)
         for bookmark in self.bookmarks:
             times.append(bookmark.start_ms)
             if bookmark.end_ms is not None:
@@ -499,8 +696,9 @@ class AnalysisTab:
         label_width = 80
         left, right = label_width, width - 12
         band = 14
-        mark_lane = 18
-        lanes_top = band + mark_lane
+        mark_lane = 16
+        problem_lane = 16
+        lanes_top = band + mark_lane + problem_lane
         lane_height = (height - 24 - lanes_top) / len(TIMELINE_LANES)
 
         def to_x(value: float) -> float:
@@ -522,6 +720,7 @@ class AnalysisTab:
         visible = {id(event): index for index, event in enumerate(self._events)}
         colors = {"bad": BAD, "warn": WARN, "ok": OK, "info": TEXT}
         self._draw_bookmarks(canvas, to_x, left, band, mark_lane, height - 22)
+        self._draw_problem_lane(canvas, problems, to_x, left, right, band + mark_lane, problem_lane)
         placer = LabelPlacer(canvas, (left, lanes_top, right, height - 22))
         for event in all_events:
             if event.processor_ms is None or event.category not in TIMELINE_LANES:
@@ -541,6 +740,23 @@ class AnalysisTab:
         if self._current_ms is not None and low <= self._current_ms <= high:
             x = to_x(self._current_ms)
             canvas.create_line(x, 0, x, height - 22, fill=TEXT, width=2)
+
+    def _draw_problem_lane(self, canvas: tk.Canvas, problems: List[Problem], to_x: Callable[[float], float],
+                           left: float, right: float, top: float, lane: float) -> None:
+        """타임라인 '문제' 줄: 자동 기록한 문제를 수준 색으로. 구간은 막대, 한 시점은 짧은 세로 막대."""
+        canvas.create_text(left - 8, top + lane / 2, text="문제", anchor="e", fill=MUTED, font=FONT_SMALL)
+        canvas.create_rectangle(left, top + 1, right, top + lane - 1, fill=PANEL, outline="")
+        selected = self._selected_problem()
+        for index, problem in enumerate(problems):
+            if problem.start_ms is None:
+                continue
+            color = BAD if problem.level == LEVEL_BAD else WARN
+            x0 = to_x(problem.start_ms)
+            x1 = max(to_x(problem.end_ms), x0 + 3) if problem.end_ms is not None else x0 + 3
+            outline = TEXT if problem is selected else ""
+            canvas.create_rectangle(x0, top + 3, x1, top + lane - 3, fill=color, outline=outline,
+                                    width=2 if outline else 1)
+            self._problem_points.append((x0 - 2, top, x1 + 2, top + lane, index))
 
     def _draw_bookmarks(self, canvas: tk.Canvas, to_x: Callable[[float], float], left: float, band: float,
                         lane: float, bottom: float) -> None:

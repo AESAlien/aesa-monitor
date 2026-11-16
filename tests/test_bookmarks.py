@@ -29,6 +29,23 @@ class BookmarkFileTest(unittest.TestCase):
             self.assertEqual(data["version"], 1)
             self.assertFalse(path.with_name(path.name + ".tmp").exists())
 
+    def test_recording_position_round_trip_and_old_format(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / BOOKMARK_FILE
+            # 처리부 재시작 뒤 같은 처리부 시각: 녹화 위치와 구간으로 구분되고, 녹화 순서로 정렬된다.
+            save_bookmarks(path, [
+                Bookmark(1500, "두 번째 실행", recording_s=6.5, segment=1),
+                Bookmark(1500, "첫 번째 실행", recording_s=1.5, segment=0),
+            ])
+            loaded = load_bookmarks(path)
+            self.assertEqual([(item.title, item.recording_s, item.segment) for item in loaded],
+                             [("첫 번째 실행", 1.5, 0), ("두 번째 실행", 6.5, 1)])
+            # 이전 형식(녹화 위치 없음)도 읽는다.
+            path.write_text(json.dumps({"version": 1, "bookmarks": [{"start_ms": 10, "title": "old"}]}),
+                            encoding="utf-8")
+            old = load_bookmarks(path)[0]
+            self.assertEqual((old.start_ms, old.recording_s, old.segment), (10, None, None))
+
     def test_missing_file_is_empty_and_broken_file_raises(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / BOOKMARK_FILE
