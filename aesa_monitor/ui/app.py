@@ -16,7 +16,7 @@ from typing import Optional
 
 from aesa_monitor.core.config import MonitorConfig, TrackingParameters
 from aesa_monitor.core.events import PEER_CONSOLE, PEER_SIMULATOR, SOURCE_CAPTURE, Event
-from aesa_monitor.core.problems import ProblemDetector, level_counts
+from aesa_monitor.core.problems import LINK_EVENTS, ProblemDetector, level_counts
 from aesa_monitor.core.settings import MonitorSettings, save_settings
 from aesa_monitor.core.state import MonitorState
 from aesa_monitor.io.processor_log import CATEGORY_REJECTED, LogEvent
@@ -415,6 +415,9 @@ class MonitorApp:
             except queue.Empty:
                 return
             self._live.apply(event)
+            if isinstance(event, LINK_EVENTS):
+                # 연결 변화는 감지 간격(0.25 s)보다 짧게 끊겼다 이어질 수 있어 사건마다 넘긴다.
+                self._live_problems.observe(event, self._live)
 
     def _draw_top_bar(self, state: MonitorState) -> None:
         if self._replaying:

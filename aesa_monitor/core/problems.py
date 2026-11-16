@@ -6,7 +6,10 @@
 - 분석: 녹화를 열 때 scan_events()로 처음부터 다시 계산한다. 기준을 고치면 예전 녹화에도 그대로 적용된다.
 
 기준은 새로 만들지 않고 실시간 판정(core/verdict.py)과 같은 값을 쓴다. 모니터 추정이 섞인 값
-(예측-측정 잔차, 연관 탐지 선택)은 넣지 않고 사실에 가까운 것만 기록한다.
+(예측-측정 잔차, 연관 탐지 선택과 그에 기댄 '빔 안 위치')은 넣지 않고 사실에 가까운 것만 기록한다.
+
+상태가 이어지는 문제는 update()가 일정 간격(0.25 s)으로 상태를 보고 판단한다. 연결 변화(ConnectionChanged,
+PeerLinkChanged)는 그 간격보다 짧게 끊겼다 이어질 수 있으므로 observe()로 사건마다 받는다.
 
 사건 묶기: 같은 종류(트랙 문제는 같은 트랙)가 MERGE_MS 안에 다시 생기면 한 사건으로 합친다.
 상태가 이어지는 문제(예: 탐색 프레임 시간 이탈)는 시작부터 풀릴 때까지를 한 구간으로 남긴다.
@@ -23,7 +26,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 from aesa_monitor.core.config import TrackingParameters
-from aesa_monitor.core.events import PEER_CONSOLE, PEER_NAMES, PEER_SIMULATOR, ConnectionChanged, Event
+from aesa_monitor.core.events import (
+    PEER_CONSOLE, PEER_NAMES, PEER_SIMULATOR, ConnectionChanged, Event, PeerLinkChanged,
+)
 from aesa_monitor.core.protocol import BeamType
 from aesa_monitor.core.state import BEAM_SLOT_MS, TIME_RESET_THRESHOLD_MS, MonitorState
 from aesa_monitor.core.tracking import Outcome
@@ -48,7 +53,8 @@ CATEGORY_BEAM = "빔"
 CATEGORY_TRACK = "추적"
 CATEGORY_LINK = "통신"
 CATEGORY_LOG = "처리부 로그"
-TRACK_KINDS = ("miss", "ended", "confirm-fail", "off-beam")
+TRACK_KINDS = ("miss", "ended", "confirm-fail")
+LINK_EVENTS = (ConnectionChanged, PeerLinkChanged)
 
 
 @dataclass
@@ -123,6 +129,43 @@ class ProblemDetector:
             self._watch_beams(state, now_s, now_ms)
             self._watch_tracks(state, now_s, now_ms)
         self._close_stale(now_s, now_ms)
+
+    def observe(self, event: Event, state: MonitorState) -> None:
+        """연결 변화를 사건마다 받는다. state.apply(event) 직후에 부른다.
+
+        update()는 일정 간격으로 상태만 보므로, 그 사이에 끊겼다 다시 이어지면 끊김을 놓친다(재연결하면 처리부 기록이
+        지워지므로 짧아도 실제 끊김이다). 그래서 끊김·재연결 시각을 사건 그대로 남긴다.
+        """
+        now_s = state.clock()
+        if isinstance(event, ConnectionChanged):
+            if not event.connected:
+                if self._was_connected:
+                    # 끊겨도 state는 기록을 지우지 않으므로(다시 연결될 때 지움) now_ms는 끊기기 직전 처리부 시각이다.
+                    self._report("disconnect", CATEGORY_LINK, BAD, "처리부 연결 끊김", event.detail or "",
+                                 state.now_ms(), now_s, occurrence=False)
+            else:
+                self._close_disconnect(now_s)
+            self._was_connected = event.connected
+        elif isinstance(event, PeerLinkChanged):
+            key = (f"peer-{event.peer}", None)
+            name = PEER_NAMES.get(event.peer, event.peer)
+            if not event.connected:
+                self._report(key[0], CATEGORY_LINK, BAD, f"{name} 연결 끊김", event.detail or "통신 캡처 기준",
+                             state.now_ms(), now_s)
+            else:
+                item = self._open.pop(key, None)
+                if item is not None:
+                    item.problem.end_s = now_s
+                    item.problem.end_ms = state.now_ms() or item.problem.end_ms
+                    item.problem.open = False
+
+    def _close_disconnect(self, now_s: float) -> None:
+        item = self._open.pop(("disconnect", None), None)
+        if item is not None:
+            item.problem.end_s = now_s
+            item.problem.detail = (f"{item.problem.detail} · " if item.problem.detail else "") + (
+                f"{now_s - item.problem.start_s:.1f} s 뒤 다시 연결")
+            item.problem.open = False
 
     def finish(self) -> None:
         """기록이 끝났을 때(녹화 끝) 이어지는 사건을 모두 닫는다."""
@@ -199,25 +242,15 @@ class ProblemDetector:
     # 통신
 
     def _watch_link(self, state: MonitorState, now_s: float, now_ms: Optional[int]) -> None:
-        if not state.connected:
-            if self._was_connected:
-                self._report("disconnect", CATEGORY_LINK, BAD, "처리부 연결 끊김",
-                             state.connection_detail or "", now_ms, now_s, occurrence=False)
-            item = self._open.get(("disconnect", None))
-            if item is not None:
-                item.problem.end_s = now_s
-        else:
-            item = self._open.pop(("disconnect", None), None)
-            if item is not None:
-                item.problem.end_s = now_s
-                item.problem.detail = (f"{item.problem.detail} · " if item.problem.detail else "") + (
-                    f"{now_s - item.problem.start_s:.1f} s 뒤 다시 연결")
-                item.problem.open = False
+        """상대 연결 상태(처리부 상태 메시지 0xAD01 기준). 처리부 연결 끊김은 observe()가 사건으로 받는다."""
+        item = self._open.get(("disconnect", None))
+        if item is not None:
+            item.problem.end_s = now_s
+        if state.connected:
             for peer in (PEER_CONSOLE, PEER_SIMULATOR):
-                if state.peer_connected(peer) is False:
+                if state.fresh_status() is not None and state.peer_connected(peer) is False:
                     self._report(f"peer-{peer}", CATEGORY_LINK, BAD, f"{PEER_NAMES[peer]} 연결 안 됨",
                                  "처리부 상태 메시지 기준", now_ms, now_s, occurrence=False)
-        self._was_connected = state.connected
         if state.connect_count != self._connects:
             # 다시 연결되면 처리부 기록이 지워지므로 이미 본 사이클·빈 칸 표시도 비운다.
             self._connects = state.connect_count
@@ -352,11 +385,8 @@ class ProblemDetector:
                     self._report("confirm-fail", CATEGORY_TRACK, WARN, f"요청 #{track_id} 확인 실패",
                                  "확인 빔 뒤 트랙을 만들지 않음", cycle.time_ms, at_s, track_id=track_id,
                                  grace_ms=grace)
-                selected = cycle.selected
-                if selected is not None and selected.beam_offset > 1.0:
-                    self._report("off-beam", CATEGORY_TRACK, WARN, f"트랙 #{track_id} 빔 밖 탐지",
-                                 f"빔 안 위치 {selected.beam_offset:.2f} (1 넘으면 모의기 기준 빔 밖)",
-                                 cycle.time_ms, at_s, track_id=track_id, grace_ms=grace)
+                # '빔 밖 탐지'(연관 탐지의 빔 안 위치 > 1)는 기록하지 않는다. 연관 탐지는 모니터가 m 거리로 고른 추정이라
+                # 처리부(NDS)가 빔 안 탐지를 썼어도 빔 밖 탐지를 고를 수 있다. 빔 안 위치는 추적 탭에서 보는 값으로만 쓴다.
         if len(self._seen_cycles) > 20000:
             self._seen_cycles = {mark for mark in self._seen_cycles
                                  if mark[0] == self._epoch and mark[2] >= now_ms - 60000}
@@ -384,6 +414,8 @@ def scan_events(events: Iterable[Tuple[float, Event]], parameters: TrackingParam
             next_update += step_s
         position[0] = time_s
         state.apply(event, time_s)
+        if isinstance(event, LINK_EVENTS):
+            detector.observe(event, state)
         if not isinstance(event, ConnectionChanged):
             last_data_s = time_s
     detector.update(state)

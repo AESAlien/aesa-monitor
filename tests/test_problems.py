@@ -1,7 +1,7 @@
 import unittest
 
 from aesa_monitor.core.config import TrackingParameters
-from aesa_monitor.core.events import ConnectionChanged
+from aesa_monitor.core.events import PEER_SIMULATOR, ConnectionChanged, PeerLinkChanged
 from aesa_monitor.core.problems import BAD, WARN, scan_events
 from aesa_monitor.core.protocol import Beam, BeamType, Detection, MonitorStatus, Plot, Track, TrackList
 
@@ -91,6 +91,30 @@ class RestartAndLinkTest(unittest.TestCase):
         self.assertEqual(len(of_kind(problems, "restart")), 1)
         self.assertEqual(len(of_kind(problems, "disconnect")), 1)
 
+    def test_short_disconnect_inside_one_scan_step_is_recorded(self):
+        # 감지 간격(0.25 s) 안에 끊겼다 다시 연결돼도 사건으로 받아 남긴다.
+        recording = Recording()
+        recording.beams(0, 4000)
+        recording.events.append((4.10, ConnectionChanged(False, "closed by processor")))
+        recording.events.append((4.15, ConnectionChanged(True)))
+        recording.offset_s = 4.15
+        recording.beams(0, 3000)
+        disconnects = of_kind(recording.scan(), "disconnect")
+        self.assertEqual(len(disconnects), 1)
+        self.assertAlmostEqual(disconnects[0].start_s, 4.10)
+        self.assertAlmostEqual(disconnects[0].end_s, 4.15)
+        self.assertIn("0.1 s 뒤 다시 연결", disconnects[0].detail)
+
+    def test_short_peer_link_drop_from_capture_is_recorded(self):
+        recording = Recording()
+        recording.beams(0, 4000)
+        recording.events.append((2.01, PeerLinkChanged(PEER_SIMULATOR, False, "FIN")))
+        recording.events.append((2.05, PeerLinkChanged(PEER_SIMULATOR, True)))
+        drops = of_kind(recording.scan(), f"peer-{PEER_SIMULATOR}")
+        self.assertEqual(len(drops), 1)
+        self.assertEqual((drops[0].level, drops[0].open), (BAD, False))
+        self.assertAlmostEqual(drops[0].end_s, 2.05)
+
     def test_mid_recording_disconnect_is_recorded_but_final_one_is_not(self):
         recording = Recording()
         recording.beams(0, 4000)
@@ -128,6 +152,20 @@ class MissTest(unittest.TestCase):
         self.assertEqual(misses[0].level, BAD)
         self.assertEqual(misses[0].track_id, 7)
         self.assertEqual(misses[0].start_ms, 3005)
+
+
+class OffBeamTest(unittest.TestCase):
+    def test_detection_outside_beam_is_not_an_automatic_problem(self):
+        # 연관 탐지(모니터 추정)에 기대는 '빔 밖 탐지'는 자동 기록하지 않는다.
+        recording = Recording()
+        recording.beams(0, 6000, skip=tuple(range(5, 6000, 1000)))
+        for beam_ms in range(1005, 5000, PARAMETERS.tracking_interval_ms):
+            recording.add(beam_ms, Beam(BeamType.TRACKING, beam_ms, 7, 0, 20.0, 1.5, 3.0, 3.0))
+            recording.add(beam_ms + 1, Detection(BeamType.TRACKING, beam_ms, 7, [Plot(50.0, 24.0, 1.5, -250.0, 80.0)]))
+            recording.add(beam_ms + 2, TrackList([track(7, beam_ms)]))
+        problems = recording.scan()
+        self.assertEqual([problem for problem in problems if problem.kind == "off-beam"], [])
+        self.assertEqual([problem for problem in problems if problem.track_id == 7], [])
 
 
 class TrackEndTest(unittest.TestCase):
