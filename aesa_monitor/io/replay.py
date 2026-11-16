@@ -8,14 +8,24 @@ state의 clock은 재생 위치(녹화 시작 후 초)다. 그래서 수신 속�
 from __future__ import annotations
 
 import bisect
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from aesa_monitor.core.events import Event
 from aesa_monitor.core.protocol import Beam, MonitorStatus
-from aesa_monitor.core.state import MonitorState
+from aesa_monitor.core.state import TIME_RESET_THRESHOLD_MS, MonitorState
 from aesa_monitor.io.recording import Recording
 
 SPEEDS = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)
+
+
+@dataclass(frozen=True)
+class ReplayPosition:
+    """재생 위치 하나를 처리부 시각·녹화 위치·처리부 실행 구간으로 나타낸 것."""
+
+    processor_ms: Optional[int]
+    recording_s: float
+    segment: int
 
 
 class ReplayPlayer:
@@ -29,12 +39,23 @@ class ReplayPlayer:
         self.playing = False
         self._index = 0
         self.state = self._new_state()
-        # 처리부 시각 → 녹화 시각 대응표. 처리부가 다시 시작하면 구간이 나뉜다.
-        self._processor_index: List[Tuple[int, float]] = []
+        # 처리부 시각 → 녹화 시각 대응표. 처리부가 다시 시작하면(처리부 시각이 1초 넘게 되돌아가면) 구간이 나뉜다.
+        # 구간 번호는 0부터이고, 통계(core/stats.py)와 같은 규칙이다. 같은 처리부 시각이 구간마다 나올 수 있으므로
+        # 처리부 시각으로 녹화 위치를 찾을 때는 구간을 함께 준다.
+        self._processor_index: List[Tuple[int, float, int]] = []
+        self._segment_starts: List[float] = []
+        segment = -1
+        latest: Optional[int] = None
         for time_s, event in self.events:
             processor_ms = _processor_time(event)
-            if processor_ms is not None:
-                self._processor_index.append((processor_ms, time_s))
+            if processor_ms is None:
+                continue
+            if latest is None or processor_ms + TIME_RESET_THRESHOLD_MS < latest:
+                segment += 1
+                self._segment_starts.append(time_s)
+                latest = processor_ms
+            latest = max(latest, processor_ms)
+            self._processor_index.append((processor_ms, time_s, segment))
 
     def _new_state(self) -> MonitorState:
         return MonitorState(clock=lambda: self.position_s)
@@ -87,12 +108,33 @@ class ReplayPlayer:
     def processor_range_ms(self) -> Optional[Tuple[int, int]]:
         if not self._processor_index:
             return None
-        values = [value for value, _ in self._processor_index]
+        values = [value for value, _, _ in self._processor_index]
         return min(values), max(values)
 
-    def time_for_processor_ms(self, processor_ms: int) -> Optional[float]:
-        """처리부 시각이 processor_ms에 처음 도달한 녹화 시각."""
-        for value, time_s in self._processor_index:
+    @property
+    def segment_count(self) -> int:
+        """처리부 실행 구간 수. 녹화 중 처리부가 다시 시작하지 않았으면 1이다."""
+        return len(self._segment_starts)
+
+    def current_position(self) -> ReplayPosition:
+        """지금 재생 위치. 처리부 시각은 화면에 보이는 값(state.now_ms())이다."""
+        return ReplayPosition(self.state.now_ms(), self.position_s, self.segment_at(self.position_s))
+
+    def segment_at(self, position_s: float) -> int:
+        """녹화 위치가 속한 처리부 실행 구간 번호(0부터). 처리부 시각이 없으면 0이다."""
+        if not self._segment_starts:
+            return 0
+        return max(bisect.bisect_right(self._segment_starts, position_s) - 1, 0)
+
+    def time_for_processor_ms(self, processor_ms: int, segment: Optional[int] = None) -> Optional[float]:
+        """처리부 시각이 processor_ms에 처음 도달한 녹화 시각.
+
+        segment를 주면 그 처리부 실행 구간 안에서만 찾는다. 주지 않으면 녹화 전체에서 처음 맞는 곳이라,
+        처리부가 다시 시작한 녹화에서는 앞 구간으로 갈 수 있다.
+        """
+        for value, time_s, index in self._processor_index:
+            if segment is not None and index != segment:
+                continue
             if value >= processor_ms:
                 return time_s
         return None

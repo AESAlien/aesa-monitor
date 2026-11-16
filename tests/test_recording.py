@@ -153,6 +153,47 @@ class ReplayTest(unittest.TestCase):
         self.assertAlmostEqual(self.player.time_for_processor_ms(1015), 0.03)
         self.assertIsNone(self.player.time_for_processor_ms(5000))
         self.assertAlmostEqual(self.player.first_beam_s(), 0.01)
+        self.assertEqual(self.player.segment_count, 1)
+        self.assertEqual(self.player.segment_at(0.05), 0)
+
+
+class RestartReplayTest(unittest.TestCase):
+    """처리부가 녹화 중 다시 시작해 처리부 시각이 0부터 다시 세는 경우."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        path = Path(self.directory.name) / RECORDING_NAME
+        clock = FakeClock()
+        recorder = Recorder(path, {"server": "x"}, clock=clock)
+        recorder.write_connection(True)
+        for run in range(2):
+            for index in range(300):           # 처리부 시각 0 ~ 2990 ms
+                clock.now += 0.01
+                recorder.write_frame(encode(beam(index * 10, index)))
+            clock.now += 1.0
+        recorder.close()
+        self.player = ReplayPlayer(read_recording(path))
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_splits_segments_at_restart(self):
+        self.assertEqual(self.player.segment_count, 2)
+        first = self.player.time_for_processor_ms(1500, segment=0)
+        second = self.player.time_for_processor_ms(1500, segment=1)
+        self.assertAlmostEqual(first, 1.51)
+        self.assertAlmostEqual(second, 1.51 + 3.0 + 1.0)
+        self.assertEqual(self.player.segment_at(first), 0)
+        self.assertEqual(self.player.segment_at(second), 1)
+        # 구간을 주지 않으면 처음 맞는 곳(앞 구간)이다.
+        self.assertAlmostEqual(self.player.time_for_processor_ms(1500), first)
+
+    def test_current_position_has_segment(self):
+        self.player.seek(5.6)
+        position = self.player.current_position()
+        self.assertEqual(position.segment, 1)
+        self.assertAlmostEqual(position.recording_s, 5.6)
+        self.assertAlmostEqual(position.processor_ms, 1590, delta=20)  # 두 번째 실행 첫 빔이 녹화 4.01초
 
 
 if __name__ == "__main__":

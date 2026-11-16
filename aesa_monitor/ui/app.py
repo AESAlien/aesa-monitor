@@ -16,13 +16,14 @@ from typing import Optional
 
 from aesa_monitor.core.config import MonitorConfig, TrackingParameters
 from aesa_monitor.core.events import PEER_CONSOLE, PEER_SIMULATOR, SOURCE_CAPTURE, Event
+from aesa_monitor.core.problems import LINK_EVENTS, ProblemDetector, level_counts
 from aesa_monitor.core.settings import MonitorSettings, save_settings
 from aesa_monitor.core.state import MonitorState
 from aesa_monitor.io.processor_log import CATEGORY_REJECTED, LogEvent
 from aesa_monitor.io.recording import (
     PROCESSOR_LOG_DIRECTORY, RECORDING_NAME, Recorder, new_session_directory,
 )
-from aesa_monitor.io.replay import SPEEDS
+from aesa_monitor.io.replay import SPEEDS, ReplayPosition
 from aesa_monitor.io.session import Session, load_session
 from aesa_monitor.ui.analysis_tab import AnalysisTab
 from aesa_monitor.ui.beam_tab import BeamTab
@@ -35,6 +36,8 @@ from aesa_monitor.ui.style import (
 from aesa_monitor.ui.track_tab import TrackTab
 
 REFRESH_MS = 50
+# 실시간 문제 감지 간격(초). 녹화를 다시 계산할 때(core/problems.SCAN_STEP_S)와 같다.
+PROBLEM_UPDATE_SECONDS = 0.25
 MAX_EVENTS_PER_REFRESH = 20000
 TAB_REFRESH_SECONDS = {"beam": 0.05, "track": 0.2, "comm": 0.25, "analysis": 0.25}
 TAB_TITLES = {"beam": " 빔 ", "track": " 추적 ", "comm": " 통신 ", "analysis": " 분석 "}
@@ -57,6 +60,10 @@ class MonitorApp:
         self._last_frame = time.monotonic()
         self._slider_dragging = False
         parameters = config.tracking if config else TrackingParameters()
+        # 실시간 문제 자동 기록. 녹화를 열면 녹화에서 다시 계산한 결과(session.problems())를 쓴다.
+        self._live_problems = ProblemDetector(parameters)
+        self._last_problem_update = 0.0
+        self._problem_tab_title = ""
         server_text = f"{config.server[0]}:{config.server[1]}" if config else "접속 안 함"
 
         root.title("AESA 데이터 처리부 모니터")
@@ -76,7 +83,8 @@ class MonitorApp:
             "track": TrackTab(self._notebook, parameters),
             "comm": CommTab(self._notebook, server_text),
             "analysis": AnalysisTab(self._notebook, self.choose_folder, self.choose_file, self.fetch_logs,
-                                    self.focus_event, self.select_run),
+                                    self.focus_event, self.select_run, self.focus_time, self.current_position,
+                                    lambda: self._live_problems.problems),
         }
         for key, tab in self._tabs.items():
             self._notebook.add(tab.frame, text=TAB_TITLES[key])
@@ -89,6 +97,8 @@ class MonitorApp:
         root.bind("<Control-KP_Subtract>", lambda _event: self.change_font(-1))
         root.bind("<Control-Key-0>", lambda _event: self.set_font_size(12))
         root.bind("<space>", self._on_space)
+        root.bind("<KeyPress-b>", self._on_bookmark_key)
+        root.bind("<KeyPress-B>", self._on_bookmark_key)
         root.protocol("WM_DELETE_WINDOW", self.close)
         if settings.auto_record and connection is not None:
             root.after(200, self.start_recording)
@@ -112,7 +122,8 @@ class MonitorApp:
         self._time_label.pack(side=tk.LEFT, padx=8)
 
         buttons = tk.Frame(bar, background=BACKGROUND)
-        buttons.pack(side=tk.RIGHT)
+        # 버튼을 왼쪽 글자보다 먼저 배치해 창이 좁으면 버튼이 아니라 글자 쪽이 줄어들게 한다.
+        buttons.pack(side=tk.RIGHT, before=self._processor_label)
         ttk.Button(buttons, text="A−", width=3, command=lambda: self.change_font(-1)).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="A+", width=3, command=lambda: self.change_font(1)).pack(side=tk.RIGHT, padx=(8, 2))
         ttk.Button(buttons, text="열기", command=self.choose_folder).pack(side=tk.RIGHT, padx=2)
@@ -303,6 +314,22 @@ class MonitorApp:
         if self._replaying and not isinstance(event.widget, (tk.Entry, ttk.Entry)):
             self._toggle_play()
 
+    def current_position(self) -> Optional[ReplayPosition]:
+        """지금 재생 위치. 재생 중이 아니면(실시간) None이다. 어느 탭이 보이든 같은 값을 준다."""
+        if self._replaying and self._session is not None and self._session.player is not None:
+            return self._session.player.current_position()
+        return None
+
+    def _on_bookmark_key(self, event: tk.Event) -> None:
+        """B 키: 세션을 열었으면 어느 탭에서든 지금 재생 위치로 북마크 추가 창을 연다. 글자 입력 칸에서는 무시한다."""
+        if self._session is None or isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox)):
+            return
+        if event.widget.winfo_toplevel() is not self._root:
+            return
+        if self._session.player is not None:
+            self._session.player.pause()
+        self._tabs["analysis"].add_bookmark()
+
     def _on_speed(self, _event: object) -> None:
         if self._session is not None and self._session.player is not None:
             self._session.player.speed = SPEEDS[self._speed_box.current()]
@@ -326,18 +353,37 @@ class MonitorApp:
 
     def focus_event(self, event: LogEvent) -> None:
         """분석 탭에서 고른 이벤트의 1초 전으로 재생 위치를 옮긴다."""
-        player = self._session.player if self._session else None
-        if player is None or event.processor_ms is None:
+        if event.processor_ms is None:
             return
-        position = player.time_for_processor_ms(int(event.processor_ms) - 1000)
+        track_id = None
+        if event.category == CATEGORY_REJECTED and event.details.get("requestId", "").isdigit():
+            track_id = int(event.details["requestId"])
+        self.focus_time(int(event.processor_ms) - 1000, track_id)
+
+    def focus_time(self, processor_ms: Optional[int], track_id: Optional[int] = None,
+                   recording_s: Optional[float] = None, segment: Optional[int] = None) -> None:
+        """재생 위치를 옮기고 멈춘다. track_id를 주면 추적 탭에서 그 트랙을 고른다.
+
+        recording_s(녹화 위치)가 있으면 그곳으로 간다. 없으면 처리부 시각으로 찾는데, 처리부가 녹화 중 다시
+        시작해 같은 처리부 시각이 여러 번 나오므로 segment(처리부 실행 구간)를 주면 그 구간 안에서 찾는다.
+        """
+        player = self._session.player if self._session else None
+        if player is None:
+            return
+        if recording_s is not None:
+            position: Optional[float] = min(max(recording_s, 0.0), player.duration_s)
+        elif processor_ms is not None:
+            position = player.time_for_processor_ms(int(processor_ms), segment)
+        else:
+            position = None
         if position is None:
             return
         player.pause()
         self._replaying = True
         self._replay_bar.pack(fill=tk.X, after=self._root.pack_slaves()[0])
         self._seek(position)
-        if event.category == CATEGORY_REJECTED and event.details.get("requestId", "").isdigit():
-            self._tabs["track"]._on_track_selected(event.details["requestId"])
+        if track_id is not None:
+            self._tabs["track"]._on_track_selected(str(track_id))
 
     # 갱신
 
@@ -348,8 +394,12 @@ class MonitorApp:
         self._drain_events()
         if self._replaying and self._session is not None and self._session.player is not None:
             self._session.player.advance(elapsed)
+        if self._connection is not None and now - self._last_problem_update >= PROBLEM_UPDATE_SECONDS:
+            self._last_problem_update = now
+            self._live_problems.update(self._live)
         state = self.display_state
         self._draw_top_bar(state)
+        self._draw_problem_label()
         self._draw_replay_bar()
         key = self._current_tab()
         if now - self._last_tab_refresh[key] >= TAB_REFRESH_SECONDS[key]:
@@ -365,6 +415,9 @@ class MonitorApp:
             except queue.Empty:
                 return
             self._live.apply(event)
+            if isinstance(event, LINK_EVENTS):
+                # 연결 변화는 감지 간격(0.25 s)보다 짧게 끊겼다 이어질 수 있어 사건마다 넘긴다.
+                self._live_problems.observe(event, self._live)
 
     def _draw_top_bar(self, state: MonitorState) -> None:
         if self._replaying:
@@ -389,6 +442,30 @@ class MonitorApp:
             self._record_label.configure(
                 text=f"녹화 중 {format_duration(self._recorder.elapsed)} · {format_bytes(self._recorder.bytes_written)}",
                 foreground=BAD)
+
+    def _draw_problem_label(self) -> None:
+        """자동 기록한 문제 수를 분석 탭 제목에 쓴다(상단 바는 1366 너비에서 자리가 없음).
+
+        재생 중이면 녹화 전체, 실시간이면 모니터를 켠 뒤 문제 수다. 실시간인데 녹화가 꺼져 있으면 녹화 버튼 옆에
+        '녹화 꺼짐'을 띄운다(녹화가 없으면 나중에 그 위치로 돌아가 볼 수 없음).
+        """
+        if self._replaying and self._session is not None:
+            counts = level_counts(self._session.problems())
+            warn_record = False
+        else:
+            counts = level_counts(self._live_problems.problems)
+            warn_record = self._recorder is None and self._connection is not None
+        total = counts["warn"] + counts["bad"]
+        title = f"{TAB_TITLES['analysis'].rstrip()} ⚑ {total} " if total else TAB_TITLES["analysis"]
+        if self._problem_tab_title != title:
+            self._problem_tab_title = title
+            self._notebook.tab(self._tabs["analysis"].frame, text=title)
+        current = self._record_label.cget("text")
+        if total and warn_record and not current.startswith("저장됨"):
+            if current != "녹화 꺼짐":
+                self._record_label.configure(text="녹화 꺼짐", foreground=WARN)
+        elif current == "녹화 꺼짐":
+            self._record_label.configure(text="")
 
     def _draw_replay_bar(self) -> None:
         if not self._replaying or self._session is None or self._session.player is None:

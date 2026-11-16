@@ -10,6 +10,7 @@ from tkinter import ttk
 from typing import Optional, Tuple
 
 from aesa_monitor.core.config import TrackingParameters
+from aesa_monitor.core.frames import expected_tracking_beams
 from aesa_monitor.core.protocol import BeamType
 from aesa_monitor.core.state import BEAM_SLOT_MS, MonitorState, ViewMode
 from aesa_monitor.core.verdict import (
@@ -20,7 +21,7 @@ from aesa_monitor.ui.style import (
     beam_color, beam_name, blend, format_time, track_color,
 )
 from aesa_monitor.ui.widgets import (
-    KpiCard, LabelPlacer, Table, VerdictBar, canvas_size, frame_share_chart, nice_ticks, section_title,
+    LabelPlacer, Table, VerdictCardRow, canvas_size, frame_request_chart, nice_ticks, section_title,
 )
 
 SEARCH_AFTERGLOW_MS = {ViewMode.FLOW: 500, ViewMode.DETAIL: 150}
@@ -53,11 +54,16 @@ HELP_GAPS = (
     "1~5칸은 주의, 6칸 이상은 이상입니다."
 )
 HELP_FRAMES = (
-    "탐색 프레임마다 나간 빔 중 탐색·확인·추적 빔의 비율입니다.\n\n"
-    "탐색 프레임은 탐색 격자를 처음(탐색 빔 0번)부터 끝까지 한 번 다 도는 구간이고, 사이에 끼어든 확인·추적 빔도 "
-    "그 프레임에 셉니다. 처음에는 탐색이 거의 100%이고, 추적 트랙이 늘수록 탐색 비율이 줄고 추적 비율이 늘어납니다.\n"
-    "모니터를 켠 뒤 처음 잘린 프레임과 처리부 재시작으로 끊긴 프레임은 그리지 않습니다. 맨 위 숫자는 마지막 프레임 값입니다."
+    "탐색 프레임마다 사이에 끼어든 확인(노랑)·추적(초록) 빔 수를 쌓은 막대입니다.\n\n"
+    "탐색 프레임은 탐색 격자를 처음(탐색 빔 0번)부터 끝까지 한 번 다 도는 구간입니다. 탐색 빔은 프레임마다 격자 칸 수"
+    "(189개)로 거의 일정해서 비율로 그리면 97% 안팎의 평평한 선만 보이므로, 막대에서는 빼고 맨 위 줄에 비율로만 적습니다.\n\n"
+    "점선: 기대 추적 빔 수 = 처리부 트랙 수 × 마지막 프레임 시간 ÷ 추적 주기(TARGET_TRACKING_INTERVAL_MS). "
+    "막대가 점선에 닿으면 트랙마다 추적 빔이 주기대로 나간 것이고, 모자라면 추적 빔이 빠졌거나 늦은 것입니다. "
+    "트랙 수는 지금 값이라 트랙이 생기거나 사라진 직후의 프레임은 점선과 다를 수 있습니다.\n"
+    "세로축 위쪽은 기대값의 2배 이상으로 잡아 정상일 때 막대가 그래프 가운데쯤에 옵니다.\n\n"
+    "모니터를 켠 뒤 처음 잘린 프레임과 처리부 재시작으로 끊긴 프레임은 그리지 않습니다. 최근 80프레임을 그립니다."
 )
+FRAME_CHART_FRAMES = 80
 HELP_MAP = (
     "처리부가 보낸 빔의 방위·고각(ENU, 북쪽 0°, 시계방향)입니다.\n\n"
     "• 파란 원: 탐색 빔 189개의 실제 빔 범위(지름 = 빔 폭 6°). 방금 쏜 빔일수록 진하고, 굵은 검은 원이 "
@@ -78,19 +84,21 @@ class BeamTab:
         self._view_mode = tk.StringVar(value=ViewMode.AUTO)
         self._show_coverage = tk.BooleanVar(value=True)
 
-        self._verdict = VerdictBar(self.frame, "빔이 계획대로 나가고 있나?")
+        # 판정과 지표 카드를 한 줄로: 왼쪽 배지가 전체 판정, 문제인 카드만 색이 들어온다.
+        self._verdict = VerdictCardRow(self.frame, "빔이 계획대로\n나가고 있나?")
         self._verdict.frame.pack(fill=tk.X)
+        self._sweep = self._verdict.add_card("탐색 프레임", HELP_SWEEP)
+        self._share = self._verdict.add_card("점유율", HELP_SHARE)
+        self._confirm = self._verdict.add_card("탐색→확인", HELP_CONFIRM)
+        self._period = self._verdict.add_card("주기 오차", HELP_PERIOD)
+        self._gaps = self._verdict.add_card("빠진 빔", HELP_GAPS)
 
-        cards = tk.Frame(self.frame, background=BACKGROUND)
-        cards.pack(fill=tk.X, pady=(8, 0))
-        self._sweep = KpiCard(cards, "탐색 프레임 시간", HELP_SWEEP)
-        self._share = KpiCard(cards, "빔 점유율 (최근 5초)", HELP_SHARE)
-        self._confirm = KpiCard(cards, "탐색 → 확인", HELP_CONFIRM)
-        self._period = KpiCard(cards, "추적 주기 오차", HELP_PERIOD)
-        self._gaps = KpiCard(cards, "빠진 빔 (최근 5초)", HELP_GAPS)
-        for index, card in enumerate((self._sweep, self._share, self._confirm, self._period, self._gaps)):
-            card.frame.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 8, 0))
-            cards.columnconfigure(index, weight=1, uniform="kpi")
+        # 타임라인을 먼저 아래에 붙인다. 창이 낮으면 가운데(지도·표·그래프)가 줄고 타임라인은 잘리지 않는다.
+        bottom = tk.Frame(self.frame, background=BACKGROUND)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        self._timeline_title = section_title(bottom, "빔 타임라인")
+        self._timeline = tk.Canvas(bottom, background=BACKGROUND, highlightthickness=0, height=110)
+        self._timeline.pack(fill=tk.X)
 
         middle = tk.Frame(self.frame, background=BACKGROUND)
         middle.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -129,26 +137,33 @@ class BeamTab:
             ("id", "트랙", 60, tk.CENTER), ("type", "마지막 빔", 80, tk.CENTER),
             ("last", "송신 시각", 110, tk.E), ("interval", "직전 간격", 90, tk.E),
             ("deviation", "주기 차이", 90, tk.E), ("next", "다음 예정", 110, tk.E),
-        ), height=5)
-        self._schedule.frame.pack(fill=tk.BOTH, expand=True)
-        section_title(right, "탐색 프레임별 빔 점유율", HELP_FRAMES)
-        self._frames = tk.Canvas(right, background=BACKGROUND, highlightthickness=0, height=150)
+        ), height=4)
+        # 표는 4행(넘치면 스크롤)으로 두고 남는 높이는 아래 그래프에 준다.
+        self._schedule.frame.pack(fill=tk.X)
+        section_title(right, "탐색 프레임별 확인·추적 빔 수", HELP_FRAMES)
+        self._frames = tk.Canvas(right, background=BACKGROUND, highlightthickness=0, height=170)
         self._frames.pack(fill=tk.BOTH, expand=True)
-
-        self._timeline_title = section_title(self.frame, "빔 타임라인")
-        self._timeline = tk.Canvas(self.frame, background=BACKGROUND, highlightthickness=0, height=110)
-        self._timeline.pack(fill=tk.X)
 
     # 갱신
 
     def refresh(self, state: MonitorState) -> None:
         mode = state.resolve_view_mode(self._view_mode.get())
+        self._draw_cards(state)  # 카드를 먼저 갱신해야 판정 줄이 문제 카드 유무를 안다
         self._verdict.set(beam_verdict(state, self._parameters))
-        self._draw_cards(state)
         self._draw_plane(state, mode)
         self._draw_schedule(state)
-        frame_share_chart(self._frames, state.frames.complete_frames())
+        self._draw_frames(state)
         self._draw_timeline(state, mode)
+
+    def _draw_frames(self, state: MonitorState) -> None:
+        frames = state.frames.complete_frames()
+        interval = self._parameters.tracking_interval_ms
+        tracks = len(state.tracks)
+        expected = expected_tracking_beams(tracks, frames[-1].duration_ms, interval) if frames else None
+        text = "" if expected is None else (
+            f"기대 추적 빔 {expected:.1f}개 = 트랙 {tracks} × {frames[-1].duration_ms / 1000:.2f} s ÷ "
+            f"{interval / 1000:g} s")
+        frame_request_chart(self._frames, frames, len(state.search_cells), expected, text, FRAME_CHART_FRAMES)
 
     def _draw_cards(self, state: MonitorState) -> None:
         sweep = sweep_check(state)
@@ -158,9 +173,8 @@ class BeamTab:
 
         occupancy = state.occupancy(WINDOW_MS)
         if any(occupancy.values()):
-            self._share.set(f"{occupancy[BeamType.SEARCH] * 100:.0f}%",
-                            f"탐색 {occupancy[BeamType.SEARCH] * 100:.0f} · 확인 "
-                            f"{occupancy[BeamType.CONFIRMATION] * 100:.0f} · 추적 "
+            self._share.set(f"탐색 {occupancy[BeamType.SEARCH] * 100:.0f}%",
+                            f"확인 {occupancy[BeamType.CONFIRMATION] * 100:.0f} · 추적 "
                             f"{occupancy[BeamType.TRACKING] * 100:.0f} %", "ok")
         else:
             self._share.set("-", "빔 없음", "idle")
@@ -171,11 +185,11 @@ class BeamTab:
 
         period = period_check(state, self._parameters)
         self._period.set("-" if period.value is None else f"{period.value:.0f} ms",
-                         f"설정 주기 {self._parameters.tracking_interval_ms} ms", period.level)
+                         f"설정 {self._parameters.tracking_interval_ms} ms", period.level)
 
         gaps = gap_check(state)
         self._gaps.set("-" if gaps.value is None else f"{gaps.value:.0f}칸",
-                       f"빔 간격 {BEAM_SLOT_MS} ms 기준", gaps.level)
+                       f"최근 5초 · {BEAM_SLOT_MS} ms 칸 기준", gaps.level)
 
     def _bounds(self, state: MonitorState, coverage: Optional[Tuple[float, float, float, float]]):
         cells = list(state.search_cells.values())

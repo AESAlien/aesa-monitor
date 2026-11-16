@@ -41,6 +41,24 @@ class FrameShare:
         total = self.total
         return self.counts.get(int(beam_type), 0) / total if total else 0.0
 
+    def count(self, beam_type: int) -> int:
+        return self.counts.get(int(beam_type), 0)
+
+    @property
+    def request_beams(self) -> int:
+        """프레임 사이에 끼어든 확인·추적 빔 수."""
+        return self.count(BeamType.CONFIRMATION) + self.count(BeamType.TRACKING)
+
+
+def expected_tracking_beams(track_count: int, frame_duration_ms: float, interval_ms: float) -> Optional[float]:
+    """탐색 프레임 하나 동안 나가야 할 추적 빔 수 = 트랙 수 × 프레임 시간 ÷ 추적 주기.
+
+    트랙이 없거나 값이 0 이하면 None이다(그릴 기대값이 없음).
+    """
+    if track_count <= 0 or frame_duration_ms <= 0 or interval_ms <= 0:
+        return None
+    return track_count * frame_duration_ms / interval_ms
+
 
 class FrameCounter:
     """빔을 처리부 시각 순서로 받아 탐색 프레임별 빔 수를 센다."""
