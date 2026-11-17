@@ -85,7 +85,8 @@ HELP_TREND = (
     "잔차가 게이트 쪽으로 올라가는 추세가 경고 신호입니다. 실제 게이트는 처리부 공분산(P)만큼 이보다 넓습니다.\n"
     f"• 세로축은 게이트 하한의 {RESIDUAL_AXIS_GATES:g}배까지만 그립니다. 트랙 시작 직후처럼 이보다 큰 값은 위 끝에 ▲로 "
     "그리고, 개수와 최댓값을 오른쪽 위에 적습니다.\n"
-    "• × 미탐(탐지 없음은 0에 표시). 탐지가 여러 개면 빔 축에 가장 가까운 것을 씁니다(모니터 추정).\n\n"
+    "• × 미탐(주황): 탐지가 있었는데 연관되지 않았으면 그 잔차 자리에, 탐지가 없었으면 0에 그립니다. "
+    "축보다 크면 위 끝에 주황 ▲입니다. 탐지가 여러 개면 빔 축에 가장 가까운 것을 씁니다(모니터 추정).\n\n"
     "빔 안 위치(빔 폭 기준으로 나눈 값)는 따로 그리지 않고 상태 줄 막대로 봅니다. 빔 안 위치 ≈ 잔차 ÷ (거리 × tan(빔 폭/2))라 "
     "같은 정보이고, 정상일 때는 0 근처에 붙어 있어 그래프로는 읽을 것이 적습니다.\n\n"
     "그래프를 누르면 그 사이클을 사이클 상세 패널(전시기 자리)에서 보여주고, 세로 점선으로 표시합니다."
@@ -689,7 +690,8 @@ class TrackTab:
         history = state.tracking
         self._rows = track_status_rows(history, state.now_ms())
         shown = [row.track_id for row in self._rows]
-        # 고른 트랙이 상태 줄에서 빠지면(종료 뒤 1분) 마지막 살아 있는 트랙으로 옮긴다.
+        previous = self._track_id
+        # 고른 트랙이 상태 줄에서 빠지면(종료 뒤 1분, 재생 위치 이동) 맨 위 살아 있는 트랙으로 옮긴다.
         if self._track_id not in shown:
             active = [row.track_id for row in self._rows if row.alive]
             track_ids = history.track_ids()
@@ -697,6 +699,9 @@ class TrackTab:
                 self._track_id = active[0] if active else shown[0]  # 맨 위(문제 트랙이 있으면 그것)
             elif self._track_id not in track_ids:
                 self._track_id = track_ids[-1] if track_ids else None
+        if self._track_id != previous:
+            # 열려 있는 사이클 상세도 새 트랙으로 옮긴다(안 하면 왼쪽은 옛 트랙, 오른쪽은 새 트랙을 보인다).
+            self._detail.focus(self._track_id)
         self._draw(state)
 
     def _draw(self, state: MonitorState) -> None:
@@ -800,21 +805,26 @@ class TrackTab:
             x_value = cycle.time_ms / 1000
             self._trend_cycles.append((x_value, start + offset_index))
             selected = cycle.selected
+            residual = selected.angle_error_m if selected is not None else math.nan
             if cycle.outcome == Outcome.MISSED or selected is None:
-                area.crosses([(x_value, 0.0)], WARN, size=4)
+                # 미탐: 탐지가 있었으면(연관 실패) 그 잔차 자리에, 탐지가 없거나 빔이 없어 잔차를 모르면 0에 × 를 그린다.
+                # 연관 실패의 잔차는 미탐 원인을 따질 때 가장 쓸모 있는 값이라 '탐지 없음'과 구분한다.
+                if math.isfinite(residual) and residual > high:
+                    tops.append((x_value, WARN))
+                else:
+                    area.crosses([(x_value, residual if math.isfinite(residual) else 0.0)], WARN, size=4)
                 points.append((math.nan, math.nan))
                 continue
-            residual = selected.angle_error_m
             if math.isfinite(residual) and residual > high:
-                tops.append(x_value)
+                tops.append((x_value, color))
                 points.append((math.nan, math.nan))
             else:
                 points.append((x_value, residual))
         area.line(points, color, width=2)
         area.markers(points, color, 2.5)
-        for x_value in tops:
+        for x_value, top_color in tops:
             x = area.x(x_value)
-            canvas.create_polygon(x - 5, area.top + 7, x + 5, area.top + 7, x, area.top, fill=color, outline="")
+            canvas.create_polygon(x - 5, area.top + 7, x + 5, area.top + 7, x, area.top, fill=top_color, outline="")
         # 사이클 상세가 보는 사이클
         if self._detail.is_open and self._detail.cycle_time_ms is not None:
             x_value = self._detail.cycle_time_ms / 1000
