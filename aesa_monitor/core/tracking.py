@@ -253,3 +253,107 @@ class TrackingHistory:
             max_beam_offset=max(offsets) if offsets else None,
             ended=bool(cycles) and cycles[-1].outcome == Outcome.ENDED,
         )
+
+
+# 추적 탭 상태 줄 ---------------------------------------------------------------
+
+# 빔 안 위치 주의 기준(조기 경보). 근거 값이 없는 임시값이다. 실제 연동 데이터로 정한다(docs/다음작업.md 1절).
+# None이면 주의를 쓰지 않고 1 초과(빔 밖)만 이상으로 본다.
+BEAM_OFFSET_WARN: Optional[float] = 0.7
+# 상태 줄에 보관하는 최근 결과 수(화면은 칸 너비에 맞춰 이보다 적게 그린다).
+STATUS_RESULT_CYCLES = 20
+# 종료된 트랙은 마지막 사이클이 이 시간 안이면 상태 줄 아래쪽에 남긴다.
+STATUS_ENDED_KEEP_MS = 60000
+STATUS_ENDED_LIMIT = 3
+
+
+@dataclass
+class TrackStatusRow:
+    """추적 탭 상태 줄 한 행. 처리부 결과와 실제 빔·탐지 기하에서 바로 나오는 값만 담는다."""
+
+    track_id: int
+    alive: bool                       # 처리부 마지막 트랙 목록에 있는지
+    outcomes: List[str]               # 최근 사이클 결과, 오래된 것 → 최신
+    consecutive_misses: int
+    beam_offset: Optional[float]      # 마지막 사이클 탐지의 빔 안 위치(0 중심, 1 가장자리)
+    offset_note: str                  # beam_offset이 없을 때 이유: '탐지 없음', '빔 없음', ''
+    since_update_ms: Optional[int]    # 마지막 갱신 뒤 지난 처리부 시간. 살아 있는 트랙만
+    last_time_ms: int
+
+    @property
+    def problem(self) -> bool:
+        """지금 끊길 위험이 보이는 살아 있는 트랙: 미탐 중, 마지막 빔에 탐지 없음, 빔 안 위치 주의 이상."""
+        return self.alive and (self.consecutive_misses > 0 or self.offset_note == "탐지 없음"
+                               or beam_offset_level(self.beam_offset) in ("warn", "bad"))
+
+
+def beam_offset_level(offset: Optional[float], warn: Optional[float] = None) -> str:
+    """빔 안 위치 수준: 'idle'(값 없음), 'ok', 'warn'(주의 기준 이상), 'bad'(1 초과, 빔 밖)."""
+    warn = BEAM_OFFSET_WARN if warn is None else warn
+    if offset is None or math.isnan(offset):
+        return "idle"
+    if offset > 1.0:
+        return "bad"
+    if warn is not None and offset >= warn:
+        return "warn"
+    return "ok"
+
+
+def track_status_row(history: TrackingHistory, track_id: int, now_ms: Optional[int],
+                     result_count: int = STATUS_RESULT_CYCLES) -> Optional[TrackStatusRow]:
+    cycles = history.cycles(track_id)
+    if not cycles:
+        return None
+    last = cycles[-1]
+    alive = track_id in history.latest_tracks
+    misses = 0
+    for cycle in reversed(cycles):
+        if cycle.outcome != Outcome.MISSED:
+            break
+        misses += 1
+    offset: Optional[float] = None
+    note = ""
+    if last.predicted is None:
+        note = "빔 없음"
+    elif last.selected is None:
+        note = "탐지 없음"
+    elif math.isnan(last.selected.beam_offset):
+        note = "빔 없음"
+    else:
+        offset = last.selected.beam_offset
+    since: Optional[int] = None
+    if alive and now_ms is not None:
+        updated = [cycle.time_ms for cycle in cycles if cycle.outcome == Outcome.UPDATED]
+        if updated:
+            since = max(now_ms - updated[-1], 0)
+    return TrackStatusRow(
+        track_id=track_id,
+        alive=alive,
+        outcomes=[cycle.outcome for cycle in cycles[-result_count:]],
+        consecutive_misses=misses,
+        beam_offset=offset,
+        offset_note=note,
+        since_update_ms=since,
+        last_time_ms=last.time_ms,
+    )
+
+
+def track_status_rows(history: TrackingHistory, now_ms: Optional[int],
+                      result_count: int = STATUS_RESULT_CYCLES,
+                      ended_keep_ms: int = STATUS_ENDED_KEEP_MS,
+                      ended_limit: int = STATUS_ENDED_LIMIT) -> List[TrackStatusRow]:
+    """상태 줄 행 순서: 문제 있는 살아 있는 트랙(연속 미탐 많은 순, 같으면 ID 순) → 나머지 살아 있는 트랙(ID 순)
+    → 최근 종료된 트랙(최근 것부터, ended_limit개까지). 넘겨 보지 않아도 위험한 트랙이 먼저 보이게 한다."""
+    alive: List[TrackStatusRow] = []
+    ended: List[TrackStatusRow] = []
+    for track_id in history.track_ids():
+        row = track_status_row(history, track_id, now_ms, result_count)
+        if row is None:
+            continue
+        if row.alive:
+            alive.append(row)
+        elif now_ms is None or now_ms - row.last_time_ms <= ended_keep_ms:
+            ended.append(row)
+    alive.sort(key=lambda row: (not row.problem, -row.consecutive_misses if row.problem else 0, row.track_id))
+    ended.sort(key=lambda row: row.last_time_ms, reverse=True)
+    return alive + ended[:ended_limit]
