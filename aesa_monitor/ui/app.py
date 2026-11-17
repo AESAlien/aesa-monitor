@@ -1,4 +1,4 @@
-"""메인 창: 상단 바(연결·시각·녹화·로그 가져오기·열기·글자 크기), 재생 바, 탭 4개.
+"""메인 창: 상단 바(연결·실시간/재생·처리부 시각·녹화·메뉴), 재생 바, 탭 4개.
 
 실시간 상태(live)는 녹화를 재생하는 동안에도 계속 갱신하고 녹화도 계속한다.
 화면은 지금 보는 쪽(실시간 또는 재생)의 MonitorState를 그린다.
@@ -30,10 +30,11 @@ from aesa_monitor.ui.beam_tab import BeamTab
 from aesa_monitor.ui.comm_tab import CommTab
 from aesa_monitor.ui.fetch_dialog import FetchDialog
 from aesa_monitor.ui.style import (
-    ACCENT, BACKGROUND, BAD, FONT_BODY, FONT_SMALL, FONT_TITLE, Fonts, MUTED, OK, PANEL, TEXT, UNKNOWN, WARN,
-    apply_theme, format_bytes, format_duration, format_scale, format_time,
+    ACCENT, ACCENT_SOFT, BACKGROUND, BAD, BORDER, DEFAULT_FONT_SIZE, FONT_BODY, FONT_TITLE, Fonts, MUTED, OK, PANEL, TEXT,
+    UNKNOWN, WARN, apply_theme, format_bytes, format_duration, format_scale, format_time,
 )
 from aesa_monitor.ui.track_tab import TrackTab
+from aesa_monitor.ui.widgets import Tooltip
 
 REFRESH_MS = 50
 # 실시간 문제 감지 간격(초). 녹화를 다시 계산할 때(core/problems.SCAN_STEP_S)와 같다.
@@ -41,6 +42,20 @@ PROBLEM_UPDATE_SECONDS = 0.25
 MAX_EVENTS_PER_REFRESH = 20000
 TAB_REFRESH_SECONDS = {"beam": 0.05, "track": 0.2, "comm": 0.25, "analysis": 0.25}
 TAB_TITLES = {"beam": " 빔 ", "track": " 추적 ", "comm": " 통신 ", "analysis": " 분석 "}
+# 상단 바 연결 상태: 키 -> (툴팁에 쓰는 이름, 바에 쓰는 짧은 이름)
+CONNECTION_NAMES = {"processor": ("처리부", "처리부"), "console": ("운용통제기", "통제"),
+                    "simulator": ("모의기", "모의")}
+# 상단 바에서 값이 바뀌는 글자의 흔한 최대 길이. 처음 폭을 이것으로 잡아 값이 바뀌어도 옆 위젯이 흔들리지 않게 하고,
+# 더 긴 값(처리부 시각 100분 이상, 녹화 1 GB 이상 등)이 오면 그때 늘린다(줄이지는 않음, _set_label_text).
+TIME_SAMPLES = ("88:88.888",)
+TIME_DETAIL_SAMPLES = ("×0.25 · 트랙 99", "정지 · 트랙 99", "운용 OFF · 트랙 99")
+RECORD_SAMPLES = ("● 녹화 59분 59초 · 999.9 MB", "녹화 꺼짐")
+# 상단 바 묶음 사이 최소 간격(px)과 시각 세부 글자 왼쪽 간격(px)
+TOP_BAR_GAP = 24
+TIME_DETAIL_PAD = 8
+# 재생 위치 막대의 한 줄 최소 길이와 좌우 간격(px). 이보다 좁으면 막대를 둘째 줄로 내린다.
+REPLAY_SLIDER_MIN = 160
+REPLAY_SLIDER_PAD = 12
 
 
 class MonitorApp:
@@ -65,6 +80,7 @@ class MonitorApp:
         self._last_problem_update = 0.0
         self._problem_tab_title = ""
         server_text = f"{config.server[0]}:{config.server[1]}" if config else "접속 안 함"
+        self._server_text = server_text
 
         root.title("AESA 데이터 처리부 모니터")
         root.configure(background=BACKGROUND)
@@ -107,61 +123,222 @@ class MonitorApp:
     # 화면 구성
 
     def _build_top_bar(self) -> None:
+        """상단 바: 왼쪽 정보 묶음(연결 상태, 실시간/재생, 처리부 시각), 오른쪽 조작 묶음(녹화 상태, 녹화, 메뉴).
+
+        두 묶음을 grid 두 칸에 두어 서로 밀어 자르지 않게 하고, 너비가 모자라면 _layout_top_bar가 단계적으로 줄인다.
+        로그 가져오기·열기·글자 크기는 '메뉴'에 모았다(분석 탭에도 버튼이 있고, 글자 크기는 Ctrl +/−/0).
+        """
         # 창 맨 위 CI 파랑 띠. 상태 표시(초록·빨강 글자)는 흰 바탕에 그대로 두고 띠로만 브랜드 색을 보인다.
         tk.Frame(self._root, background=ACCENT, height=4).pack(fill=tk.X)
         bar = tk.Frame(self._root, background=BACKGROUND, padx=12, pady=6)
         bar.pack(fill=tk.X)
-        self._processor_label = self._status_label(bar, "처리부")
-        self._console_label = self._status_label(bar, "운용통제기")
-        self._simulator_label = self._status_label(bar, "모의기")
-        self._mode_label = tk.Label(bar, text="실시간", font=FONT_TITLE, background=OK, foreground=BACKGROUND,
-                                    padx=8)
-        self._mode_label.pack(side=tk.LEFT, padx=(8, 8))
-        self._time_label = tk.Label(bar, text="처리부 시각 -", background=BACKGROUND, foreground=TEXT,
-                                    font=FONT_TITLE)
-        self._time_label.pack(side=tk.LEFT, padx=8)
+        bar.columnconfigure(1, weight=1)
+        self._top_bar = bar
+        self._top_level = -1
+        self._info = tk.Frame(bar, background=BACKGROUND)
+        self._controls = tk.Frame(bar, background=BACKGROUND)
 
-        buttons = tk.Frame(bar, background=BACKGROUND)
-        # 버튼을 왼쪽 글자보다 먼저 배치해 창이 좁으면 버튼이 아니라 글자 쪽이 줄어들게 한다.
-        buttons.pack(side=tk.RIGHT, before=self._processor_label)
-        ttk.Button(buttons, text="A−", width=3, command=lambda: self.change_font(-1)).pack(side=tk.RIGHT)
-        ttk.Button(buttons, text="A+", width=3, command=lambda: self.change_font(1)).pack(side=tk.RIGHT, padx=(8, 2))
-        ttk.Button(buttons, text="열기", command=self.choose_folder).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(buttons, text="로그 가져오기", command=self.fetch_logs).pack(side=tk.RIGHT, padx=2)
-        self._record_button = ttk.Button(buttons, text="● 녹화", command=self.toggle_recording)
-        self._record_button.pack(side=tk.RIGHT, padx=2)
+        # 1. 연결 상태: 색 점 + 짧은 이름. 끊긴 이유 같은 자세한 내용은 툴팁.
+        self._connection_items = {}
+        self._connection_tips = {}
+        for key, (name, short) in CONNECTION_NAMES.items():
+            item = tk.Frame(self._info, background=BACKGROUND)
+            item.pack(side=tk.LEFT, padx=(0, 10))
+            dot = tk.Label(item, text="●", font=FONT_TITLE, background=BACKGROUND, foreground=UNKNOWN)
+            dot.pack(side=tk.LEFT)
+            label = tk.Label(item, text=short, font=FONT_TITLE, background=BACKGROUND, foreground=UNKNOWN)
+            label.pack(side=tk.LEFT, padx=(2, 0))
+            self._connection_items[key] = (dot, label)
+            self._connection_tips[key] = f"{name}: 상태 모름"
+            Tooltip(item, lambda key=key: self._connection_tips[key])
+        tk.Frame(self._info, background=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=(2, 12), pady=2)
+
+        # 2. 실시간/재생/캡처/오프라인
+        self._mode_label = tk.Label(self._info, text="실시간", font=FONT_TITLE, background=OK, foreground=BACKGROUND,
+                                    padx=8)
+        self._mode_label.pack(side=tk.LEFT, padx=(0, 12))
+
+        # 3. 처리부 시각. 배율·트랙 수(세부)는 따로 두어 좁으면 숨긴다(툴팁에는 늘 있다).
+        time_frame = tk.Frame(self._info, background=BACKGROUND)
+        time_frame.pack(side=tk.LEFT)
+        tk.Label(time_frame, text="시각", font=FONT_BODY, background=BACKGROUND,
+                 foreground=MUTED).pack(side=tk.LEFT, padx=(0, 4))
+        self._time_label = tk.Label(time_frame, text=format_time(None), font=FONT_TITLE, background=BACKGROUND,
+                                    foreground=TEXT, anchor="w")
+        self._time_label.pack(side=tk.LEFT)
+        self._time_detail = tk.Label(time_frame, text="", font=FONT_BODY, background=BACKGROUND, foreground=MUTED,
+                                     anchor="w")
+        self._time_detail.pack(side=tk.LEFT, padx=(TIME_DETAIL_PAD, 0))
+        self._time_tip = ""
+        Tooltip(time_frame, lambda: self._time_tip)
+
+        # 4. 녹화 상태(녹화 중·녹화 꺼짐·저장됨). 저장 경로는 툴팁.
+        self._record_label = tk.Label(self._controls, text="", font=FONT_BODY, background=BACKGROUND,
+                                      foreground=MUTED, anchor="e")
+        self._record_label.pack(side=tk.LEFT, padx=(0, 10))
+        self._record_tip = ""
+        Tooltip(self._record_label, lambda: self._record_tip)
+
+        # 5. 버튼: 녹화, 메뉴. ttk(clam) 버튼은 기본 최소 폭이 11자라 글자에 맞춰 폭을 준다.
+        self._record_button = ttk.Button(self._controls, text="● 녹화", width=-6, command=self.toggle_recording)
+        self._record_button.pack(side=tk.LEFT, padx=2)
         if self._connection is None:
             self._record_button.configure(state=tk.DISABLED)
-        self._record_label = tk.Label(buttons, text="", background=BACKGROUND, foreground=MUTED, font=FONT_SMALL)
-        self._record_label.pack(side=tk.RIGHT, padx=6)
+        menu_button = ttk.Menubutton(self._controls, text="메뉴", width=-4, direction="below")
+        menu_button.pack(side=tk.LEFT, padx=(2, 0))
+        menu = tk.Menu(menu_button, tearoff=False, font=FONT_BODY, background=BACKGROUND, foreground=TEXT,
+                       activebackground=ACCENT_SOFT, activeforeground=TEXT, disabledforeground=MUTED)
+        menu.add_command(label="폴더 열기…", command=self.choose_folder)
+        menu.add_command(label="파일 열기…", command=self.choose_file)
+        menu.add_command(label="로그 가져오기…", command=self.fetch_logs)
+        menu.add_separator()
+        menu.add_command(label="", state=tk.DISABLED)
+        self._font_menu_index = menu.index(tk.END)
+        menu.add_command(label="글자 크게", accelerator="Ctrl +", command=lambda: self.change_font(1))
+        menu.add_command(label="글자 작게", accelerator="Ctrl −", command=lambda: self.change_font(-1))
+        menu.add_command(label=f"기본 크기 ({DEFAULT_FONT_SIZE})", accelerator="Ctrl 0",
+                         command=lambda: self.set_font_size(DEFAULT_FONT_SIZE))
+        menu_button.configure(menu=menu)
+        self._menu = menu
 
-    def _status_label(self, parent: tk.Widget, name: str) -> tk.Label:
-        label = tk.Label(parent, text=f"● {name}", background=BACKGROUND, foreground=UNKNOWN, font=FONT_TITLE)
-        label.pack(side=tk.LEFT, padx=(0, 12))
-        return label
+        self._fit_top_bar_text()
+        bar.bind("<Configure>", lambda _event: self._layout_top_bar())
+
+    def _fit_top_bar_text(self) -> None:
+        """바뀌는 글자(처리부 시각, 배율·트랙 수, 녹화 상태)의 폭을 가장 긴 경우로 고정한다. 글자 크기를 바꾸면 다시 부른다.
+
+        폭이 값마다 달라지면 옆 위젯이 흔들리고, 너비 판단(_layout_top_bar)이 한 줄과 두 줄 사이를 오갈 수 있다.
+        """
+        for label, font, samples in ((self._time_label, FONT_TITLE, TIME_SAMPLES),
+                                     (self._time_detail, FONT_BODY, TIME_DETAIL_SAMPLES),
+                                     (self._record_label, FONT_BODY, RECORD_SAMPLES)):
+            label.configure(width=max(self._text_units(sample, font) for sample in samples + (label.cget("text"),)))
+        self._menu.entryconfigure(self._font_menu_index, label=f"글자 크기 {self.fonts.size}")
+
+    def _text_units(self, text: str, font: str) -> int:
+        """글자가 들어갈 Label width(글자 수 단위, '0' 폭 기준, 올림)."""
+        return -(-self.fonts.measure(text, font) // max(self.fonts.measure("0", font), 1))
+
+    def _set_label_text(self, label: tk.Label, text: str, font: str, foreground: Optional[str] = None) -> None:
+        """글자(와 색)가 바뀌었을 때만 고친다(매 갱신 50 ms마다 같은 값으로 다시 그리지 않게).
+
+        폭을 고정한 Label이라 더 긴 글자가 오면 잘리므로 그때만 폭을 늘린다. 줄이지 않아 한 줄·두 줄이 오가지 않는다.
+        """
+        if label.cget("text") == text and (foreground is None or label.cget("foreground") == foreground):
+            return
+        options = {"text": text}
+        if foreground is not None:
+            options["foreground"] = foreground
+        units = self._text_units(text, font)
+        if units > int(label.cget("width")):
+            options["width"] = units
+        label.configure(**options)
+
+    def _layout_top_bar(self) -> None:
+        """상단 바를 너비에 맞춘다. 0단계 한 줄 → 1단계 조작 묶음을 둘째 줄로 → 2단계 시각 세부를 숨김(툴팁에 남음).
+
+        각 묶음이 원하는 너비(winfo_reqwidth)로 판단한다. 우선순위(연결 > 실시간/재생 > 처리부 시각 > 녹화 상태 > 버튼)대로
+        아래쪽 묶음부터 자리를 양보하되, 녹화 버튼은 숨기지 않고 둘째 줄로 내린다. 단계가 같으면 아무것도 바꾸지 않는다.
+        """
+        bar = self._top_bar
+        width = bar.winfo_width() - 2 * int(str(bar.cget("padx")))
+        if width <= 1:
+            return
+        detail = 0 if self._time_detail.winfo_manager() else self._time_detail.winfo_reqwidth() + TIME_DETAIL_PAD
+        info = self._info.winfo_reqwidth() + detail
+        if info + TOP_BAR_GAP + self._controls.winfo_reqwidth() <= width:
+            level = 0
+        elif info <= width:
+            level = 1
+        else:
+            level = 2
+        if level == self._top_level:
+            return
+        self._top_level = level
+        # grid()는 이미 배치된 위젯의 이전 옵션(columnspan, pady)을 이어받으므로 지우고 다시 놓는다.
+        self._controls.grid_forget()
+        self._info.grid(row=0, column=0, sticky="w")
+        if level == 0:
+            self._controls.grid(row=0, column=2, sticky="e")
+        else:
+            self._controls.grid(row=1, column=0, columnspan=3, sticky="e", pady=(6, 0))
+        if level == 2:
+            self._time_detail.pack_forget()
+        elif not self._time_detail.winfo_manager():
+            self._time_detail.pack(side=tk.LEFT, padx=(TIME_DETAIL_PAD, 0))
 
     def _build_replay_bar(self) -> None:
-        self._replay_bar = tk.Frame(self._root, background=PANEL, padx=12, pady=6)
-        self._play_button = ttk.Button(self._replay_bar, text="▶ 재생", width=8, command=self._toggle_play)
+        """재생 바: 왼쪽 조작(재생·처음·±5초·속도), 가운데 재생 위치 막대, 오른쪽 녹화 위치·'실시간으로'.
+
+        좁으면 _layout_replay_bar가 막대를 둘째 줄로 내린다(막대가 버튼을 밀어 자르지 않게).
+        """
+        bar = tk.Frame(self._root, background=PANEL, padx=12, pady=6)
+        self._replay_bar = bar
+        self._replay_level = -1
+        self._replay_controls = tk.Frame(bar, background=PANEL)
+        self._play_button = ttk.Button(self._replay_controls, text="▶ 재생", width=8, command=self._toggle_play)
         self._play_button.pack(side=tk.LEFT)
-        ttk.Button(self._replay_bar, text="⏮", width=3, command=lambda: self._seek(0.0)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(self._replay_bar, text="−5s", width=4, command=lambda: self._skip(-5)).pack(side=tk.LEFT)
-        ttk.Button(self._replay_bar, text="+5s", width=4, command=lambda: self._skip(5)).pack(side=tk.LEFT, padx=4)
-        tk.Label(self._replay_bar, text="속도", background=PANEL, foreground=MUTED).pack(side=tk.LEFT, padx=(8, 2))
-        self._speed_box = ttk.Combobox(self._replay_bar, state="readonly", width=6,
+        ttk.Button(self._replay_controls, text="⏮", width=3,
+                   command=lambda: self._seek(0.0)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(self._replay_controls, text="−5s", width=4, command=lambda: self._skip(-5)).pack(side=tk.LEFT)
+        ttk.Button(self._replay_controls, text="+5s", width=4,
+                   command=lambda: self._skip(5)).pack(side=tk.LEFT, padx=4)
+        tk.Label(self._replay_controls, text="속도", background=PANEL,
+                 foreground=MUTED).pack(side=tk.LEFT, padx=(8, 2))
+        self._speed_box = ttk.Combobox(self._replay_controls, state="readonly", width=6,
                                        values=[f"×{format_scale(speed)}" for speed in SPEEDS])
         self._speed_box.current(SPEEDS.index(1.0))
         self._speed_box.bind("<<ComboboxSelected>>", self._on_speed)
         self._speed_box.pack(side=tk.LEFT)
         self._position = tk.DoubleVar(value=0.0)
-        self._slider = ttk.Scale(self._replay_bar, from_=0.0, to=1.0, variable=self._position,
-                                 command=self._on_slider)
-        self._slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=12)
+        self._slider = ttk.Scale(bar, from_=0.0, to=1.0, variable=self._position, command=self._on_slider)
         self._slider.bind("<ButtonPress-1>", lambda _event: setattr(self, "_slider_dragging", True))
         self._slider.bind("<ButtonRelease-1>", self._on_slider_release)
-        self._replay_label = tk.Label(self._replay_bar, text="", background=PANEL, foreground=TEXT, font=FONT_BODY)
+        self._replay_right = tk.Frame(bar, background=PANEL)
+        self._replay_label = tk.Label(self._replay_right, text="", background=PANEL, foreground=TEXT, font=FONT_BODY)
         self._replay_label.pack(side=tk.LEFT)
-        ttk.Button(self._replay_bar, text="실시간으로", command=self.show_live).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(self._replay_right, text="실시간으로", command=self.show_live).pack(side=tk.LEFT, padx=(12, 0))
+        bar.bind("<Configure>", lambda _event: self._layout_replay_bar())
+
+    def _layout_replay_bar(self) -> None:
+        """재생 바를 너비에 맞춘다. 0단계 한 줄 → 1단계 막대만 둘째 줄 → 2단계 막대와 녹화 위치·'실시간으로'를 둘째 줄."""
+        bar = self._replay_bar
+        width = bar.winfo_width() - 2 * int(str(bar.cget("padx")))
+        if width <= 1:
+            return
+        controls = self._replay_controls.winfo_reqwidth()
+        right = self._replay_right.winfo_reqwidth()
+        if controls + right + 2 * REPLAY_SLIDER_PAD + REPLAY_SLIDER_MIN <= width:
+            level = 0
+        elif controls + right + TOP_BAR_GAP <= width:
+            level = 1
+        else:
+            level = 2
+        if level == self._replay_level:
+            return
+        self._replay_level = level
+        for widget in (self._replay_controls, self._slider, self._replay_right):
+            widget.grid_forget()
+        for column in range(3):
+            bar.columnconfigure(column, weight=0)
+        # 조작 묶음은 첫 줄 전체를 쓴다(2단계에서 둘째 줄 오른쪽 칸 폭만큼 좁아지지 않게).
+        self._replay_controls.grid(row=0, column=0, columnspan=3 if level == 2 else 1, sticky="w")
+        if level == 0:
+            bar.columnconfigure(1, weight=1)
+            self._slider.grid(row=0, column=1, sticky="ew", padx=REPLAY_SLIDER_PAD)
+            self._replay_right.grid(row=0, column=2, sticky="e")
+        elif level == 1:
+            bar.columnconfigure(1, weight=1)
+            self._replay_right.grid(row=0, column=2, sticky="e")
+            self._slider.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        else:
+            bar.columnconfigure(0, weight=1)
+            self._slider.grid(row=1, column=0, sticky="ew", padx=(0, REPLAY_SLIDER_PAD), pady=(6, 0))
+            self._replay_right.grid(row=1, column=1, columnspan=2, sticky="e", pady=(6, 0))
+
+    def _show_replay_bar(self) -> None:
+        """재생 바를 상단 바 아래(탭 바로 위)에 보인다. 처리부 시각은 상단 바에만 쓴다."""
+        self._replay_bar.pack(fill=tk.X, after=self._top_bar)
 
     # 상태
 
@@ -190,6 +367,7 @@ class MonitorApp:
         from dataclasses import replace
 
         self.fonts.apply(size)
+        self._fit_top_bar_text()
         self._settings = replace(self._settings, font_size=self.fonts.size)
         self._last_tab_refresh = {key: 0.0 for key in self._tabs}
 
@@ -212,7 +390,8 @@ class MonitorApp:
             return
         self._recorder = recorder
         self._connection.attach_recorder(recorder)
-        self._record_button.configure(text="■ 녹화 중지")
+        self._record_button.configure(text="■ 중지")
+        self._record_tip = f"녹화 중: {self._record_dir}"
 
     def stop_recording(self) -> None:
         recorder = self._recorder
@@ -223,7 +402,8 @@ class MonitorApp:
         recorder.close()
         self._recorder = None
         self._record_button.configure(text="● 녹화")
-        self._record_label.configure(text=f"저장됨: {recorder.path.parent}", foreground=MUTED)
+        self._record_label.configure(text="저장됨", foreground=MUTED)
+        self._record_tip = f"저장됨: {recorder.path.parent}"
 
     # 로그 가져오기
 
@@ -285,7 +465,7 @@ class MonitorApp:
             # 녹화 첫 빔까지 넣어 둬야 처리부 시각과 연결 상태가 바로 보인다.
             session.player.seek(session.player.first_beam_s())
             self._replaying = True
-            self._replay_bar.pack(fill=tk.X, after=self._root.pack_slaves()[0])
+            self._show_replay_bar()
         else:
             self.show_live()
         self.select_tab("analysis")
@@ -307,7 +487,7 @@ class MonitorApp:
             return
         if not self._replaying:
             self._replaying = True
-            self._replay_bar.pack(fill=tk.X, after=self._root.pack_slaves()[0])
+            self._show_replay_bar()
         self._session.player.toggle()
 
     def _on_space(self, event: tk.Event) -> None:
@@ -380,7 +560,7 @@ class MonitorApp:
             return
         player.pause()
         self._replaying = True
-        self._replay_bar.pack(fill=tk.X, after=self._root.pack_slaves()[0])
+        self._show_replay_bar()
         self._seek(position)
         if track_id is not None:
             self._tabs["track"]._on_track_selected(str(track_id))
@@ -426,25 +606,33 @@ class MonitorApp:
             live_text = "캡처" if state.source == SOURCE_CAPTURE else "실시간"
             self._mode_label.configure(text=live_text if self._connection else "오프라인",
                                        background=OK if self._connection else UNKNOWN)
-        self._set_status(self._processor_label, "처리부", state.connected,
-                         "" if state.connected else state.connection_detail)
+        # 재생 중에는 녹화 당시 연결 상태를 보인다(화면의 다른 값과 같은 시점).
+        processor_detail = self._server_text if state.connected else state.connection_detail
+        self._set_status("processor", state.connected, processor_detail)
+        self._set_status("console", state.peer_connected(PEER_CONSOLE))
+        self._set_status("simulator", state.peer_connected(PEER_SIMULATOR))
+
         status = state.fresh_status()
-        self._set_status(self._console_label, "운용통제기", state.peer_connected(PEER_CONSOLE))
-        self._set_status(self._simulator_label, "모의기", state.peer_connected(PEER_SIMULATOR))
         speed = ""
         if status is not None:
-            speed = "  정지" if status.paused else f"  ×{format_scale(status.time_scale)}"
+            speed = "정지" if status.paused else f"×{format_scale(status.time_scale)}"
         elif state.paused():
-            speed = "  운용 OFF"
-        self._time_label.configure(text=f"처리부 시각 {format_time(state.now_ms())}{speed}  ·  "
-                                        f"트랙 {len(state.tracks)}")
+            speed = "운용 OFF"
+        now = format_time(state.now_ms())
+        tracks = f"트랙 {len(state.tracks)}"
+        detail = f"{speed} · {tracks}" if speed else tracks
+        self._set_label_text(self._time_label, now, FONT_TITLE)
+        self._set_label_text(self._time_detail, detail, FONT_BODY)
+        self._time_tip = f"처리부 시각 {now}{' (재생 위치)' if self._replaying else ''}\n{detail}"
         if self._recorder is not None:
-            self._record_label.configure(
-                text=f"녹화 중 {format_duration(self._recorder.elapsed)} · {format_bytes(self._recorder.bytes_written)}",
-                foreground=BAD)
+            self._set_label_text(
+                self._record_label,
+                f"● 녹화 {format_duration(self._recorder.elapsed)} · {format_bytes(self._recorder.bytes_written)}",
+                FONT_BODY, BAD)
+        self._layout_top_bar()
 
     def _draw_problem_label(self) -> None:
-        """자동 기록한 문제 수를 분석 탭 제목에 쓴다(상단 바는 1366 너비에서 자리가 없음).
+        """자동 기록한 문제 수를 분석 탭 제목에 쓴다(탭 제목은 상단 바와 너비를 다투지 않고 어느 탭에서든 보인다).
 
         재생 중이면 녹화 전체, 실시간이면 모니터를 켠 뒤 문제 수다. 실시간인데 녹화가 꺼져 있으면 녹화 버튼 옆에
         '녹화 꺼짐'을 띄운다(녹화가 없으면 나중에 그 위치로 돌아가 볼 수 없음).
@@ -464,28 +652,41 @@ class MonitorApp:
         if total and warn_record and not current.startswith("저장됨"):
             if current != "녹화 꺼짐":
                 self._record_label.configure(text="녹화 꺼짐", foreground=WARN)
+                self._record_tip = "녹화가 꺼져 있다. 녹화하지 않으면 문제가 난 위치로 돌아가 볼 수 없다."
         elif current == "녹화 꺼짐":
             self._record_label.configure(text="")
+            self._record_tip = ""
 
     def _draw_replay_bar(self) -> None:
         if not self._replaying or self._session is None or self._session.player is None:
             return
+        self._layout_replay_bar()
         player = self._session.player
         if not self._slider_dragging:
             self._position.set(player.position_s)
         self._play_button.configure(text="⏸ 정지" if player.playing else "▶ 재생")
         self._replay_label.configure(
-            text=f"{format_time(player.position_s * 1000)} / {format_time(player.duration_s * 1000)}"
-                 f"  (처리부 {format_time(player.state.now_ms())})")
+            text=f"{format_time(player.position_s * 1000)} / {format_time(player.duration_s * 1000)}")
 
-    @staticmethod
-    def _set_status(label: tk.Label, name: str, connected: Optional[bool], detail: str = "") -> None:
+    def _set_status(self, key: str, connected: Optional[bool], detail: str = "") -> None:
+        """연결 상태 점·이름 색과 툴팁. 연결됨 초록 점, 끊김 빨강 점·이름, 모름 회색."""
+        name, _short = CONNECTION_NAMES[key]
+        dot, label = self._connection_items[key]
         if connected is None:
-            label.configure(text=f"● {name} ?", foreground=UNKNOWN)
+            dot_color, text_color, tip = UNKNOWN, UNKNOWN, f"{name}: 상태 모름"
         elif connected:
-            label.configure(text=f"● {name}", foreground=OK)
+            dot_color, text_color, tip = OK, TEXT, f"{name}: 연결됨"
         else:
-            label.configure(text=f"● {name} 끊김", foreground=BAD)
+            dot_color, text_color, tip = BAD, BAD, f"{name}: 끊김"
+        if detail:
+            tip += f" · {detail}"
+        if self._replaying:
+            tip += "\n(재생 중: 녹화 당시 상태)"
+        self._connection_tips[key] = tip
+        if dot.cget("foreground") != dot_color:
+            dot.configure(foreground=dot_color)
+        if label.cget("foreground") != text_color:
+            label.configure(foreground=text_color)
 
     # 종료
 
