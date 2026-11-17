@@ -35,6 +35,7 @@ from aesa_monitor.ui.style import (
 )
 from aesa_monitor.ui.track_tab import TrackTab
 from aesa_monitor.ui.widgets import Tooltip
+from aesa_monitor.ui.window import initial_window_size
 
 REFRESH_MS = 50
 # 실시간 문제 감지 간격(초). 녹화를 다시 계산할 때(core/problems.SCAN_STEP_S)와 같다.
@@ -84,8 +85,7 @@ class MonitorApp:
 
         root.title("AESA 데이터 처리부 모니터")
         root.configure(background=BACKGROUND)
-        root.geometry("1440x920")
-        root.minsize(1100, 720)
+        self._apply_initial_size()
         apply_theme(root)
         self.fonts = Fonts(root, settings.font_size)
         self._initial_font_size = settings.font_size
@@ -121,6 +121,44 @@ class MonitorApp:
         root.after(REFRESH_MS, self._refresh)
 
     # 화면 구성
+
+    def _apply_initial_size(self) -> None:
+        """화면에 맞춰 시작 창 크기를 정한다. 1680×1000이 들어가면 그 크기로 가운데에, 아니면 최대화(1920×1080 이하).
+
+        글자 16에서도 빔 탭 요청 빔 일정 4행과 프레임별 빔 수 막대가 처음부터 보이게 하려는 것이다.
+        """
+        root = self._root
+        size = initial_window_size(root.winfo_screenwidth(), root.winfo_screenheight())
+        root.minsize(size.min_width, size.min_height)
+        root.geometry(size.geometry)
+        if size.maximize:
+            self._set_maximized(True)
+
+    def _set_maximized(self, maximized: bool) -> None:
+        """창 최대화. Windows·macOS는 state('zoomed'), X11(리눅스)은 -zoomed 속성을 쓴다."""
+        root = self._root
+        if maximized:
+            try:
+                root.state("zoomed")
+                return
+            except tk.TclError:
+                pass
+            try:
+                root.attributes("-zoomed", True)
+            except tk.TclError:
+                pass  # 창 관리자가 최대화를 지원하지 않으면 계산한 크기 그대로 둔다
+            return
+        # 풀 때는 두 방식 모두 되돌린다(X11은 state('normal')만으로 -zoomed가 풀리지 않을 수 있음).
+        for undo in (lambda: root.attributes("-zoomed", False), lambda: root.state("normal")):
+            try:
+                undo()
+            except tk.TclError:
+                pass
+
+    def set_window_geometry(self, geometry: str) -> None:
+        """명령줄 --geometry: 최대화를 풀고 주어진 크기로 둔다."""
+        self._set_maximized(False)
+        self._root.geometry(geometry)
 
     def _build_top_bar(self) -> None:
         """상단 바: 왼쪽 정보 묶음(연결 상태, 실시간/재생, 처리부 시각), 오른쪽 조작 묶음(녹화 상태, 녹화, 메뉴).

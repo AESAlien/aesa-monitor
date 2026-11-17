@@ -53,7 +53,7 @@ class StatItem:
     samples: List[float] = field(default_factory=list)
     unit: str = ""
     note: str = ""
-    chart: str = ""   # "frames"면 분석 탭이 분포 대신 탐색 프레임별 확인·추적 빔 수를 그린다
+    chart: str = ""   # "frames"면 분석 탭이 분포 대신 탐색 프레임별 빔 수(프레임 시간 띠 + 확인·추적 막대)를 그린다
 
 
 @dataclass
@@ -286,7 +286,7 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
     items.append(StatItem(group, "빔 점유율", " / ".join(
         f"{name} {shares[beam_type] * 100:.1f}%" for beam_type, name in
         ((BeamType.SEARCH, "탐색"), (BeamType.CONFIRMATION, "확인"), (BeamType.TRACKING, "추적"))),
-        chart="frames", note="전체 기록 기준. 누르면 탐색 프레임별 확인·추적 빔 수를 그린다"))
+        chart="frames", note="전체 기록 기준. 누르면 탐색 프레임별 빔 수를 그린다"))
 
     counter = FrameCounter()
     for segment in _by_segment(records).values():
@@ -302,7 +302,7 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
         frame_value = "완료된 프레임 없음"
     items.append(StatItem(group, "탐색 프레임별 점유율", frame_value, chart="frames",
                           note="탐색 프레임 = 탐색 격자를 처음부터 끝까지 한 번 다 도는 구간. "
-                               "녹화 시작·끝에 걸려 잘린 프레임은 뺀다. 누르면 프레임별 확인·추적 빔 수를 그린다"))
+                               "녹화 시작·끝에 걸려 잘린 프레임은 뺀다. 누르면 프레임별 빔 수를 그린다"))
 
     intervals: List[float] = []
     for segment in _by_segment(records).values():

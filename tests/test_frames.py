@@ -1,7 +1,7 @@
 import unittest
 
 from aesa_monitor.core.config import TrackingParameters
-from aesa_monitor.core.frames import FrameCounter, expected_tracking_beams
+from aesa_monitor.core.frames import GAP, FrameCounter, FrameShare, expected_tracking_beams
 from aesa_monitor.core.protocol import Beam, BeamType
 from aesa_monitor.core.state import MonitorState
 from aesa_monitor.core.stats import BeamRecord, compute_stats
@@ -24,6 +24,34 @@ class ExpectedTrackingBeamsTest(unittest.TestCase):
         self.assertIsNone(expected_tracking_beams(0, 1950, 1000))
         self.assertIsNone(expected_tracking_beams(3, 0, 1000))
         self.assertIsNone(expected_tracking_beams(3, 1950, 0))
+
+
+class FrameTimePartsTest(unittest.TestCase):
+    @staticmethod
+    def frame(duration_ms, search=189, confirm=0, track=6):
+        counts = {int(BeamType.SEARCH): search, int(BeamType.CONFIRMATION): confirm, int(BeamType.TRACKING): track}
+        return FrameShare(1, 0, duration_ms, counts, True)
+
+    def test_no_gap_matches_beam_share(self):
+        parts = {key: (ms, fraction) for key, ms, fraction in self.frame(1950).time_parts(10)}
+        self.assertEqual(parts[int(BeamType.SEARCH)][0], 1890)
+        self.assertAlmostEqual(parts[int(BeamType.SEARCH)][1], 189 / 195)
+        self.assertEqual(parts[GAP], (0, 0.0))
+
+    def test_gap_lowers_beam_fractions(self):
+        # 1초 빈 칸: 탐색은 프레임 시간의 약 2/3이고 나머지가 빈 칸이다(빔 수 기준 share는 여전히 약 97%).
+        frame = self.frame(2950)
+        parts = {key: (ms, fraction) for key, ms, fraction in frame.time_parts(10)}
+        self.assertAlmostEqual(parts[int(BeamType.SEARCH)][1], 1890 / 2950)
+        self.assertEqual(parts[GAP][0], 1000)
+        self.assertAlmostEqual(parts[GAP][1], 1000 / 2950)
+        self.assertAlmostEqual(sum(fraction for _, _, fraction in frame.time_parts(10)), 1.0)
+        self.assertGreater(frame.share(BeamType.SEARCH), 0.96)
+
+    def test_short_duration_uses_beam_time(self):
+        parts = self.frame(1900).time_parts(10)
+        self.assertEqual(parts[-1][:2], (GAP, 0))
+        self.assertAlmostEqual(sum(fraction for _, _, fraction in parts), 1.0)
 
 
 class FrameCounterTest(unittest.TestCase):

@@ -17,14 +17,16 @@ from aesa_monitor.core.verdict import (
     WINDOW_MS, beam_verdict, confirmation_check, gap_check, period_check, sweep_check,
 )
 from aesa_monitor.ui.style import (
-    BACKGROUND, BEAM_COLORS, BEAM_NAMES, FONT_SMALL, GRID_LINE, LEVEL_COLORS, MUTED, PANEL, TEXT,
+    BACKGROUND, BEAM_COLORS, BEAM_NAMES, FONT_BODY, FONT_SMALL, GRID_LINE, LEVEL_COLORS, MUTED, PANEL, TEXT,
     beam_color, beam_name, blend, format_time, track_color,
 )
 from aesa_monitor.ui.widgets import (
-    LabelPlacer, Table, VerdictCardRow, canvas_size, frame_request_chart, nice_ticks, section_title,
+    LabelPlacer, Table, VerdictCardRow, canvas_size, frame_chart_heights, frame_request_chart, nice_ticks,
+    section_title, text_height, text_width,
 )
 
-SEARCH_AFTERGLOW_MS = {ViewMode.FLOW: 500, ViewMode.DETAIL: 150}
+# 탐색 빔 잔상: 10 ms마다 한 칸씩 가므로 200 ms면 최근 약 20칸. 500 ms(약 50칸)는 격자 한 줄 넘게 덮어 길었다.
+SEARCH_AFTERGLOW_MS = {ViewMode.FLOW: 200, ViewMode.DETAIL: 150}
 REQUEST_AFTERGLOW_MS = {ViewMode.FLOW: 2000, ViewMode.DETAIL: 400}
 TIMELINE_WINDOW_MS = {ViewMode.FLOW: 3000, ViewMode.DETAIL: 400}
 # 확인·추적 빔 추적 영역(안테나 기준). 처리부 .env의 BEAM_REQUEST_COVERAGE_* 기본값과 같다.
@@ -54,9 +56,16 @@ HELP_GAPS = (
     "1~5칸은 주의, 6칸 이상은 이상입니다."
 )
 HELP_FRAMES = (
-    "탐색 프레임마다 사이에 끼어든 확인(노랑)·추적(초록) 빔 수를 쌓은 막대입니다.\n\n"
-    "탐색 프레임은 탐색 격자를 처음(탐색 빔 0번)부터 끝까지 한 번 다 도는 구간입니다. 탐색 빔은 프레임마다 격자 칸 수"
-    "(189개)로 거의 일정해서 비율로 그리면 97% 안팎의 평평한 선만 보이므로, 막대에서는 빼고 맨 위 줄에 비율로만 적습니다.\n\n"
+    "탐색 프레임은 탐색 격자를 처음(탐색 빔 0번)부터 끝까지 한 번 다 도는 구간입니다.\n\n"
+    "처리부는 10 ms마다 빔을 하나 보내고, 탐색 빔은 다 보낼 때까지 다음 칸으로 넘어가지 않으므로 프레임마다 "
+    "격자 칸 수(189개)로 고정입니다. 확인·추적 빔이 끼어든 만큼 프레임이 길어집니다.\n\n"
+    "• 위 시간 띠: 마지막 프레임 시간을 탐색(파랑)·확인(노랑)·추적(초록)에 쓴 시간으로 나눈 것입니다(빔 수 × 10 ms). "
+    "회색은 빔이 오지 않은 빈 칸(처리부 지연이나 모니터 큐 넘침)입니다. 띠 안 %는 프레임 시간에서 차지한 비율이고, "
+    "빈 칸이 있으면 빈 칸 비율도 함께 씁니다(점유율 카드는 받은 빔 수 기준이라 빈 칸이 있으면 다를 수 있음). "
+    "오른쪽 끝이 프레임 시간입니다. 프레임이 닫힐 때마다 바뀌고, "
+    "▼는 지금 진행 중인 프레임의 위치입니다.\n"
+    "• 아래 막대: 프레임 사이에 끼어든 확인(노랑)·추적(초록) 빔 수를 쌓은 것입니다. 오른쪽 축은 같은 높이의 "
+    "확인·추적 비율(%) = n ÷ (탐색 189 + n)입니다.\n\n"
     "점선: 기대 추적 빔 수 = 처리부 트랙 수 × 마지막 프레임 시간 ÷ 추적 주기(TARGET_TRACKING_INTERVAL_MS). "
     "막대가 점선에 닿으면 트랙마다 추적 빔이 주기대로 나간 것이고, 모자라면 추적 빔이 빠졌거나 늦은 것입니다. "
     "트랙 수는 지금 값이라 트랙이 생기거나 사라진 직후의 프레임은 점선과 다를 수 있습니다.\n"
@@ -64,6 +73,7 @@ HELP_FRAMES = (
     "모니터를 켠 뒤 처음 잘린 프레임과 처리부 재시작으로 끊긴 프레임은 그리지 않습니다. 최근 80프레임을 그립니다."
 )
 FRAME_CHART_FRAMES = 80
+SCHEDULE_ROWS = 4
 HELP_MAP = (
     "처리부가 보낸 빔의 방위·고각(ENU, 북쪽 0°, 시계방향)입니다.\n\n"
     "• 파란 원: 탐색 빔 189개의 실제 빔 범위(지름 = 빔 폭 6°). 방금 쏜 빔일수록 진하고, 굵은 검은 원이 "
@@ -137,10 +147,10 @@ class BeamTab:
             ("id", "트랙", 60, tk.CENTER), ("type", "마지막 빔", 80, tk.CENTER),
             ("last", "송신 시각", 110, tk.E), ("interval", "직전 간격", 90, tk.E),
             ("deviation", "주기 차이", 90, tk.E), ("next", "다음 예정", 110, tk.E),
-        ), height=4)
+        ), height=SCHEDULE_ROWS)
         # 표는 4행(넘치면 스크롤)으로 두고 남는 높이는 아래 그래프에 준다.
         self._schedule.frame.pack(fill=tk.X)
-        section_title(right, "탐색 프레임별 확인·추적 빔 수", HELP_FRAMES)
+        section_title(right, "탐색 프레임별 빔 수", HELP_FRAMES)
         self._frames = tk.Canvas(right, background=BACKGROUND, highlightthickness=0, height=170)
         self._frames.pack(fill=tk.BOTH, expand=True)
 
@@ -161,9 +171,34 @@ class BeamTab:
         tracks = len(state.tracks)
         expected = expected_tracking_beams(tracks, frames[-1].duration_ms, interval) if frames else None
         text = "" if expected is None else (
-            f"기대 추적 빔 {expected:.1f}개 = 트랙 {tracks} × {frames[-1].duration_ms / 1000:.2f} s ÷ "
-            f"{interval / 1000:g} s")
-        frame_request_chart(self._frames, frames, len(state.search_cells), expected, text, FRAME_CHART_FRAMES)
+            f"기대 = 트랙 {tracks} × {frames[-1].duration_ms / 1000:.2f} s ÷ {interval / 1000:g} s")
+        self._fit_schedule_rows()
+        frame_request_chart(self._frames, frames, len(state.search_cells), expected, text, FRAME_CHART_FRAMES,
+                            current=state.frames.current())
+
+    def _fit_schedule_rows(self) -> None:
+        """창이 낮아 빔 수 그래프가 다 보이지 않으면 높이를 단계적으로 그래프에 준다.
+
+        1단계: 요청 빔 일정 표 4행 → 3행. 2단계: 판정 카드 아랫줄(기준 설명)과 배지 질문을 숨김(툴팁에 남음).
+        되돌릴 때는 되돌려도 기준을 넘을 만큼 남을 때만 되돌린다(경계에서 오가지 않게).
+        """
+        height = self._frames.winfo_height()
+        if height <= 1:
+            return
+        full, core = frame_chart_heights()
+        line = text_height()
+        rows = int(self._schedule.tree.cget("height"))
+        row = int(text_height(FONT_BODY) * 1.45)
+        card_detail = 2 * line + 8  # 카드 아랫줄 + 배지 질문(2줄) 중 큰 쪽 근사
+        compact = self._verdict.compact
+        if rows == SCHEDULE_ROWS and height < full:
+            self._schedule.tree.configure(height=SCHEDULE_ROWS - 1)
+        elif rows < SCHEDULE_ROWS and not compact and height >= full + row + 8:
+            self._schedule.tree.configure(height=SCHEDULE_ROWS)
+        elif rows < SCHEDULE_ROWS and not compact and height < core + 2 * line:
+            self._verdict.set_compact(True)
+        elif compact and height >= core + 2 * line + card_detail + 8:
+            self._verdict.set_compact(False)
 
     def _draw_cards(self, state: MonitorState) -> None:
         sweep = sweep_check(state)
@@ -222,7 +257,9 @@ class BeamTab:
         width, height = canvas_size(canvas, 200, 160)
         coverage = self._coverage(state)
         left, right, bottom, top = self._bounds(state, coverage)
-        margin_left, margin_bottom, margin_top, margin_right = 48, 26, 8, 8
+        # 여백은 눈금 글자 크기로 잡는다(고정 px면 글자 16에서 숫자가 잘림).
+        line = text_height()
+        margin_left, margin_bottom, margin_top, margin_right = text_width("-10°") + 14, line + 10, 8, 8
         plot_width = width - margin_left - margin_right
         plot_height = height - margin_bottom - margin_top
         # 방위와 고각을 같은 축척(1°당 같은 픽셀)으로 그려야 빔이 화면에서도 원으로 보인다.
@@ -245,9 +282,10 @@ class BeamTab:
                                 outline=GRID_LINE)
         for tick in nice_ticks(left, right, max(3, int(plot_width / 90))):
             x = to_x(tick)
+            label = f"{tick % 360:.0f}°"
             canvas.create_line(x, height - margin_bottom, x, height - margin_bottom + 4, fill=GRID_LINE)
-            canvas.create_text(x, height - margin_bottom + 5, text=f"{tick % 360:.0f}°", anchor="n",
-                               fill=MUTED, font=FONT_SMALL)
+            if x + text_width(label) / 2 <= width and x - text_width(label) / 2 >= 0:  # 캔버스 끝에서 잘리는 눈금은 뺀다
+                canvas.create_text(x, height - margin_bottom + 5, text=label, anchor="n", fill=MUTED, font=FONT_SMALL)
         for tick in nice_ticks(bottom, top, max(3, int(plot_height / 50))):
             y = to_y(tick)
             canvas.create_line(margin_left - 4, y, margin_left, y, fill=GRID_LINE)
@@ -296,9 +334,11 @@ class BeamTab:
             x, y = to_x(cell.azimuth_deg), to_y(cell.elevation_deg)
             canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline=TEXT, width=2)
             canvas.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, fill=TEXT, outline="")
+            placer.reserve((x - radius, y - radius, x + radius, y + radius))  # 마지막 탐색 빔이 번호를 덮지 않게
 
         request_afterglow = REQUEST_AFTERGLOW_MS[mode]
         track_ids = {track.track_id for track in state.tracks}
+        beam_radius = {}  # 트랙 ID별 마지막 확인·추적 빔 원 반지름(px). 트랙 번호를 이 원 밖에 쓴다.
         for beam in state.recent_beams(request_afterglow):
             if beam.beam_type == BeamType.SEARCH:
                 continue
@@ -310,6 +350,7 @@ class BeamTab:
             canvas.create_oval(x - radius_x, y - radius_y, x + radius_x, y + radius_y,
                                fill=blend(color, max(ratio, 0) * 0.85, BACKGROUND), outline=color, width=2)
             placer.reserve((x - radius_x, y - radius_y, x + radius_x, y + radius_y))
+            beam_radius[beam.beam_id] = max(radius_x, radius_y)
             if beam.beam_id not in track_ids:
                 placer.place(x + radius_x, y, f"#{beam.beam_id}", gap=3, color=color)
 
@@ -320,7 +361,12 @@ class BeamTab:
             canvas.create_polygon(x, y - size, x + size, y, x, y + size, x - size, y, fill=color,
                                   outline=BACKGROUND)
             placer.reserve((x - size, y - size, x + size, y + size))
-            placer.place(x, y, f"#{track.track_id}", gap=size + 3, color=TEXT)
+            # 트랙 마름모는 늘 자기 추적 빔 원 위에 있어, 마름모 바로 옆(9 px)에 쓰면 지도가 클 때(원이 클 때)
+            # 8방향이 모두 원과 겹쳐 번호가 빠졌다. 원 밖에서 시작하고, 자리가 없으면 조금씩 더 떨어뜨린다.
+            gap = max(size, beam_radius.get(track.track_id, 0.0)) + 3
+            for step in (0, 6, 14):
+                if placer.place(x, y, f"#{track.track_id}", gap=gap + step, color=TEXT) is not None:
+                    break
 
     def _draw_schedule(self, state: MonitorState) -> None:
         interval = self._parameters.tracking_interval_ms
@@ -346,10 +392,16 @@ class BeamTab:
         self._timeline_title.configure(text=f"빔 타임라인 — 최근 {window / 1000:g}초, 오른쪽 끝이 지금")
         canvas = self._timeline
         canvas.delete("all")
+        line = text_height()
+        ticks = line + 8  # 시간 눈금 자리(글자 높이 기준)
+        lane = line + 4
+        wanted = 3 * lane + ticks
+        if int(canvas.cget("height")) != wanted:
+            canvas.configure(height=wanted)  # 글자 크기가 바뀌면 타임라인 높이도 맞춘다
         width, height = canvas_size(canvas, 200, 80)
-        label_width = 56
+        label_width = text_width("확인") + 16
         plot_width = width - label_width - 8
-        lane_height = (height - 22) / 3
+        lane_height = (height - ticks) / 3
         lanes = {BeamType.SEARCH: 0, BeamType.CONFIRMATION: 1, BeamType.TRACKING: 2}
         for beam_type, index in lanes.items():
             top = index * lane_height
@@ -359,8 +411,8 @@ class BeamTab:
                                anchor="e", font=FONT_SMALL)
         for tick in nice_ticks(-window, 0, 6):
             x = label_width + plot_width + tick / window * plot_width
-            canvas.create_line(x, height - 20, x, height - 16, fill=GRID_LINE)
-            canvas.create_text(x, height - 15, text="지금" if tick == 0 else f"{tick / 1000:g}s",
+            canvas.create_line(x, height - ticks + 2, x, height - ticks + 6, fill=GRID_LINE)
+            canvas.create_text(x, height - ticks + 6, text="지금" if tick == 0 else f"{tick / 1000:g}s",
                                anchor="ne" if tick == 0 else ("nw" if tick == -window else "n"),
                                fill=MUTED, font=FONT_SMALL)
         now = state.now_ms()
@@ -368,7 +420,7 @@ class BeamTab:
             return
         slot_width = plot_width / window * BEAM_SLOT_MS
         bar_width = max(slot_width * 0.8, 1.0)
-        placer = LabelPlacer(canvas)
+        placer = LabelPlacer(canvas, (label_width, 0, width, height - ticks))  # 오른쪽 끝에서 캔버스 밖으로 나가지 않게
         labels = []
         for beam in state.recent_beams(window):
             index = lanes.get(BeamType(beam.beam_type)) if beam.beam_type in (1, 2, 3) else None
@@ -388,5 +440,5 @@ class BeamTab:
         missed = [time_ms for time_ms, _ in state.beam_gaps if time_ms >= now - window]
         for time_ms in missed:
             x = label_width + plot_width - (now - time_ms) / window * plot_width
-            canvas.create_line(x, 0, x, height - 22, fill=LEVEL_COLORS["bad"], dash=(2, 2))
+            canvas.create_line(x, 0, x, height - ticks, fill=LEVEL_COLORS["bad"], dash=(2, 2))
 

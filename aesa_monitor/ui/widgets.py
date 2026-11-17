@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import math
 import tkinter as tk
+import tkinter.font as tkfont
+from collections import Counter
 from tkinter import ttk
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from aesa_monitor.core.frames import FrameShare
+from aesa_monitor.core.state import BEAM_SLOT_MS
 from aesa_monitor.core.protocol import BeamType
 from aesa_monitor.core.verdict import Verdict
 from aesa_monitor.ui.style import (
     BACKGROUND, BEAM_COLORS, BEAM_NAMES, FONT_BODY, FONT_SMALL, FONT_TITLE, FONT_VALUE, FONT_VERDICT, GRID_LINE, LEVEL_BACKGROUNDS,
-    CHART_COLOR, LEVEL_COLORS, LEVEL_NAMES, MUTED, PANEL, TEXT, TOOLTIP_BACKGROUND,
+    CHART_COLOR, LEVEL_COLORS, LEVEL_NAMES, MUTED, PANEL, TEXT, TOOLTIP_BACKGROUND, blend,
 )
 
 Box = Tuple[float, float, float, float]
@@ -84,6 +87,19 @@ class StatusCard:
         self._detail.pack(fill=tk.X)
         self._backgrounds = (self.frame, self._body, header, self._title, self._value, self._detail)
         self._last: Tuple = ()
+        self.compact = False
+        # 낮은 화면에서 아랫줄(기준 설명)을 숨기면 마우스를 올려 볼 수 있게 한다.
+        Tooltip(self._value, lambda: self._detail.cget("text") if self.compact else "")
+
+    def set_compact(self, compact: bool) -> None:
+        """낮은 화면용: 아랫줄(기준 설명)을 숨겨 카드 높이를 줄인다(툴팁에 남음)."""
+        if compact == self.compact:
+            return
+        self.compact = compact
+        if compact:
+            self._detail.pack_forget()
+        else:
+            self._detail.pack(fill=tk.X)
 
     def set(self, value: str, detail: str = "", level: str = "idle") -> None:
         key = (value, detail, level)
@@ -136,6 +152,19 @@ class VerdictCardRow:
         self.cards: List[StatusCard] = []
         self._showing_message = False
         self._last: Tuple = ()
+
+    def set_compact(self, compact: bool) -> None:
+        """낮은 화면용: 카드 아랫줄과 배지의 질문을 숨겨 줄 높이를 줄인다."""
+        for card in self.cards:
+            card.set_compact(compact)
+        if compact:
+            self._question.pack_forget()
+        elif not self._question.winfo_manager():
+            self._question.pack(fill=tk.X)
+
+    @property
+    def compact(self) -> bool:
+        return bool(self.cards) and self.cards[0].compact
 
     def _wrap(self, event: tk.Event) -> None:
         width = max(event.width - 30, 200)
@@ -207,7 +236,11 @@ class HelpButton(tk.Label):
 class Tooltip:
     """마우스를 올리면 잠시 뒤 위젯 아래에 작은 설명 창을 띄운다. text는 글자나, 띄울 때마다 부르는 함수.
 
-    빈 글자를 돌려주면 띄우지 않는다. 안쪽 위젯 위로 옮겨 가도 <Leave>가 오지 않도록 묶음 프레임에 붙인다.
+    빈 글자를 돌려주면 띄우지 않는다. 묶음 프레임(예: 연결 상태의 점 + 이름)에 붙이면 안쪽 위젯 어디에 올려도 뜬다.
+    - 프레임 자체 영역에서 안쪽 위젯으로 옮겨 가면 Tk가 프레임에 <Leave>를 보내므로, 포인터가 아직 위젯 영역 안이면 무시한다.
+    - 안쪽 위젯에서 프레임으로 돌아오며 오는 <Enter>는 이미 떠 있거나 띄울 예정이면 무시한다(깜박이지 않게).
+    - 설명 창은 위치를 정한 뒤에 보인다. 먼저 보이면 화면 왼쪽 위(0,0)에 잠깐 나타나 그 자리의 위젯을 덮고,
+      그 위젯이 <Leave>를 받아 바로 닫혔다(창 왼쪽 위의 연결 상태 툴팁이 뜨지 않던 원인).
     """
 
     DELAY_MS = 400
@@ -218,12 +251,23 @@ class Tooltip:
         self._window: Optional[tk.Toplevel] = None
         self._job: Optional[str] = None
         widget.bind("<Enter>", self._schedule, add="+")
-        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<Leave>", self._on_leave, add="+")
         widget.bind("<ButtonPress>", self.hide, add="+")
 
     def _schedule(self, _event: object = None) -> None:
-        self._cancel()
+        if self._window is not None or self._job is not None:
+            return
         self._job = self._widget.after(self.DELAY_MS, self.show)
+
+    def _pointer_inside(self) -> bool:
+        x, y = self._widget.winfo_pointerxy()
+        left, top = self._widget.winfo_rootx(), self._widget.winfo_rooty()
+        return left <= x < left + self._widget.winfo_width() and top <= y < top + self._widget.winfo_height()
+
+    def _on_leave(self, _event: object = None) -> None:
+        if self._pointer_inside():
+            return
+        self.hide()
 
     def _cancel(self) -> None:
         if self._job is not None:
@@ -237,6 +281,7 @@ class Tooltip:
         if not text or not self._widget.winfo_ismapped():
             return
         window = tk.Toplevel(self._widget)
+        window.withdraw()  # 위치를 정하기 전에는 보이지 않게(위 설명)
         window.wm_overrideredirect(True)
         label = tk.Label(window, text=text, justify=tk.LEFT, font=FONT_BODY, background=TOOLTIP_BACKGROUND,
                          foreground=TEXT, relief=tk.SOLID, borderwidth=1, padx=8, pady=4)
@@ -246,6 +291,7 @@ class Tooltip:
         x = min(self._widget.winfo_rootx(), self._widget.winfo_screenwidth() - window.winfo_reqwidth() - 4)
         y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
         window.geometry(f"+{max(x, 0)}+{y}")
+        window.deiconify()
         self._window = window
 
     def hide(self, _event: object = None) -> None:
@@ -357,6 +403,15 @@ class LabelPlacer:
                 return item
             self.canvas.delete(item)
         return None
+
+
+def text_height(font: str = FONT_SMALL) -> int:
+    """글꼴 한 줄 높이(px). 캔버스 여백을 글자 크기에 맞출 때 쓴다(고정 px 여백은 글자 16에서 잘림)."""
+    return tkfont.nametofont(font).metrics("linespace")
+
+
+def text_width(text: str, font: str = FONT_SMALL) -> int:
+    return tkfont.nametofont(font).measure(text)
 
 
 def canvas_size(canvas: tk.Canvas, minimum_width: int = 100, minimum_height: int = 60) -> Tuple[int, int]:
@@ -512,56 +567,158 @@ def histogram(canvas: tk.Canvas, values: Sequence[float], unit: str, reference: 
         canvas.create_text(56, 4, text=title + " · 세로축은 개수", anchor="nw", fill=TEXT, font=FONT_SMALL)
 
 
+CURSOR_SPACE = 7  # 진행 중 프레임 표시(▼) 자리
+
+
+def frame_chart_heights() -> Tuple[int, int]:
+    """빔 수 그래프가 다 보이는 높이와, 막대를 그릴 수 있는 최소 높이(px). 지금 글자 크기 기준."""
+    line = text_height()
+    core = CURSOR_SPACE + (line + 4 + 6) + 2 * line + (line + 10)  # 시간 띠(글자 포함), 막대 최소 2줄, 가로 눈금
+    return core + (line + 4) + (line + 6) + line, core
+
+
 def frame_request_chart(canvas: tk.Canvas, frames: Sequence[FrameShare], grid_cells: int = 0,
                         expected: Optional[float] = None, expected_text: str = "", max_frames: Optional[int] = None,
-                        title: str = "") -> None:
-    """탐색 프레임마다 끼어든 확인·추적 빔 수를 쌓은 막대. 가로축은 프레임 번호, 세로축은 빔 수(개)다.
+                        title: str = "", current: Optional[FrameShare] = None) -> None:
+    """위: 마지막 탐색 프레임 시간 띠(탐색·확인·추적에 쓴 시간), 아래: 프레임별 끼어든 확인·추적 빔 수 막대.
 
-    탐색 빔은 프레임마다 격자 칸 수로 거의 일정해서(점유율 97% 안팎) 비율 그래프로는 변화가 보이지 않는다.
-    그래서 탐색 빔은 빼고 확인·추적 빔 수만 그리며, 뺐다는 것을 맨 위 부제로 밝힌다.
-    expected(기대 추적 빔 수)를 주면 점선을 긋고, 세로축 위쪽을 기대값의 2배 이상으로 잡아
-    정상일 때 막대가 그래프 가운데쯤에 오게 한다. 빠진 프레임 번호 자리는 비워 둔다.
+    처리부는 10 ms마다 빔을 하나 보내고 탐색 빔은 프레임마다 격자 칸 수(189)로 고정이라, 점유율은 '한 프레임 시간을
+    무엇에 썼나'와 같다. 시간 띠는 프레임이 닫힐 때마다 바뀌고, current(진행 중 프레임)를 주면 지금 위치를 ▼로 보인다.
+    막대 오른쪽 축은 같은 높이의 확인·추적 비율(%) = n ÷ (탐색 + n)이다(탐색이 고정이라 개수와 1:1).
+    expected(기대 추적 빔 수)를 주면 점선과 그래프 오른쪽 바깥 이름표, 계산식(expected_text)은 축 제목 줄에 자리가 있을 때만.
+    높이가 모자라면 축 제목 줄 → 시간 띠 글자 → 요약 줄 순서로 빼서 막대를 남긴다. 여백은 글자 높이로 잡는다.
     """
     canvas.delete("all")
-    width, height = canvas_size(canvas, 200, 120)
+    width, height = canvas_size(canvas, 200, 40)
     if not frames:
-        empty_message(canvas, "탐색 프레임이 한 번 다 돌면 프레임별 확인·추적 빔 수를 그립니다")
+        empty_message(canvas, "탐색 프레임이 한 번 다 돌면 프레임별 빔 수를 그립니다")
         return
     frames = list(frames)
     if max_frames is not None:
         frames = frames[-max_frames:]
     first, last = frames[0].index, frames[-1].index
     latest = frames[-1]
+    searches = [frame.count(BeamType.SEARCH) for frame in frames]
+    reference = grid_cells or Counter(searches).most_common(1)[0][0]
     observed = max(frame.request_beams for frame in frames)
     high = max(observed * 1.15, (expected or 0.0) * 2.0, 4.0)
+    line = text_height()
+    _full, core = frame_chart_heights()
 
-    left = 44.0
-    cells = f"{grid_cells}개" if grid_cells else "격자 칸 수만큼"
-    prefix = f"{title} — " if title else ""
-    canvas.create_text(left, 2, text=f"{prefix}탐색 빔(프레임당 {cells})은 빼고, 프레임 사이에 끼어든 확인·추적 빔만 셉니다",
-                       anchor="nw", fill=MUTED, font=FONT_SMALL)
-    pieces = [("마지막 프레임  ", TEXT)]
-    pieces += [(f"{BEAM_NAMES[beam_type]} {latest.count(beam_type)}개({latest.share(beam_type) * 100:.0f}%)  ",
-                BEAM_COLORS[beam_type]) for beam_type in (BeamType.SEARCH, BeamType.CONFIRMATION, BeamType.TRACKING)]
-    pieces.append((f"#{latest.index}, {latest.duration_ms / 1000:.2f} s", MUTED))
-    x = left
-    second_line_y = 2.0
-    first_line = canvas.bbox("all")
-    if first_line:
-        second_line_y = first_line[3] + 2
-    for text, color in pieces:
-        item = canvas.create_text(x, second_line_y, text=text, anchor="nw", fill=color, font=FONT_SMALL)
-        box = canvas.bbox(item)
-        x = box[2] if box else x + len(text) * 7
-    header = canvas.bbox("all")
-    top = (header[3] if header else 36) + 22
+    left = text_width(f"{high:.0f}") + 14
+    expected_label = f"기대 {expected:.1f}" if expected is not None else ""
+    # 넓으면 기대값 이름표에 비율도 붙인다(`기대 5.8 (3.0%)`). 좁으면 이름만.
+    if expected_label and width >= 600:
+        expected_label = f"{expected_label} ({expected / (reference + expected) * 100:.1f}%)"
+    right = width - 12 - max(text_width(expected_label), text_width("99.9%")) - 8
+    optional = {"summary": line + 4, "titles": line + 6}
+    shown = set()
+    used = core
+    for name in ("summary", "titles"):
+        if used + optional[name] + line <= height:
+            shown.add(name)
+            used += optional[name]
 
-    x_range = (first - 0.5, last + 0.5)
-    area = ChartArea(canvas, (left, top, width - 16, height - 22), x_range, (0.0, high))
+    # 요약 줄: 프레임 #n 1.95 s = 탐색 1.89 s(97%) + 확인 0.00 s + 추적 0.06 s. 넓이가 모자라면 줄인다.
+    # 비율은 프레임 시간 기준(빈 칸 포함). 빔 수 기준 share()는 빈 칸이 있어도 합이 100%라 지연·수신 누락 때 틀리게 보인다.
+    time_parts = latest.time_parts(BEAM_SLOT_MS)
+    parts_ms = [(beam_type, ms, fraction) for beam_type, ms, fraction in time_parts[:3]]
+    _gap, gap_ms, gap_fraction = time_parts[3]
+    total_ms = sum(ms for _, ms, _ in time_parts)
+    y = 2.0
+    if "summary" in shown:
+        def pieces(level: int):
+            head = [(f"{title} — " if title else "", MUTED), (f"프레임 #{latest.index}  " if level < 2 else
+                                                              f"#{latest.index} ", TEXT),
+                    (f"{latest.duration_ms / 1000:.2f} s = " if level < 2 else f"{latest.duration_ms / 1000:.2f} s: ",
+                     TEXT)]
+            body = []
+            for number, (beam_type, ms, fraction) in enumerate(parts_ms):
+                share = f"({fraction * 100:.0f}%)" if level == 0 else ""
+                join = "" if number == 0 else (" + " if level < 2 else " · ")
+                unit = " s" if level < 2 else ""
+                body.append((f"{join}{BEAM_NAMES[beam_type]} {ms / 1000:.2f}{unit}{share}", BEAM_COLORS[beam_type]))
+            if gap_ms:
+                gap_share = f"({gap_fraction * 100:.0f}%)" if level == 0 else ""
+                body.append((f" + 빈 칸 {gap_ms / 1000:.2f} s{gap_share}", MUTED))
+            return [piece for piece in head + body if piece[0]]
+
+        for level in (0, 1, 2):
+            chosen = pieces(level)
+            if sum(text_width(text) for text, _ in chosen) <= width - 12 - left:
+                break
+        x = left
+        for text, color in chosen:
+            canvas.create_text(x, y, text=text, anchor="nw", fill=color, font=FONT_SMALL)
+            x += text_width(text)
+        y += line + 4
+
+    # 시간 띠: 마지막 프레임 시간을 탐색·확인·추적·빈 칸으로 나눠 칠한다. 축 길이는 진행 중 프레임이 넘어가도 보이게 여유.
+    elapsed_ms = current.duration_ms if current is not None else None
+    scale_ms = max(total_ms, elapsed_ms or 0)
+    end_text = f"{latest.duration_ms / 1000:.2f} s"
+    bar_left, bar_right = left, width - 12 - text_width("99.99 s") - 6  # 띠 끝 프레임 시간 자리
+    to_px = (bar_right - bar_left) / max(scale_ms, 1)
+    cursor_top = y
+    bar_top = y + CURSOR_SPACE
+    bar_bottom = bar_top + line + 4
+    x = bar_left
+    segments = [(ms, blend(BEAM_COLORS[beam_type], 0.55, BACKGROUND)) for beam_type, ms, _ in parts_ms]
+    segments.append((gap_ms, GRID_LINE))
+    for ms, color in segments:
+        if ms <= 0:
+            continue
+        canvas.create_rectangle(x, bar_top, x + ms * to_px, bar_bottom, fill=color, outline="")
+        x += ms * to_px
+    search_ms, search_fraction = parts_ms[0][1], parts_ms[0][2]
+    request_fraction = parts_ms[1][2] + parts_ms[2][2]
+    gap_text = f" · 빈 칸 {gap_fraction * 100:.0f}%" if gap_ms else ""
+    candidates = [f"탐색 {search_fraction * 100:.0f}% · 확인·추적 {request_fraction * 100:.0f}%{gap_text}"]
+    if gap_ms:
+        candidates.append(f"탐색 {search_fraction * 100:.0f}%{gap_text}")
+    candidates.append(f"탐색 {search_fraction * 100:.0f}%")
+    for text in candidates:
+        if text_width(text) + 12 <= search_ms * to_px:
+            canvas.create_text(bar_left + 6, (bar_top + bar_bottom) / 2, text=text, anchor="w", fill=TEXT,
+                               font=FONT_SMALL)
+            break
+    canvas.create_text(x + 6, (bar_top + bar_bottom) / 2, text=end_text, anchor="w", fill=TEXT, font=FONT_SMALL)
+    if elapsed_ms is not None:
+        cx = bar_left + elapsed_ms * to_px
+        canvas.create_line(cx, bar_top - 1, cx, bar_bottom + 1, fill=TEXT, width=2)
+        canvas.create_polygon(cx - 5, cursor_top, cx + 5, cursor_top, cx, bar_top - 1, fill=TEXT, outline="")
+    y = bar_bottom + 6
+
+    if height < core:
+        return
+
+    top = y + (line + 6 if "titles" in shown else 4)
+    area = ChartArea(canvas, (left, top, right, height - line - 10), (first - 0.5, last + 0.5), (0.0, high))
+    titles = ("막대: 확인·추적 빔 수(개)", "확인·추적 비율") if "titles" in shown else ("", "")
+    span = area.bottom - area.top
+    y_count = 4 if span >= 6 * line else (3 if span >= 3 * line else 2)
     area.draw_axes(lambda value: f"{value:.0f}" if abs(value - round(value)) < 1e-6 else "",
-                   lambda value: f"{value:.0f}", "빔 수(개)", "탐색 프레임 번호", y_count=3)
-    slot = (area.right - area.left) / max(last - first + 1, 1)
-    bar = max(min(slot * 0.7, 18.0), 1.0)
+                   lambda value: f"{value:.0f}", titles[0], "", y_count=y_count)
+    if titles[1]:
+        canvas.create_text(width - 12, top - 4, text=titles[1], anchor="se", fill=MUTED, font=FONT_SMALL)
+    if "titles" in shown and expected_text:
+        # 점선 계산식은 축 제목 줄의 빈자리에 쓴다(오른쪽 설명과 겹치면 생략. 도움말에도 있음).
+        formula = f"┅ {expected_text}"
+        start = left + text_width(titles[0]) + 16
+        end = width - 12 - text_width(titles[1]) - 16
+        if start + text_width(formula) <= end:
+            canvas.create_text(start, top - 4, text=formula, anchor="sw", fill=TEXT, font=FONT_SMALL)
+    # 오른쪽 % 축: 같은 높이의 개수 n을 비율 n ÷ (탐색 + n)으로. 기대값 이름표와 겹치는 눈금 글자는 뺀다.
+    expected_y = area.y(expected) if expected is not None else None
+    for tick in nice_ticks(*area.y_range, count=y_count):
+        if tick <= 0:
+            continue
+        y_tick = area.y(tick)
+        if expected_y is not None and abs(y_tick - expected_y) < line:
+            continue
+        canvas.create_text(area.right + 6, y_tick, text=f"{tick / (reference + tick) * 100:.1f}%", anchor="w",
+                           fill=MUTED, font=FONT_SMALL)
+    bar = max(min((area.right - area.left) / max(last - first + 1, 1) * 0.7, 18.0), 1.0)
     for frame in frames:
         center = area.x(frame.index)
         bottom = 0
@@ -572,15 +729,8 @@ def frame_request_chart(canvas: tk.Canvas, frames: Sequence[FrameShare], grid_ce
                                         fill=BEAM_COLORS[beam_type], outline="")
                 bottom += count
     if expected is not None:
-        y = area.y(expected)
-        canvas.create_line(area.left, y, area.right, y, fill=TEXT, dash=(5, 3), width=2)
-        if expected_text:
-            item = canvas.create_text(area.right - 4, y - 3, text=expected_text, anchor="se", fill=TEXT,
-                                      font=FONT_SMALL)
-            box = canvas.bbox(item)
-            if box:
-                back = canvas.create_rectangle(box[0] - 3, box[1], box[2] + 3, box[3], fill=BACKGROUND, outline="")
-                canvas.tag_lower(back, item)
+        canvas.create_line(area.left, expected_y, area.right, expected_y, fill=TEXT, dash=(5, 3), width=2)
+        canvas.create_text(area.right + 6, expected_y, text=expected_label, anchor="w", fill=TEXT, font=FONT_SMALL)
 
 
 def bind_tree_colors(tree: ttk.Treeview, colors: Dict[str, str]) -> None:

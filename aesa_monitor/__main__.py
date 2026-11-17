@@ -187,7 +187,7 @@ def main(arguments: Optional[List[str]] = None) -> int:
             if options.font_size:
                 app.set_font_size(options.font_size)
             if options.geometry:
-                root.geometry(options.geometry)
+                app.set_window_geometry(options.geometry)
             if options.record:
                 app.start_recording()
             if options.open is not None:
