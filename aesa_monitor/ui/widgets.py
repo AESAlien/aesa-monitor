@@ -1,4 +1,4 @@
-"""여러 탭이 함께 쓰는 화면 부품: 판정 줄, 판정 카드 줄, 표, 도움말, 캔버스 라벨 배치, 그래프."""
+"""여러 탭이 함께 쓰는 화면 부품: 판정 줄, 판정 카드 줄, 표, 도움말, 툴팁, 캔버스 라벨 배치, 그래프."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from aesa_monitor.core.protocol import BeamType
 from aesa_monitor.core.verdict import Verdict
 from aesa_monitor.ui.style import (
     BACKGROUND, BEAM_COLORS, BEAM_NAMES, FONT_BODY, FONT_SMALL, FONT_TITLE, FONT_VALUE, FONT_VERDICT, GRID_LINE, LEVEL_BACKGROUNDS,
-    CHART_COLOR, LEVEL_COLORS, LEVEL_NAMES, MUTED, PANEL, TEXT,
+    CHART_COLOR, LEVEL_COLORS, LEVEL_NAMES, MUTED, PANEL, TEXT, TOOLTIP_BACKGROUND,
 )
 
 Box = Tuple[float, float, float, float]
@@ -202,6 +202,60 @@ class HelpButton(tk.Label):
         body.configure(state=tk.DISABLED)
         body.pack(fill=tk.BOTH, expand=True)
         ttk.Button(window, text="닫기", command=window.destroy).pack(pady=(0, 10))
+
+
+class Tooltip:
+    """마우스를 올리면 잠시 뒤 위젯 아래에 작은 설명 창을 띄운다. text는 글자나, 띄울 때마다 부르는 함수.
+
+    빈 글자를 돌려주면 띄우지 않는다. 안쪽 위젯 위로 옮겨 가도 <Leave>가 오지 않도록 묶음 프레임에 붙인다.
+    """
+
+    DELAY_MS = 400
+
+    def __init__(self, widget: tk.Widget, text) -> None:
+        self._widget = widget
+        self._text = text
+        self._window: Optional[tk.Toplevel] = None
+        self._job: Optional[str] = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def _schedule(self, _event: object = None) -> None:
+        self._cancel()
+        self._job = self._widget.after(self.DELAY_MS, self.show)
+
+    def _cancel(self) -> None:
+        if self._job is not None:
+            self._widget.after_cancel(self._job)
+            self._job = None
+
+    def show(self) -> None:
+        self._cancel()
+        self._destroy_window()
+        text = self._text() if callable(self._text) else self._text
+        if not text or not self._widget.winfo_ismapped():
+            return
+        window = tk.Toplevel(self._widget)
+        window.wm_overrideredirect(True)
+        label = tk.Label(window, text=text, justify=tk.LEFT, font=FONT_BODY, background=TOOLTIP_BACKGROUND,
+                         foreground=TEXT, relief=tk.SOLID, borderwidth=1, padx=8, pady=4)
+        label.pack()
+        window.update_idletasks()
+        # 화면 오른쪽 끝을 넘으면 왼쪽으로 당긴다(상단 바 오른쪽 위젯의 툴팁).
+        x = min(self._widget.winfo_rootx(), self._widget.winfo_screenwidth() - window.winfo_reqwidth() - 4)
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        window.geometry(f"+{max(x, 0)}+{y}")
+        self._window = window
+
+    def hide(self, _event: object = None) -> None:
+        self._cancel()
+        self._destroy_window()
+
+    def _destroy_window(self) -> None:
+        if self._window is not None:
+            self._window.destroy()
+            self._window = None
 
 
 def section_title(parent: tk.Widget, text: str, help_text: str = "",

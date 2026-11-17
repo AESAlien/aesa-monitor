@@ -46,6 +46,7 @@ GRID_LINE = _mix(LIG_GRAY, 0.6, BACKGROUND)      # 캔버스 격자. 원색은 �
 PANEL = _mix(LIG_BLUE, 0.05, BACKGROUND)         # 카드·막대 바탕. CI 파랑을 아주 옅게
 # 보조 글자. CI 회색은 대비가 모자라서 푸른 기가 도는 진한 회색을 따로 둔다(흰 바탕 대비 약 6:1).
 MUTED = "#5a6068"
+TOOLTIP_BACKGROUND = "#fffdf3"  # 툴팁 바탕. 흰 바탕과 구분되게 아주 옅은 노랑
 
 OK = "#2f7d32"
 WARN = "#b26a00"
@@ -140,6 +141,7 @@ class Fonts:
         # clam 테마는 선택된 탭의 padding을 따로 줄여 두므로 같은 값으로 덮는다(안 하면 선택 탭만 좁아진다).
         style.map("TNotebook.Tab", padding=[("selected", (14, 6))])
         style.configure("TButton", font=FONT_BODY, padding=(8, 3))
+        style.configure("TMenubutton", font=FONT_BODY, padding=(8, 3))
         style.configure("TCombobox", font=FONT_BODY)
         style.configure("TCheckbutton", font=FONT_BODY, background=BACKGROUND)
         style.configure("TRadiobutton", font=FONT_BODY, background=BACKGROUND)
@@ -181,6 +183,15 @@ def apply_theme(root: tk.Misc) -> None:
               foreground=[("disabled", UNKNOWN), ("pressed", BACKGROUND)],
               lightcolor=[("pressed", ACCENT_ACTIVE), ("active", ACCENT_SOFT)],
               darkcolor=[("pressed", ACCENT_ACTIVE), ("active", ACCENT_SOFT)],
+              bordercolor=[("focus", ACCENT), ("active", ACCENT)])
+    # 메뉴 버튼(상단 바 '메뉴')은 보통 버튼과 같은 모양으로. 기본 모양은 흰 바탕이라 펼침 목록처럼 보인다.
+    style.configure("TMenubutton", background=PANEL, foreground=TEXT, bordercolor=BORDER, lightcolor=PANEL,
+                    darkcolor=PANEL, arrowcolor=TEXT)
+    style.map("TMenubutton",
+              background=[("disabled", BACKGROUND), ("pressed", ACCENT_SOFT), ("active", ACCENT_SOFT)],
+              foreground=[("disabled", UNKNOWN)],
+              lightcolor=[("pressed", ACCENT_SOFT), ("active", ACCENT_SOFT)],
+              darkcolor=[("pressed", ACCENT_SOFT), ("active", ACCENT_SOFT)],
               bordercolor=[("focus", ACCENT), ("active", ACCENT)])
     style.configure("Treeview", background=BACKGROUND, fieldbackground=BACKGROUND, foreground=TEXT,
                     bordercolor=BORDER, lightcolor=BACKGROUND, darkcolor=BACKGROUND)
