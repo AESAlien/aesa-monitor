@@ -620,10 +620,11 @@ def frame_request_chart(canvas: tk.Canvas, frames: Sequence[FrameShare], grid_ce
             used += optional[name]
 
     # 요약 줄: 프레임 #n 1.95 s = 탐색 1.89 s(97%) + 확인 0.00 s + 추적 0.06 s. 넓이가 모자라면 줄인다.
-    slot_ms = BEAM_SLOT_MS
-    parts_ms = [(beam_type, latest.count(beam_type) * slot_ms) for beam_type in
-                (BeamType.SEARCH, BeamType.CONFIRMATION, BeamType.TRACKING)]
-    gap_ms = max(latest.duration_ms - sum(ms for _, ms in parts_ms), 0)
+    # 비율은 프레임 시간 기준(빈 칸 포함). 빔 수 기준 share()는 빈 칸이 있어도 합이 100%라 지연·수신 누락 때 틀리게 보인다.
+    time_parts = latest.time_parts(BEAM_SLOT_MS)
+    parts_ms = [(beam_type, ms, fraction) for beam_type, ms, fraction in time_parts[:3]]
+    _gap, gap_ms, gap_fraction = time_parts[3]
+    total_ms = sum(ms for _, ms, _ in time_parts)
     y = 2.0
     if "summary" in shown:
         def pieces(level: int):
@@ -632,13 +633,14 @@ def frame_request_chart(canvas: tk.Canvas, frames: Sequence[FrameShare], grid_ce
                     (f"{latest.duration_ms / 1000:.2f} s = " if level < 2 else f"{latest.duration_ms / 1000:.2f} s: ",
                      TEXT)]
             body = []
-            for number, (beam_type, ms) in enumerate(parts_ms):
-                share = f"({latest.share(beam_type) * 100:.0f}%)" if level == 0 else ""
+            for number, (beam_type, ms, fraction) in enumerate(parts_ms):
+                share = f"({fraction * 100:.0f}%)" if level == 0 else ""
                 join = "" if number == 0 else (" + " if level < 2 else " · ")
                 unit = " s" if level < 2 else ""
                 body.append((f"{join}{BEAM_NAMES[beam_type]} {ms / 1000:.2f}{unit}{share}", BEAM_COLORS[beam_type]))
             if gap_ms:
-                body.append((f" + 빈 칸 {gap_ms / 1000:.2f} s", MUTED))
+                gap_share = f"({gap_fraction * 100:.0f}%)" if level == 0 else ""
+                body.append((f" + 빈 칸 {gap_ms / 1000:.2f} s{gap_share}", MUTED))
             return [piece for piece in head + body if piece[0]]
 
         for level in (0, 1, 2):
@@ -653,7 +655,7 @@ def frame_request_chart(canvas: tk.Canvas, frames: Sequence[FrameShare], grid_ce
 
     # 시간 띠: 마지막 프레임 시간을 탐색·확인·추적·빈 칸으로 나눠 칠한다. 축 길이는 진행 중 프레임이 넘어가도 보이게 여유.
     elapsed_ms = current.duration_ms if current is not None else None
-    scale_ms = max(latest.duration_ms, elapsed_ms or 0)
+    scale_ms = max(total_ms, elapsed_ms or 0)
     end_text = f"{latest.duration_ms / 1000:.2f} s"
     bar_left, bar_right = left, width - 12 - text_width("99.99 s") - 6  # 띠 끝 프레임 시간 자리
     to_px = (bar_right - bar_left) / max(scale_ms, 1)
@@ -661,17 +663,21 @@ def frame_request_chart(canvas: tk.Canvas, frames: Sequence[FrameShare], grid_ce
     bar_top = y + CURSOR_SPACE
     bar_bottom = bar_top + line + 4
     x = bar_left
-    segments = [(ms, blend(BEAM_COLORS[beam_type], 0.55, BACKGROUND)) for beam_type, ms in parts_ms]
+    segments = [(ms, blend(BEAM_COLORS[beam_type], 0.55, BACKGROUND)) for beam_type, ms, _ in parts_ms]
     segments.append((gap_ms, GRID_LINE))
     for ms, color in segments:
         if ms <= 0:
             continue
         canvas.create_rectangle(x, bar_top, x + ms * to_px, bar_bottom, fill=color, outline="")
         x += ms * to_px
-    search_ms = parts_ms[0][1]
-    request_share = latest.share(BeamType.CONFIRMATION) + latest.share(BeamType.TRACKING)
-    for text in (f"탐색 {latest.share(BeamType.SEARCH) * 100:.0f}% · 확인·추적 {request_share * 100:.0f}%",
-                 f"탐색 {latest.share(BeamType.SEARCH) * 100:.0f}%"):
+    search_ms, search_fraction = parts_ms[0][1], parts_ms[0][2]
+    request_fraction = parts_ms[1][2] + parts_ms[2][2]
+    gap_text = f" · 빈 칸 {gap_fraction * 100:.0f}%" if gap_ms else ""
+    candidates = [f"탐색 {search_fraction * 100:.0f}% · 확인·추적 {request_fraction * 100:.0f}%{gap_text}"]
+    if gap_ms:
+        candidates.append(f"탐색 {search_fraction * 100:.0f}%{gap_text}")
+    candidates.append(f"탐색 {search_fraction * 100:.0f}%")
+    for text in candidates:
         if text_width(text) + 12 <= search_ms * to_px:
             canvas.create_text(bar_left + 6, (bar_top + bar_bottom) / 2, text=text, anchor="w", fill=TEXT,
                                font=FONT_SMALL)

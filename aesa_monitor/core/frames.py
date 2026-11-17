@@ -12,11 +12,12 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
 from aesa_monitor.core.protocol import BeamType
 
 BEAM_TYPES = (BeamType.SEARCH, BeamType.CONFIRMATION, BeamType.TRACKING)
+GAP = "gap"  # FrameShare.time_parts의 빈 칸(빔이 오지 않은 시간) 키
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,20 @@ class FrameShare:
 
     def count(self, beam_type: int) -> int:
         return self.counts.get(int(beam_type), 0)
+
+    def time_parts(self, slot_ms: int) -> List[Tuple[Union[int, str], int, float]]:
+        """프레임 시간을 탐색·확인·추적에 쓴 시간(빔 수 × slot_ms)과 빈 칸(GAP, 빔이 오지 않은 시간)으로 나눈다.
+
+        (키, ms, 비율) 목록을 탐색·확인·추적·빈 칸 순서로 준다. 비율은 빔 수가 아니라 프레임 시간 기준이라, 처리부 지연이나
+        모니터 큐 넘침으로 빈 칸이 생기면 탐색·확인·추적 비율의 합이 100%보다 작아지고 나머지가 빈 칸 비율이다(share()와 다름).
+        프레임 시간이 빔 수 × slot_ms보다 짧으면(시각 반올림 등) 빈 칸은 0이고 빔 시간 합을 분모로 쓴다.
+        """
+        parts: List[Tuple[Union[int, str], int]] = [(int(beam_type), self.count(beam_type) * slot_ms)
+                                                    for beam_type in BEAM_TYPES]
+        used = sum(ms for _, ms in parts)
+        parts.append((GAP, max(self.duration_ms - used, 0)))
+        total = max(self.duration_ms, used)
+        return [(key, ms, ms / total if total else 0.0) for key, ms in parts]
 
     @property
     def request_beams(self) -> int:
