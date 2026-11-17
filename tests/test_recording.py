@@ -188,6 +188,12 @@ class RestartReplayTest(unittest.TestCase):
         # 구간을 주지 않으면 처음 맞는 곳(앞 구간)이다.
         self.assertAlmostEqual(self.player.time_for_processor_ms(1500), first)
 
+    def test_processor_range_per_segment(self):
+        # 분석 탭 타임라인은 고른 실행 구간의 녹화 범위만 그린다.
+        self.assertEqual(self.player.processor_range_ms(0), (0, 2990))
+        self.assertEqual(self.player.processor_range_ms(1), (0, 2990))
+        self.assertIsNone(self.player.processor_range_ms(2))
+
     def test_current_position_has_segment(self):
         self.player.seek(5.6)
         position = self.player.current_position()

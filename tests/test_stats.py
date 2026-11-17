@@ -88,6 +88,15 @@ class ComputeStatsTest(unittest.TestCase):
         self.assertEqual(item(report, "탐색→확인 지연").samples, [100.0])
         self.assertEqual(report.tracks[0].max_consecutive_misses, 1)
 
+    def test_tracks_keep_processor_run_segment(self):
+        # 처리부가 다시 시작하면 같은 트랙 ID가 다시 쓰인다. 트랙별 요약은 실행 구간으로 나누고, 그 구간을 지닌다.
+        hit = [(50.0, 20.0, 1.5, -250.0)]
+        first = self.build({1600: hit, 2600: hit, 3600: hit})
+        second = [BeamRecord(record.time_ms, record.beam_type, record.beam_id, record.azimuth_deg,
+                             record.elevation_deg, record.plots, segment=1) for record in first]
+        report = compute_stats(first + second, PARAMETERS, "test")
+        self.assertEqual([(entry.segment, entry.track_id) for entry in report.tracks], [(0, 1), (1, 1)])
+
     def test_gap_counts_missing_slots(self):
         report = compute_stats(self.build({}, gap_after=2000), PARAMETERS, "test")
         gaps = item(report, "연속 빔 간격")

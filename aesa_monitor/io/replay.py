@@ -105,10 +105,12 @@ class ReplayPlayer:
 
     # 처리부 시각
 
-    def processor_range_ms(self) -> Optional[Tuple[int, int]]:
-        if not self._processor_index:
+    def processor_range_ms(self, segment: Optional[int] = None) -> Optional[Tuple[int, int]]:
+        """녹화가 담은 처리부 시각 범위. segment를 주면 그 처리부 실행 구간 안의 범위만."""
+        values = [value for value, time_s, _ in self._processor_index
+                  if segment is None or self.segment_at(time_s) == segment]
+        if not values:
             return None
-        values = [value for value, _, _ in self._processor_index]
         return min(values), max(values)
 
     @property
