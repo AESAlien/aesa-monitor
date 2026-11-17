@@ -236,7 +236,11 @@ class HelpButton(tk.Label):
 class Tooltip:
     """마우스를 올리면 잠시 뒤 위젯 아래에 작은 설명 창을 띄운다. text는 글자나, 띄울 때마다 부르는 함수.
 
-    빈 글자를 돌려주면 띄우지 않는다. 안쪽 위젯 위로 옮겨 가도 <Leave>가 오지 않도록 묶음 프레임에 붙인다.
+    빈 글자를 돌려주면 띄우지 않는다. 묶음 프레임(예: 연결 상태의 점 + 이름)에 붙이면 안쪽 위젯 어디에 올려도 뜬다.
+    - 프레임 자체 영역에서 안쪽 위젯으로 옮겨 가면 Tk가 프레임에 <Leave>를 보내므로, 포인터가 아직 위젯 영역 안이면 무시한다.
+    - 안쪽 위젯에서 프레임으로 돌아오며 오는 <Enter>는 이미 떠 있거나 띄울 예정이면 무시한다(깜박이지 않게).
+    - 설명 창은 위치를 정한 뒤에 보인다. 먼저 보이면 화면 왼쪽 위(0,0)에 잠깐 나타나 그 자리의 위젯을 덮고,
+      그 위젯이 <Leave>를 받아 바로 닫혔다(창 왼쪽 위의 연결 상태 툴팁이 뜨지 않던 원인).
     """
 
     DELAY_MS = 400
@@ -247,12 +251,23 @@ class Tooltip:
         self._window: Optional[tk.Toplevel] = None
         self._job: Optional[str] = None
         widget.bind("<Enter>", self._schedule, add="+")
-        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<Leave>", self._on_leave, add="+")
         widget.bind("<ButtonPress>", self.hide, add="+")
 
     def _schedule(self, _event: object = None) -> None:
-        self._cancel()
+        if self._window is not None or self._job is not None:
+            return
         self._job = self._widget.after(self.DELAY_MS, self.show)
+
+    def _pointer_inside(self) -> bool:
+        x, y = self._widget.winfo_pointerxy()
+        left, top = self._widget.winfo_rootx(), self._widget.winfo_rooty()
+        return left <= x < left + self._widget.winfo_width() and top <= y < top + self._widget.winfo_height()
+
+    def _on_leave(self, _event: object = None) -> None:
+        if self._pointer_inside():
+            return
+        self.hide()
 
     def _cancel(self) -> None:
         if self._job is not None:
@@ -266,6 +281,7 @@ class Tooltip:
         if not text or not self._widget.winfo_ismapped():
             return
         window = tk.Toplevel(self._widget)
+        window.withdraw()  # 위치를 정하기 전에는 보이지 않게(위 설명)
         window.wm_overrideredirect(True)
         label = tk.Label(window, text=text, justify=tk.LEFT, font=FONT_BODY, background=TOOLTIP_BACKGROUND,
                          foreground=TEXT, relief=tk.SOLID, borderwidth=1, padx=8, pady=4)
@@ -275,6 +291,7 @@ class Tooltip:
         x = min(self._widget.winfo_rootx(), self._widget.winfo_screenwidth() - window.winfo_reqwidth() - 4)
         y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
         window.geometry(f"+{max(x, 0)}+{y}")
+        window.deiconify()
         self._window = window
 
     def hide(self, _event: object = None) -> None:
