@@ -68,6 +68,7 @@ class TrackStat:
     max_consecutive_misses: int
     mean_angle_error_m: Optional[float]
     ended: bool
+    segment: int = 0   # 처리부 실행 구간(녹화 중 처리부가 다시 시작하면 1 증가). 같은 트랙 ID가 구간마다 다시 나온다
 
     @property
     def lifetime_s(self) -> float:
@@ -255,7 +256,7 @@ def _track_stats(records: Sequence[BeamRecord], end_ms: int, interval_ms: int,
         has_confirmation = any(item.beam_type == BeamType.CONFIRMATION for item in items)
         result.append(TrackStat(track_id, items[0].time_ms, last, has_confirmation, bool(tracking),
                                 len(tracking), misses,
-                                longest, _mean(errors), ended))
+                                longest, _mean(errors), ended, segment))
     return result
 
 

@@ -98,8 +98,8 @@ class MonitorApp:
             "beam": BeamTab(self._notebook, parameters),
             "track": TrackTab(self._notebook, parameters),
             "comm": CommTab(self._notebook, server_text),
-            "analysis": AnalysisTab(self._notebook, self.choose_folder, self.choose_file, self.fetch_logs,
-                                    self.focus_event, self.select_run, self.focus_time, self.current_position,
+            "analysis": AnalysisTab(self._notebook, self.focus_event, self.select_run, self.focus_time,
+                                    self.current_position,
                                     lambda: self._live_problems.problems),
         }
         for key, tab in self._tabs.items():
