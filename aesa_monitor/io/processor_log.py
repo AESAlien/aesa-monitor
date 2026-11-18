@@ -6,8 +6,12 @@
 파일 이름의 시각은 처리부 시작 시각(로컬 시간)이다.
 
 메시지 로그의 시각은 벽시계(UTC)이고, 탐지 CSV와 모니터 녹화의 시각은 처리부 시각(시작 후 ms)이다.
-메시지 로그를 처리부 시각으로 바꾸려고 main 로거의 "Six worker threads started" 줄을 처리부 시각 0으로 본다.
-main은 이 줄을 쓴 직후 빔 시각의 기준점(started)을 잡으므로 차이는 수 ms 이내다(추정).
+메시지 로그를 처리부 시각으로 바꾸려고 main 로거의 워커 시작 줄을 처리부 시각 0으로 본다.
+    현재 처리부(main):  "[10/12] All 7 worker threads started"
+    이전 처리부:        "Six worker threads started; beam tick = 10 ms"
+틱 워커가 첫 실행에서 빔 시각의 기준점(_started)을 잡고, main은 워커를 모두 띄운 직후 이 줄을 쓰므로
+차이는 수 ms 이내다(추정). 이 줄이 없으면 "Application starting"(이전 처리부), 그것도 없으면 main 로거의
+첫 줄을 쓴다. 첫 줄은 설정 읽기 전이라 수십 ms 이상 이를 수 있다(추정).
 보드 시계가 맞지 않아도 같은 파일 안의 시각 차이만 쓰므로 영향이 없다.
 """
 
@@ -26,7 +30,11 @@ LINE_PATTERN = re.compile(
 )
 MESSAGE_LOG_NAME = re.compile(r"^adp_(?P<stamp>\d{8}_\d{6}_\d{3})(?:_\d+)?\.log$")
 DETECTION_LOG_NAME = re.compile(r"^adp_detection_(?P<stamp>\d{8}_\d{6}_\d{3})(?:_\d+)?\.csv$")
-ORIGIN_TEXTS = ("Six worker threads started", "Application starting")
+# 처리부 시각 0으로 볼 main 로거 줄. 앞의 것이 우선이다.
+ORIGIN_PATTERNS = (
+    re.compile(r"worker threads started"),     # "[10/12] All 7 worker threads started", "Six worker threads started; ..."
+    re.compile(r"^Application starting"),
+)
 # 메시지 로그와 탐지 CSV는 같은 실행에서 몇 ms 차이로 만들어진다.
 PAIR_TOLERANCE_SECONDS = 5.0
 
@@ -62,12 +70,14 @@ class LogEvent:
             return f"운용 {details.get('state', '?')}"
         if self.category == CATEGORY_ATTITUDE:
             action = details.get("action", "")
-            yaw = details.get("yaw", "?")
+            yaw = f" (yaw {details['yaw']})" if "yaw" in details else ""
             if action == "applied":
-                return f"자세 반영 (yaw {yaw})"
+                return f"자세 반영{yaw}"
             if "OFF" in action:
-                return f"자세 무시: 운용 OFF 중 수신 (yaw {yaw})"
-            return f"자세 무시: 이미 설정됨 (yaw {yaw})"
+                return f"자세 무시: 운용 OFF 중 수신{yaw}"
+            if "already" in action:
+                return f"자세 무시: 이미 설정됨{yaw}"
+            return f"자세 {action}{yaw}"
         if self.category == CATEGORY_REJECTED:
             return f"요청 빔 거부 #{details.get('requestId', '?')} ({details.get('status', '?')})"
         return f"[{self.logger}] {self.text}"
@@ -183,10 +193,13 @@ def _classify(logger: str, level: str, text: str) -> Tuple[str, Dict[str, str]]:
         match = re.match(r"Operation state changed: (\w+)", text)
         if match:
             return CATEGORY_OPERATION, {"state": match.group(1)}
-        match = re.match(r"Attitude (.+): roll=([^,]+), pitch=([^,]+), yaw=(.+)$", text)
+        # 현재 처리부는 "Attitude applied"만 쓰고, 이전 처리부는 "Attitude <동작>: roll=.., pitch=.., yaw=.."를 썼다.
+        match = re.match(r"Attitude ([^:]+?)(?:: roll=([^,]+), pitch=([^,]+), yaw=(.+))?$", text)
         if match:
-            return CATEGORY_ATTITUDE, {"action": match.group(1), "roll": match.group(2),
-                                       "pitch": match.group(3), "yaw": match.group(4)}
+            details = {"action": match.group(1)}
+            if match.group(4) is not None:
+                details.update(roll=match.group(2), pitch=match.group(3), yaw=match.group(4))
+            return CATEGORY_ATTITUDE, details
         match = re.match(r"Beam request rejected: status=(\w+), requestId=(\d+)", text)
         if match:
             return CATEGORY_REJECTED, {"status": match.group(1), "requestId": match.group(2)}
@@ -195,6 +208,16 @@ def _classify(logger: str, level: str, text: str) -> Tuple[str, Dict[str, str]]:
     if logger == "main":
         return CATEGORY_LIFECYCLE, {}
     return CATEGORY_OTHER, {}
+
+
+def find_origin(raw: List[Tuple[datetime.datetime, str, str, str]]) -> Optional[datetime.datetime]:
+    """처리부 시각 0에 해당하는 벽시계 시각. 모듈 설명의 순서로 찾고, main 로거 줄이 없으면 None이다."""
+    main_lines = [(wall, text) for wall, logger, _, text in raw if logger == "main"]
+    for pattern in ORIGIN_PATTERNS:
+        found = next((wall for wall, text in main_lines if pattern.search(text)), None)
+        if found is not None:
+            return found
+    return main_lines[0][0] if main_lines else None
 
 
 def read_message_log(path: Path) -> MessageLog:
@@ -213,12 +236,7 @@ def read_message_log(path: Path) -> MessageLog:
             wall = datetime.datetime.strptime(match.group("time"), "%Y-%m-%dT%H:%M:%S.%f")
             raw.append((wall, match.group("logger"), match.group("level").lower(), match.group("text")))
 
-    origin = None
-    for origin_text in ORIGIN_TEXTS:
-        origin = next((wall for wall, logger, _, text in raw
-                       if logger == "main" and text.startswith(origin_text)), None)
-        if origin is not None:
-            break
+    origin = find_origin(raw)
     events = []
     for wall, logger, level, text in raw:
         category, details = _classify(logger, level, text)

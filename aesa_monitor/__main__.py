@@ -1,7 +1,7 @@
 """모니터 실행 진입점.
 
-    python3 -m aesa_monitor --env ../aesa-processor/.env             실시간 모니터 (복사본 수신)
-    python3 -m aesa_monitor --env ../aesa-processor/.env --source capture   실시간 모니터 (통신 캡처)
+    python3 -m aesa_monitor --env ../aesa-processor/.env             실시간 모니터 (기본: 통신 캡처)
+    python3 -m aesa_monitor --env ../aesa-processor/.env --source copy   실시간 모니터 (복사본 수신, 이전 방식)
     python3 -m aesa_monitor --open capture.pcapng                     캡처 파일 열기(재생, 분석)
     python3 -m aesa_monitor --open ~/aesa-records/20261112_101500    녹화·로그 열기(재생, 분석)
     python3 -m aesa_monitor --stats ~/aesa-records/20261112_101500   화면 없이 통계 요약만 출력
@@ -30,7 +30,8 @@ def parse_arguments(arguments: Optional[List[str]] = None) -> argparse.Namespace
     parser.add_argument("--server", help="처리부 서버 주소 ADDRESS:PORT. .env 값을 덮어쓴다")
     parser.add_argument("--local", help="모니터가 바인딩할 주소 ADDRESS:PORT. .env 값을 덮어쓴다")
     parser.add_argument("--source", choices=DATA_SOURCES,
-                        help="데이터 출처: copy(처리부 복사본 수신) 또는 capture(통신 캡처). 기본값은 설정 파일")
+                        help="데이터 출처: capture(통신 캡처) 또는 copy(처리부 복사본 수신, 이전 방식). "
+                             "기본값은 설정 파일, 없으면 capture")
     parser.add_argument("--capture-command",
                         help="캡처 명령. 표준 출력으로 pcap을 내야 한다. {port}는 처리부 포트로 바뀐다")
     parser.add_argument("--settings", type=Path, default=DEFAULT_SETTINGS_PATH,
@@ -52,8 +53,8 @@ def parse_arguments(arguments: Optional[List[str]] = None) -> argparse.Namespace
 
 def resolve_config(arguments: argparse.Namespace) -> MonitorConfig:
     env_path: Optional[Path] = arguments.env
-    # 서버와 로컬 주소를 모두 지정하면 .env 파일이 없어도 실행할 수 있다.
-    if not env_path.is_file() and arguments.server and arguments.local:
+    # 서버 주소를 지정하면 .env 파일이 없어도 실행할 수 있다(복사본 수신은 --local도 필요).
+    if not env_path.is_file() and arguments.server:
         env_path = None
     return load_config(env_path, arguments.server, arguments.local)
 
@@ -156,8 +157,12 @@ def main(arguments: Optional[List[str]] = None) -> int:
     events: "queue.Queue[Event]" = queue.Queue()
     connection = None
     if config is not None and not offline:
-        connection = create_source(options.source or settings.data_source, config, events,
-                                   options.capture_command or settings.capture_command)
+        try:
+            connection = create_source(options.source or settings.data_source, config, events,
+                                       options.capture_command or settings.capture_command)
+        except ConfigError as error:
+            print(f"monitor: {error}", file=sys.stderr)
+            return 2
         connection.start()
     try:
         if options.headless:

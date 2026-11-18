@@ -3,14 +3,13 @@
 AESA 데이터 처리부(aesa-processor) 모니터·분석기. `aesa-processor/tools/monitor`(1단계 모니터)를 바탕으로
 화면을 다시 구성하고 녹화·재생, 처리부 로그 가져오기, 통계 분석을 더한 버전이다.
 
-- 실시간: 데이터 출처를 둘 중에서 고른다(`MONITOR_SOURCE` 또는 `--source`). 아래 "데이터 출처" 참고.
-  - 복사본 수신(copy, 기본): 처리부가 보내는 복사본(0xAB01, 0xBA01, 0xAC01, 0xAC02)과 상태(0xAD01)를 받는다.
-  - 통신 캡처(capture): 처리부·모의기·운용통제기 사이 TCP 패킷을 캡처해 같은 화면으로 보여준다.
-- 녹화·재생: 받은 프레임을 그대로 녹화하고, 같은 화면으로 다시 재생한다.
+- 실시간: 처리부·모의기·운용통제기 사이 TCP 패킷을 캡처(통신 캡처, 기본)해 메시지 흐름을 보여준다. 아래 "데이터 출처" 참고.
+- 녹화·재생: 캡처한 메시지를 그대로 녹화하고, 원하는 시점부터 같은 화면으로 다시 재생한다(사후 분석).
 - 분석: 녹화나 처리부 로그(adp_*.log, adp_detection_*.csv)로 통계 요약과 처리부 이벤트 타임라인을 만든다.
 
-모니터는 처리부에 아무것도 보내지 않는다. 복사본 수신은 처리부의 모니터 지원 코드(aesa-processor feature/126)가
-있어야 하고, 통신 캡처는 처리부 코드를 바꾸지 않아도 된다.
+모니터는 처리부에 아무것도 보내지 않고, 처리부 코드도 바꾸지 않는다. 데이터 출처는 통신 캡처로 정했다(2026-11 팀 결정).
+이전 방식인 복사본 수신(copy, 처리부가 모니터에 복사본을 보냄)은 처리부 main에 없는 코드(aesa-processor
+`feature/129-monitor-feed`)가 있어야 해서 비교·호환용으로만 남겨 두었다.
 
 관련 저장소: [aesa-processor](https://github.com/AESAlien/aesa-processor) (데이터 처리부). 작업 기록은 `docs/작업로그.md`.
 
@@ -27,14 +26,15 @@ cp monitor.env.example monitor.env    # 선택. 없으면 기본값
 
 # Linux
 sudo apt install python3-tk           # 화면(tkinter)
-sudo apt install tcpdump              # 통신 캡처를 쓸 때만
+sudo apt install tcpdump              # 통신 캡처 (이 PC에서 캡처할 때)
 sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)   # 일반 사용자로 캡처
+# 처리부 보드에서 캡처할 때는 보드에 tcpdump와 이 PC의 공개키가 있어야 한다(아래 "데이터 출처").
 ```
 
 ## 실행
 
 ```sh
-./run.sh --env ../aesa-processor/.env             # 실시간 모니터 (python3 -m aesa_monitor 와 같음)
+./run.sh --env ../aesa-processor/.env             # 실시간 모니터, 통신 캡처 (python3 -m aesa_monitor 와 같음)
 ./run.sh --env ../aesa-processor/.env --record    # 시작하자마자 녹화
 ./run.sh --open ~/aesa-records/20261112_101500     # 녹화·로그 열기 (처리부 접속도 함께 함)
 ./run.sh --open ~/aesa-records/20261112_101500 --offline
@@ -43,9 +43,9 @@ sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)   # 일반 사용자�
 
 | 옵션 | 설명 |
 | --- | --- |
-| `--env PATH` | 처리부와 같은 `.env`. 서버 주소(`COMM_SERVER_*`), 모니터 주소(`COMM_MONITOR_*`), 추적 설정(`TARGET_*`)을 읽는다 |
-| `--server`, `--local` | `ADDRESS:PORT`로 `.env` 값을 덮어쓴다. 둘 다 주면 `.env` 없이 실행된다 |
-| `--source copy\|capture` | 데이터 출처. 기본값은 `monitor.env`의 `MONITOR_SOURCE`(없으면 copy) |
+| `--env PATH` | 처리부와 같은 `.env`. 처리부 주소(`COMM_SERVER_*`), 운용통제기·모의기 주소, 추적 설정(`TARGET_*`)을 읽는다 |
+| `--server`, `--local` | `ADDRESS:PORT`로 `.env` 값을 덮어쓴다. `--server`를 주면 `.env` 없이 실행된다. `--local`(모니터 주소)은 copy에만 필요 |
+| `--source capture\|copy` | 데이터 출처. 기본값은 `monitor.env`의 `MONITOR_SOURCE`(없으면 capture) |
 | `--capture-command CMD` | 통신 캡처 명령. 기본값은 `MONITOR_CAPTURE_COMMAND` |
 | `--settings PATH` | 모니터 설정 파일. 기본값은 이 폴더의 `monitor.env` |
 | `--record` | 시작하자마자 녹화. `--headless`와 함께 쓰면 화면 없이 녹화만 한다 |
@@ -55,28 +55,46 @@ sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)   # 일반 사용자�
 | `--headless`, `--duration` | 화면 없이 1초마다 수신 요약 출력 |
 | `--font-size N`, `--tab NAME` | 글자 크기, 처음 탭(beam, track, comm, analysis) |
 
-처리부는 접속한 상대를 원격 주소와 포트로 구분한다. 그래서 모니터는 `COMM_MONITOR_ADDRESS:COMM_MONITOR_PORT`에
-바인딩한 뒤 접속한다. 노트북에 그 주소(예: 192.168.10.30)가 있어야 한다. 끊기면 1초마다 다시 접속한다.
-
 ## 데이터 출처
 
-| | 복사본 수신 (copy) | 통신 캡처 (capture) |
-| --- | --- | --- |
-| 받는 것 | 처리부가 모니터에 보내는 복사본 + 상태(0xAD01) | 세 장비가 실제로 주고받은 모든 메시지(0xCA01, 0xBA02, 0xAC03 포함) |
-| 처리부 코드 | 모니터 지원 코드 필요 | 바꾸지 않음 |
-| 처리부 시각·속도·연결 상태 | 0xAD01로 정확히 | 빔 시각, TCP 연결·종료, 운용 명령(0xCA01)으로 추정 |
-| 필요한 것 | 모니터 PC에 `COMM_MONITOR_ADDRESS` | 캡처 권한, 다른 장비 사이 패킷이 보이는 위치(아래) |
+기본은 **통신 캡처(capture)**다. 처리부 서버 포트(`COMM_SERVER_PORT`, 3200)를 지나는 양방향 TCP를 모두 잡는다.
 
-통신 캡처는 표준 출력으로 pcap을 내는 명령을 실행해 읽는다(`MONITOR_CAPTURE_COMMAND`, `--capture-command`).
+| 연결 | 방향 | 메시지 |
+| --- | --- | --- |
+| 처리부 ↔ 모의기 | 처리부 → 모의기 | 빔 명령(0xAB01) — 빔 탭·추적 탭 예측 빔의 근거 |
+| | 모의기 → 처리부 | 탐지 정보(0xBA01), 레이더 위치·자세(0xBA02) |
+| 처리부 ↔ 운용통제기 | 처리부 → 운용통제기 | 추적 정보(0xAC01), 레이더 위치·자세(0xAC02), 트랙 삭제(0xAC03) |
+| | 운용통제기 → 처리부 | 운용 명령(0xCA01) — 운용 ON/OFF 판단의 근거 |
+
+캡처는 표준 출력으로 pcap을 내는 명령을 실행해 읽는다(`MONITOR_CAPTURE_COMMAND`, `--capture-command`).
 `{port}`는 처리부 서버 포트로 바뀐다. 기본값은 이 PC에서 `tcpdump -i any --immediate-mode -U -s 0 -w - tcp port {port}`다.
 
+**어디서 캡처하나.** 일반(단순) 스위치는 다른 장비끼리 주고받는 패킷을 모니터 PC로 보내지 않는다. 그래서 두 연결이
+모두 지나가는 처리부 쪽에서 캡처한다.
+
 ```sh
-# 이 PC에서 캡처 (처리부·모의기·전시기 중 하나가 이 PC이거나, 포트 미러링을 이 PC로 받을 때)
-./run.sh --env ../aesa-processor/.env --source capture
-# 처리부 보드에서 캡처해 ssh로 받기 (보드에 tcpdump와 공개키 필요)
-./run.sh --env ../aesa-processor/.env --source capture \
+# 처리부를 이 PC에서 실행할 때 (가짜 처리부 시험 포함): 기본 명령 그대로
+./run.sh --env ../aesa-processor/.env
+# 처리부를 보드(192.168.10.20)에서 실행할 때: 보드에서 tcpdump를 실행하고 ssh로 받는다 (보드에 tcpdump와 공개키 필요)
+./run.sh --env ../aesa-processor/.env \
     --capture-command "ssh root@192.168.10.20 tcpdump -i eth0 --immediate-mode -U -s 0 -w - tcp port {port}"
 ```
+
+보드 캡처는 아직 실제 보드에서 확인하지 않았다(보드에 tcpdump가 있는지, `--immediate-mode`를 지원하는지 미확인).
+명령을 정하면 `monitor.env`의 `MONITOR_CAPTURE_COMMAND`에 넣어 두면 된다. 관리형 스위치의 포트 미러링을 쓸 수 있으면
+처리부 포트를 이 PC로 복사해 기본 명령(`-i <그 인터페이스>`)으로 받아도 된다.
+
+| | 통신 캡처 (capture, 기본) | 복사본 수신 (copy, 이전 방식) |
+| --- | --- | --- |
+| 받는 것 | 세 장비가 실제로 주고받은 모든 메시지(위 표) | 처리부가 모니터에 보내는 복사본 + 상태(0xAD01) |
+| 처리부 코드 | 바꾸지 않음 | `feature/129-monitor-feed`의 모니터 지원 코드 필요(main에 없음) |
+| 처리부 시각·연결·운용 상태 | 빔 시각, TCP 연결·종료, 운용 명령(0xCA01)으로 추정 | 0xAD01로 정확히 |
+| 필요한 것 | 캡처 권한, 두 연결이 보이는 위치(처리부 쪽) | `.env`의 `COMM_MONITOR_*`(또는 `--local`), 모니터 PC에 그 주소 |
+
+copy는 `--source copy`로 쓴다. 처리부는 접속한 상대를 원격 주소와 포트로 구분하므로 모니터가
+`COMM_MONITOR_ADDRESS:COMM_MONITOR_PORT`에 바인딩한 뒤 접속한다. 끊기면 1초마다 다시 접속한다.
+
+통신 캡처 참고:
 
 - `--immediate-mode`: libpcap이 패킷을 묶어서 넘기지 않게 한다. 빼면 캡처가 복사본보다 늦게(측정 40~120 ms,
   트래픽이 적으면 더 길 수 있음) 뭉쳐서 들어온다. 넣으면 복사본보다 20~30 ms 빠르다(복사본은 처리부 모니터 큐를
@@ -88,8 +106,9 @@ sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)   # 일반 사용자�
 - 연결의 상대(운용통제기, 모의기)는 `.env`의 `COMM_OPERATOR_CONSOLE_*`, `COMM_SCENARIO_SIMULATOR_*` 주소로 정하고,
   없으면 메시지 종류로 정한다. 모니터 복사본 연결(`COMM_MONITOR_*` 또는 0xAD01이 오가는 연결)은 같은 메시지가
   두 번 들어가지 않도록 뺀다. 그래서 복사본 수신 모니터와 캡처 모니터를 동시에 띄워도 된다.
-- 캡처를 연결 도중에 시작하면 다음 메시지 경계부터 받는다. 그 전에 한 번만 보낸 메시지(레이더 자세, 운용 명령)는
-  보이지 않을 수 있다.
+- 캡처를 연결 도중에 시작하면 다음 메시지 경계부터 받는다. 그 전에 한 번만 보낸 메시지(레이더 위치·자세 0xBA02·0xAC02,
+  운용 명령 0xCA01)는 보이지 않는다. 그러면 운용 상태가 '?'이고 추적 영역이 그려지지 않는다.
+  **모니터(캡처)를 모의기·운용통제기 접속보다 먼저 켠다.**
 - 캡처 녹화도 같은 `monitor.aesarec` 형식이다. 상대 연결 변화는 레코드 종류 4로 남는다.
 - Wireshark·tcpdump로 저장한 `*.pcap`, `*.pcapng`도 `--open`이나 `메뉴 → 파일 열기`로 재생·분석할 수 있다.
 
@@ -221,7 +240,7 @@ python3 -m aesa_monitor.io.log_fetch --source ssh --target root@192.168.10.20 --
 
 | 키 | 기본값 | 설명 |
 | --- | --- | --- |
-| `MONITOR_SOURCE` | copy | 데이터 출처: copy(복사본 수신) 또는 capture(통신 캡처) |
+| `MONITOR_SOURCE` | capture | 데이터 출처: capture(통신 캡처) 또는 copy(복사본 수신, 이전 방식) |
 | `MONITOR_CAPTURE_COMMAND` | `tcpdump -i any --immediate-mode -U -s 0 -w - tcp port {port}` | capture: 표준 출력으로 pcap을 내는 명령 |
 | `MONITOR_RECORD_DIR` | `~/aesa-records` | 세션 폴더를 만들 곳 |
 | `MONITOR_FONT_SIZE` | 12 | 본문 글자 크기(8~32) |

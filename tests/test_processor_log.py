@@ -67,6 +67,47 @@ class MessageLogTest(unittest.TestCase):
         self.assertEqual(counts[CATEGORY_PROBLEM], 1)
 
 
+# 현재 처리부(aesa-processor main) 형식: main 로거가 단계 번호를 붙이고, 자세 로그에 값이 없다.
+CURRENT_MESSAGE_LOG = """\
+2026-11-18T01:00:00.000Z [main] [info] [thread=100] [1/12] Logging managers initialized
+2026-11-18T01:00:00.020Z [main] [info] [thread=100] [9/12] Communication server opened
+2026-11-18T01:00:00.050Z [main] [info] [thread=100] [10/12] All 7 worker threads started
+2026-11-18T01:00:00.051Z [main] [info] [thread=100] [11/12] Application is running; waiting for shutdown signal
+2026-11-18T01:00:01.050Z [BeamEvent] [info] [thread=101] Operation state changed: ON
+2026-11-18T01:00:01.100Z [BeamEvent] [info] [thread=101] Attitude applied
+2026-11-18T01:00:05.050Z [BeamEvent] [warning] [thread=101] Beam request rejected: status=OUT_OF_COVERAGE, requestId=3
+"""
+
+
+class CurrentProcessorMessageLogTest(unittest.TestCase):
+    def write(self, text):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "adp_20261118_100000_000.log"
+        path.write_text(text, encoding="utf-8")
+        return read_message_log(path)
+
+    def test_processor_time_starts_at_numbered_worker_start_line(self):
+        log = self.write(CURRENT_MESSAGE_LOG)
+        by_text = {event.text: event for event in log.events}
+        self.assertAlmostEqual(by_text["[10/12] All 7 worker threads started"].processor_ms, 0.0)
+        self.assertAlmostEqual(by_text["Operation state changed: ON"].processor_ms, 1000.0)
+        rejected = [event for event in log.events if event.category == CATEGORY_REJECTED][0]
+        self.assertAlmostEqual(rejected.processor_ms, 5000.0)
+
+    def test_attitude_without_values(self):
+        log = self.write(CURRENT_MESSAGE_LOG)
+        attitudes = [event for event in log.events if event.category == CATEGORY_ATTITUDE]
+        self.assertEqual([event.summary for event in attitudes], ["자세 반영"])
+        self.assertEqual(attitudes[0].details, {"action": "applied"})
+
+    def test_falls_back_to_first_main_line_without_worker_start_line(self):
+        text = "\n".join(line for line in CURRENT_MESSAGE_LOG.splitlines() if "worker threads" not in line) + "\n"
+        log = self.write(text)
+        self.assertEqual(log.origin_utc.isoformat(), "2026-11-18T01:00:00")
+        self.assertTrue(all(event.processor_ms is not None for event in log.events))
+
+
 class DetectionLogTest(unittest.TestCase):
     def test_groups_rows_by_beam(self):
         with tempfile.TemporaryDirectory() as directory:

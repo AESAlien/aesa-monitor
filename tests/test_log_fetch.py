@@ -71,14 +71,15 @@ class SettingsTest(unittest.TestCase):
     def test_defaults_when_file_is_missing(self):
         settings = load_settings(Path("/nonexistent/monitor.env"))
         self.assertEqual(settings, MonitorSettings())
+        self.assertEqual(settings.data_source, "capture")   # 팀 결정: 통신 캡처가 기본
 
     def test_reads_data_source_and_rejects_unknown_value(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "monitor.env"
-            path.write_text('MONITOR_SOURCE=capture\nMONITOR_CAPTURE_COMMAND="ssh b tcpdump -w - port {port}"\n',
+            path.write_text('MONITOR_SOURCE=copy\nMONITOR_CAPTURE_COMMAND="ssh b tcpdump -w - port {port}"\n',
                             encoding="utf-8")
             settings = load_settings(path)
-            self.assertEqual(settings.data_source, "capture")
+            self.assertEqual(settings.data_source, "copy")
             self.assertEqual(settings.capture_command, "ssh b tcpdump -w - port {port}")
             path.write_text("MONITOR_SOURCE=both\n", encoding="utf-8")
             with self.assertRaises(ConfigError):

@@ -47,6 +47,26 @@ class ConfigTest(EnvFileTestCase):
         self.assertEqual(config.server, ("127.0.0.1", 1))
         self.assertEqual(config.local, ("127.0.0.2", 2))
 
+    def test_monitor_endpoint_is_optional_for_capture(self):
+        # 처리부 main의 .env에는 COMM_MONITOR_*가 없다. 통신 캡처는 이것 없이 실행된다.
+        path = self.write_env("COMM_SERVER_ADDRESS=192.168.10.20\nCOMM_SERVER_PORT=3200\n")
+
+        config = load_config(path)
+
+        self.assertEqual(config.server, ("192.168.10.20", 3200))
+        self.assertIsNone(config.local)
+
+    def test_copy_source_requires_monitor_endpoint(self):
+        import queue
+
+        from aesa_monitor.io.capture import CaptureSource
+        from aesa_monitor.io.connection import create_source
+
+        config = load_config(self.write_env("COMM_SERVER_ADDRESS=127.0.0.1\nCOMM_SERVER_PORT=43200\n"))
+        with self.assertRaises(ConfigError):
+            create_source("copy", config, queue.Queue())
+        self.assertIsInstance(create_source("capture", config, queue.Queue()), CaptureSource)
+
     def test_rejects_missing_or_invalid_values(self):
         with self.assertRaises(ConfigError):
             load_config(self.write_env("COMM_SERVER_ADDRESS=127.0.0.1\n"))
