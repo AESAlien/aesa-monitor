@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 import tkinter as tk
 from tkinter import ttk
 from typing import Optional, Tuple
@@ -43,7 +44,8 @@ HELP_SWEEP = (
 HELP_SHARE = "최근 5초 동안 나간 빔 중 탐색·확인·추적이 차지한 비율입니다. 추적 트랙이 늘면 탐색 비율이 줄어듭니다."
 HELP_CONFIRM = (
     "탐색 빔에서 표적을 찾은 뒤 같은 방향으로 확인 빔이 나가기까지 걸린 시간입니다.\n\n"
-    "확인 빔 방향과 0.5° 안에 있는 직전 탐색 탐지를 찾아 계산합니다(모니터 추정).\n"
+    "확인 빔과 방향이 같은(0.01° 안) 직전 탐색 탐지를 찾아 계산합니다. 처리부는 탐색 플롯 방향 그대로 확인 빔을 "
+    "조향하므로, 겹친 이웃 칸에서 같은 표적을 찾은 다른 탐지와 짝짓지 않습니다.\n"
     "기준은 .env의 TARGET_CONFIRMATION_DELAY_MS입니다. 20 ms 넘게 다르면 주의, 100 ms 넘게 다르면 이상입니다."
 )
 HELP_PERIOD = (
@@ -53,6 +55,7 @@ HELP_PERIOD = (
 HELP_GAPS = (
     "처리부는 10 ms마다 빔을 하나씩 보냅니다. 최근 5초 동안 빔이 오지 않은 10 ms 칸 수입니다.\n\n"
     "처리부가 늦었거나, 처리부의 모니터 큐(1000개)가 넘쳐 복사본이 버려진 경우입니다.\n"
+    "운용 OFF 동안 빔이 없던 시간은 세지 않습니다(OFF→ON 뒤 처리부가 빔을 처음부터 다시 보냄).\n"
     "1~5칸은 주의, 6칸 이상은 이상입니다."
 )
 HELP_FRAMES = (
@@ -73,6 +76,8 @@ HELP_FRAMES = (
     "모니터를 켠 뒤 처음 잘린 프레임과 처리부 재시작으로 끊긴 프레임은 그리지 않습니다. 최근 80프레임을 그립니다."
 )
 FRAME_CHART_FRAMES = 80
+# 진행 중 프레임 위치(▼)만 바뀔 때 프레임 그래프를 다시 그리는 간격
+FRAME_CHART_INTERVAL_S = 0.5
 SCHEDULE_ROWS = 4
 HELP_MAP = (
     "처리부가 보낸 빔의 방위·고각(ENU, 북쪽 0°, 시계방향)입니다.\n\n"
@@ -154,6 +159,14 @@ class BeamTab:
         self._frames = tk.Canvas(right, background=BACKGROUND, highlightthickness=0, height=170)
         self._frames.pack(fill=tk.BOTH, expand=True)
 
+        # 다시 그릴 필요가 있는지 판단하는 값(바뀌지 않으면 그리지 않는다)
+        self._plane_static_key: Optional[tuple] = None
+        self._plane_reserved: list = []
+        self._timeline_static_key: Optional[tuple] = None
+        self._timeline_title_text = ""
+        self._frames_key: Optional[tuple] = None
+        self._frames_drawn_at = 0.0
+
     # 갱신
 
     def refresh(self, state: MonitorState) -> None:
@@ -166,13 +179,21 @@ class BeamTab:
         self._draw_timeline(state, mode)
 
     def _draw_frames(self, state: MonitorState) -> None:
+        self._fit_schedule_rows()
         frames = state.frames.complete_frames()
         interval = self._parameters.tracking_interval_ms
         tracks = len(state.tracks)
+        # 프레임은 약 2초마다 닫히므로 그래프는 프레임이 닫혔거나 크기·트랙 수가 바뀌었을 때 그린다.
+        # 진행 중 프레임 위치(▼)만 바뀌는 동안은 FRAME_CHART_INTERVAL_S마다 그린다.
+        key = (frames[-1].index if frames else None, len(frames), tracks, len(state.search_cells),
+               self._frames.winfo_width(), self._frames.winfo_height(), text_height())
+        now = time.monotonic()
+        if key == self._frames_key and now - self._frames_drawn_at < FRAME_CHART_INTERVAL_S:
+            return
+        self._frames_key, self._frames_drawn_at = key, now
         expected = expected_tracking_beams(tracks, frames[-1].duration_ms, interval) if frames else None
         text = "" if expected is None else (
             f"기대 = 트랙 {tracks} × {frames[-1].duration_ms / 1000:.2f} s ÷ {interval / 1000:g} s")
-        self._fit_schedule_rows()
         frame_request_chart(self._frames, frames, len(state.search_cells), expected, text, FRAME_CHART_FRAMES,
                             current=state.frames.current())
 
@@ -252,8 +273,11 @@ class BeamTab:
                 COVERAGE_ELEVATION[0], COVERAGE_ELEVATION[1])
 
     def _draw_plane(self, state: MonitorState, mode: str) -> None:
+        """빔 방향 지도. 바뀌지 않는 바탕(축, 추적 영역, 탐색 격자 원)은 크기·격자·자세가 바뀔 때만 다시 그리고,
+        갱신마다 잔상·요청 빔·트랙(태그 'dyn')만 지우고 그린다. 예전처럼 매번 전부(원 380여 개) 다시 그리면
+        Windows에서 한 번 그리는 데 수백 ms가 걸려 화면이 끊겼다.
+        """
         canvas = self._plane
-        canvas.delete("all")
         width, height = canvas_size(canvas, 200, 160)
         coverage = self._coverage(state)
         left, right, bottom, top = self._bounds(state, coverage)
@@ -278,58 +302,47 @@ class BeamTab:
         degree_x = degree_y = scale
         placer = LabelPlacer(canvas, (margin_left, margin_top, width - margin_right, height - margin_bottom))
 
-        canvas.create_rectangle(margin_left, margin_top, width - margin_right, height - margin_bottom,
-                                outline=GRID_LINE)
-        for tick in nice_ticks(left, right, max(3, int(plot_width / 90))):
-            x = to_x(tick)
-            label = f"{tick % 360:.0f}°"
-            canvas.create_line(x, height - margin_bottom, x, height - margin_bottom + 4, fill=GRID_LINE)
-            if x + text_width(label) / 2 <= width and x - text_width(label) / 2 >= 0:  # 캔버스 끝에서 잘리는 눈금은 뺀다
-                canvas.create_text(x, height - margin_bottom + 5, text=label, anchor="n", fill=MUTED, font=FONT_SMALL)
-        for tick in nice_ticks(bottom, top, max(3, int(plot_height / 50))):
-            y = to_y(tick)
-            canvas.create_line(margin_left - 4, y, margin_left, y, fill=GRID_LINE)
-            canvas.create_text(margin_left - 6, y, text=f"{tick:.0f}°", anchor="e", fill=MUTED, font=FONT_SMALL)
-
-        if coverage is not None:
-            canvas.create_rectangle(to_x(coverage[0]), to_y(coverage[3]), to_x(coverage[1]), to_y(coverage[2]),
-                                    outline=MUTED, dash=(6, 4), width=2)
-            item = canvas.create_text(to_x(coverage[1]) - 4, to_y(coverage[3]) + 4, text="추적 영역",
-                                      anchor="ne", fill=MUTED, font=FONT_SMALL)
-            box = canvas.bbox(item)
-            if box:
-                placer.reserve(box)
+        cells = state.search_cells
+        static_key = (width, height, line, round(left, 4), round(right, 4), round(bottom, 4), round(top, 4),
+                      None if coverage is None else tuple(round(value, 4) for value in coverage),
+                      tuple((beam_id, round(cell.azimuth_deg, 4), round(cell.elevation_deg, 4), cell.width_deg)
+                            for beam_id, cell in sorted(cells.items())))
+        if static_key != self._plane_static_key:
+            self._plane_static_key = static_key
+            self._plane_reserved = self._draw_plane_static(canvas, state, coverage, cells, to_x, to_y, scale, width,
+                                                           height, margin_left, margin_right, margin_top,
+                                                           margin_bottom, left, right, bottom, top, plot_width,
+                                                           plot_height)
+        else:
+            canvas.delete("dyn")
+        for box in self._plane_reserved:
+            placer.reserve(box)
 
         now = state.now_ms()
         if now is None:
             canvas.create_text(width / 2, height / 2, text="빔을 기다리는 중", fill=MUTED, font=FONT_SMALL)
+            self._mark_dynamic(canvas)
             return
         search_afterglow = SEARCH_AFTERGLOW_MS[mode]
-        latest_search = next((beam for beam in reversed(state.beams) if beam.beam_type == BeamType.SEARCH), None)
-        # 탐색 빔은 실제 빔 범위(지름 = 빔 폭)의 원으로 그린다. 모의기는 방위·고각 차이를 빔 폭으로 나눈
-        # 타원식으로 빔 안을 판정하므로, 같은 축척의 방위-고각 평면에서는 이 원 안이 탐지 범위다.
-        # 빔 폭(6°)이 격자 간격(4.2°, 4.4°)보다 넓어 원이 서로 겹친다.
+        # 표시 시각(now)보다 늦게 받은 빔은 아직 그리지 않는다(실시간 화면을 고르게 흘리려고 표시 시각을 조금 늦춤).
+        latest_search = next((beam for beam in reversed(state.beams)
+                              if beam.beam_type == BeamType.SEARCH and beam.timestamp_ms <= now), None)
         search_color = BEAM_COLORS[BeamType.SEARCH]
-        cells = sorted(state.search_cells.items(), key=lambda item: item[1].last_ms)
-        for _, cell in cells:
-            radius = cell.width_deg / 2 * scale
-            x, y = to_x(cell.azimuth_deg), to_y(cell.elevation_deg)
-            canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
-                               outline=blend(search_color, 0.22, BACKGROUND), width=1)
-            canvas.create_oval(x - 1.5, y - 1.5, x + 1.5, y + 1.5, fill=blend(search_color, 0.45, BACKGROUND),
-                               outline="")
         # 잔상: 오래된 빔부터 그려 최근 빔이 위에 오게 한다.
-        for beam_id, cell in cells:
-            ratio = 1.0 - (now - cell.last_ms) / search_afterglow
-            if ratio <= 0:
-                continue
+        visits = []
+        for cell in cells.values():
+            shown = cell.last_ms if cell.last_ms <= now else cell.previous_ms
+            if shown is not None and 0 <= now - shown < search_afterglow:
+                visits.append((shown, cell))
+        for shown, cell in sorted(visits, key=lambda item: item[0]):
+            ratio = 1.0 - (now - shown) / search_afterglow
             radius = cell.width_deg / 2 * scale
             x, y = to_x(cell.azimuth_deg), to_y(cell.elevation_deg)
             canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
                                fill=blend(search_color, 0.15 + ratio * 0.6, BACKGROUND),
                                outline=blend(search_color, 0.4 + ratio * 0.6, BACKGROUND), width=1)
-        if latest_search is not None and latest_search.beam_id in state.search_cells:
-            cell = state.search_cells[latest_search.beam_id]
+        if latest_search is not None and latest_search.beam_id in cells:
+            cell = cells[latest_search.beam_id]
             radius = cell.width_deg / 2 * scale
             x, y = to_x(cell.azimuth_deg), to_y(cell.elevation_deg)
             canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline=TEXT, width=2)
@@ -367,6 +380,57 @@ class BeamTab:
             for step in (0, 6, 14):
                 if placer.place(x, y, f"#{track.track_id}", gap=gap + step, color=TEXT) is not None:
                     break
+        self._mark_dynamic(canvas)
+
+    @staticmethod
+    def _mark_dynamic(canvas: tk.Canvas) -> None:
+        """방금 그린 것(바탕 'static'이 아닌 것)에 'dyn' 태그를 붙여 다음 갱신 때 한 번에 지운다."""
+        canvas.addtag_all("dyn")
+        canvas.dtag("static", "dyn")
+
+    def _draw_plane_static(self, canvas, state, coverage, cells, to_x, to_y, scale, width, height,
+                           margin_left, margin_right, margin_top, margin_bottom, left, right, bottom, top,
+                           plot_width, plot_height) -> list:
+        """빔 방향 지도의 바탕. 다른 항목과 겹치지 않게 비워 둘 글자 영역 목록을 돌려준다."""
+        canvas.delete("all")
+        tag = ("static",)
+        reserved = []
+        canvas.create_rectangle(margin_left, margin_top, width - margin_right, height - margin_bottom,
+                                outline=GRID_LINE, tags=tag)
+        for tick in nice_ticks(left, right, max(3, int(plot_width / 90))):
+            x = to_x(tick)
+            label = f"{tick % 360:.0f}°"
+            canvas.create_line(x, height - margin_bottom, x, height - margin_bottom + 4, fill=GRID_LINE, tags=tag)
+            if x + text_width(label) / 2 <= width and x - text_width(label) / 2 >= 0:  # 캔버스 끝에서 잘리는 눈금은 뺀다
+                canvas.create_text(x, height - margin_bottom + 5, text=label, anchor="n", fill=MUTED, font=FONT_SMALL,
+                                   tags=tag)
+        for tick in nice_ticks(bottom, top, max(3, int(plot_height / 50))):
+            y = to_y(tick)
+            canvas.create_line(margin_left - 4, y, margin_left, y, fill=GRID_LINE, tags=tag)
+            canvas.create_text(margin_left - 6, y, text=f"{tick:.0f}°", anchor="e", fill=MUTED, font=FONT_SMALL,
+                               tags=tag)
+
+        if coverage is not None:
+            canvas.create_rectangle(to_x(coverage[0]), to_y(coverage[3]), to_x(coverage[1]), to_y(coverage[2]),
+                                    outline=MUTED, dash=(6, 4), width=2, tags=tag)
+            item = canvas.create_text(to_x(coverage[1]) - 4, to_y(coverage[3]) + 4, text="추적 영역",
+                                      anchor="ne", fill=MUTED, font=FONT_SMALL, tags=tag)
+            box = canvas.bbox(item)
+            if box:
+                reserved.append(box)
+
+        # 탐색 빔은 실제 빔 범위(지름 = 빔 폭)의 원으로 그린다. 모의기는 방위·고각 차이를 빔 폭으로 나눈
+        # 타원식으로 빔 안을 판정하므로, 같은 축척의 방위-고각 평면에서는 이 원 안이 탐지 범위다.
+        # 빔 폭(6°)이 격자 간격(4.2°, 4.4°)보다 넓어 원이 서로 겹친다.
+        search_color = BEAM_COLORS[BeamType.SEARCH]
+        outline = blend(search_color, 0.22, BACKGROUND)
+        center = blend(search_color, 0.45, BACKGROUND)
+        for _, cell in sorted(cells.items()):
+            radius = cell.width_deg / 2 * scale
+            x, y = to_x(cell.azimuth_deg), to_y(cell.elevation_deg)
+            canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline=outline, width=1, tags=tag)
+            canvas.create_oval(x - 1.5, y - 1.5, x + 1.5, y + 1.5, fill=center, outline="", tags=tag)
+        return reserved
 
     def _draw_schedule(self, state: MonitorState) -> None:
         interval = self._parameters.tracking_interval_ms
@@ -388,10 +452,15 @@ class BeamTab:
         self._schedule.set_rows(rows)
 
     def _draw_timeline(self, state: MonitorState, mode: str) -> None:
+        """빔 타임라인. 바탕(줄·눈금)은 크기가 바뀔 때만 그리고, 빔 막대는 10 ms 간격으로 이어진 같은 종류끼리
+        한 막대로 합쳐 그린다(3초 창에 막대 300개를 매번 그리던 것을 수십 개로 줄임).
+        """
         window = TIMELINE_WINDOW_MS[mode]
-        self._timeline_title.configure(text=f"빔 타임라인 — 최근 {window / 1000:g}초, 오른쪽 끝이 지금")
+        title = f"빔 타임라인 — 최근 {window / 1000:g}초, 오른쪽 끝이 지금"
+        if title != self._timeline_title_text:
+            self._timeline_title_text = title
+            self._timeline_title.configure(text=title)
         canvas = self._timeline
-        canvas.delete("all")
         line = text_height()
         ticks = line + 8  # 시간 눈금 자리(글자 높이 기준)
         lane = line + 4
@@ -403,18 +472,25 @@ class BeamTab:
         plot_width = width - label_width - 8
         lane_height = (height - ticks) / 3
         lanes = {BeamType.SEARCH: 0, BeamType.CONFIRMATION: 1, BeamType.TRACKING: 2}
-        for beam_type, index in lanes.items():
-            top = index * lane_height
-            canvas.create_rectangle(label_width, top + 1, label_width + plot_width, top + lane_height - 1,
-                                    fill=PANEL, outline="")
-            canvas.create_text(label_width - 8, top + lane_height / 2, text=BEAM_NAMES[beam_type], fill=MUTED,
-                               anchor="e", font=FONT_SMALL)
-        for tick in nice_ticks(-window, 0, 6):
-            x = label_width + plot_width + tick / window * plot_width
-            canvas.create_line(x, height - ticks + 2, x, height - ticks + 6, fill=GRID_LINE)
-            canvas.create_text(x, height - ticks + 6, text="지금" if tick == 0 else f"{tick / 1000:g}s",
-                               anchor="ne" if tick == 0 else ("nw" if tick == -window else "n"),
-                               fill=MUTED, font=FONT_SMALL)
+        static_key = (width, height, line, window)
+        if static_key != self._timeline_static_key:
+            self._timeline_static_key = static_key
+            canvas.delete("all")
+            tag = ("static",)
+            for beam_type, index in lanes.items():
+                top = index * lane_height
+                canvas.create_rectangle(label_width, top + 1, label_width + plot_width, top + lane_height - 1,
+                                        fill=PANEL, outline="", tags=tag)
+                canvas.create_text(label_width - 8, top + lane_height / 2, text=BEAM_NAMES[beam_type], fill=MUTED,
+                                   anchor="e", font=FONT_SMALL, tags=tag)
+            for tick in nice_ticks(-window, 0, 6):
+                x = label_width + plot_width + tick / window * plot_width
+                canvas.create_line(x, height - ticks + 2, x, height - ticks + 6, fill=GRID_LINE, tags=tag)
+                canvas.create_text(x, height - ticks + 6, text="지금" if tick == 0 else f"{tick / 1000:g}s",
+                                   anchor="ne" if tick == 0 else ("nw" if tick == -window else "n"),
+                                   fill=MUTED, font=FONT_SMALL, tags=tag)
+        else:
+            canvas.delete("dyn")
         now = state.now_ms()
         if now is None:
             return
@@ -422,23 +498,38 @@ class BeamTab:
         bar_width = max(slot_width * 0.8, 1.0)
         placer = LabelPlacer(canvas, (label_width, 0, width, height - ticks))  # 오른쪽 끝에서 캔버스 밖으로 나가지 않게
         labels = []
+        runs = []  # (줄, 첫 빔 시각, 마지막 빔 시각, 빔 종류)
+        current = {}  # 줄 → 진행 중인 막대 [첫 시각, 마지막 시각, 종류]
         for beam in state.recent_beams(window):
             index = lanes.get(BeamType(beam.beam_type)) if beam.beam_type in (1, 2, 3) else None
             if index is None:
                 continue
-            top = index * lane_height
-            x = label_width + plot_width - (now - beam.timestamp_ms) / window * plot_width
-            canvas.create_rectangle(x - bar_width, top + 4, x, top + lane_height - 4,
-                                    fill=beam_color(beam.beam_type), outline="")
+            run = current.get(index)
+            if run is not None and beam.timestamp_ms - run[1] <= BEAM_SLOT_MS:
+                run[1] = beam.timestamp_ms
+            else:
+                if run is not None:
+                    runs.append((index, run[0], run[1], run[2]))
+                current[index] = [beam.timestamp_ms, beam.timestamp_ms, beam.beam_type]
             if beam.beam_type != BeamType.SEARCH:
+                top = index * lane_height
+                x = label_width + plot_width - (now - beam.timestamp_ms) / window * plot_width
                 placer.reserve((x - bar_width - 1, top + 4, x + 1, top + lane_height - 4))
                 labels.append((x, top + lane_height / 2, f"#{beam.beam_id}"))
+        runs.extend((index, run[0], run[1], run[2]) for index, run in current.items())
+        for index, first_ms, last_ms, beam_type in runs:
+            top = index * lane_height
+            x_first = label_width + plot_width - (now - first_ms) / window * plot_width
+            x_last = label_width + plot_width - (now - last_ms) / window * plot_width
+            canvas.create_rectangle(x_first - bar_width, top + 4, x_last, top + lane_height - 4,
+                                    fill=beam_color(beam_type), outline="")
         # 막대를 모두 그린 뒤 막대와 겹치지 않는 자리에 ID를 쓴다.
         for x, y, text in labels:
             placer.place(x, y, text, gap=4, color=TEXT)
 
-        missed = [time_ms for time_ms, _ in state.beam_gaps if time_ms >= now - window]
+        missed = [time_ms for time_ms, _ in state.beam_gaps if now - window <= time_ms <= now]
         for time_ms in missed:
             x = label_width + plot_width - (now - time_ms) / window * plot_width
             canvas.create_line(x, 0, x, height - ticks, fill=LEVEL_COLORS["bad"], dash=(2, 2))
+        self._mark_dynamic(canvas)
 

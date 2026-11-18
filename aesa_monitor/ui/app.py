@@ -19,6 +19,7 @@ from aesa_monitor.core.events import PEER_CONSOLE, PEER_SIMULATOR, SOURCE_CAPTUR
 from aesa_monitor.core.problems import LINK_EVENTS, ProblemDetector, level_counts
 from aesa_monitor.core.settings import MonitorSettings, save_settings
 from aesa_monitor.core.state import MonitorState
+from aesa_monitor.core.view_clock import ViewClock
 from aesa_monitor.io.processor_log import CATEGORY_REJECTED, LogEvent
 from aesa_monitor.io.recording import (
     PROCESSOR_LOG_DIRECTORY, RECORDING_NAME, Recorder, new_session_directory,
@@ -69,6 +70,8 @@ class MonitorApp:
         self._settings_path = settings_path
         self._connection = connection
         self._live = MonitorState()
+        # 캡처가 메시지를 몰아서 넘겨도 실시간 화면이 고르게 움직이도록 표시 시각을 따로 흘린다.
+        self._view_clock = ViewClock()
         self._session: Optional[Session] = None
         self._replaying = False
         self._recorder: Optional[Recorder] = None
@@ -610,6 +613,7 @@ class MonitorApp:
         elapsed = now - self._last_frame
         self._last_frame = now
         self._drain_events()
+        self._live.view_limit_ms = self._view_clock.update(self._live.latest_ms(), now, self._live.time_scale())
         if self._replaying and self._session is not None and self._session.player is not None:
             self._session.player.advance(elapsed)
         if self._connection is not None and now - self._last_problem_update >= PROBLEM_UPDATE_SECONDS:

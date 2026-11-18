@@ -2,7 +2,7 @@ import unittest
 
 from aesa_monitor.core.config import TrackingParameters
 from aesa_monitor.core.events import ConnectionChanged
-from aesa_monitor.core.protocol import Beam, BeamType, Detection, Plot, Track, TrackList
+from aesa_monitor.core.protocol import Beam, BeamType, Detection, OperatorControl, Plot, Track, TrackList
 from aesa_monitor.core.stats import BeamRecord, compute_stats, records_from_events
 from aesa_monitor.core.verdict import BAD, OK, WARN
 
@@ -35,7 +35,7 @@ class RecordsFromEventsTest(unittest.TestCase):
             ConnectionChanged(False, "end"),
         ]
         records, extra = records_from_events((index * 0.01, event) for index, event in enumerate(events))
-        self.assertEqual(extra, {"disconnects": 1, "restarts": 1})
+        self.assertEqual(extra, {"disconnects": 1, "restarts": 1, "operation_restarts": 0})
         self.assertEqual([record.segment for record in records], [0, 0, 0, 0, 1])
         self.assertEqual(records[0].plots, [(50.0, 20.0, 1.5, -250.0)])
         self.assertEqual([record.outcome for record in records[2:4]], ["missed", "updated"])
@@ -110,3 +110,33 @@ class ComputeStatsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OperationRestartStatsTest(unittest.TestCase):
+    def test_off_time_is_excluded_from_intervals_and_sweeps(self):
+        events = [ConnectionChanged(True)]
+        count = 0
+        for start in (0, 30000):  # 30 s 동안 운용 OFF
+            if start:
+                events += [OperatorControl(0), OperatorControl(1)]
+                count = 0
+            for index in range(12):
+                count += 1
+                events.append(Beam(BeamType.SEARCH, start + index * 10, index % 4, count, float(index % 4), 1.5, 6, 6))
+        records, extra = records_from_events((index * 0.01, event) for index, event in enumerate(events))
+        self.assertEqual(extra["operation_restarts"], 1)
+        self.assertEqual(sorted({record.run for record in records}), [0, 1])
+        report = compute_stats(records, PARAMETERS, "test", extra)
+        self.assertEqual(item(report, "연속 빔 간격").level, OK)
+        self.assertEqual(max(item(report, "연속 빔 간격").samples), 10.0)
+        self.assertEqual(max(item(report, "탐색 프레임 시간").samples), 40.0)
+        self.assertEqual(item(report, "운용 OFF→ON").value, "1회")
+
+    def test_confirmation_delay_uses_exact_direction(self):
+        records = [
+            BeamRecord(280, BeamType.SEARCH, 2, 20.4, 3.3, [(50.0, 20.4, 3.3, -100.0)]),
+            BeamRecord(500, BeamType.SEARCH, 3, 20.2, 3.1, [(50.0, 20.2, 3.1, -100.0)]),
+            BeamRecord(600, BeamType.CONFIRMATION, 7, 20.2, 3.1, [(50.0, 20.2, 3.1, -100.0)]),
+        ]
+        report = compute_stats(records, PARAMETERS, "test")
+        self.assertEqual(item(report, "탐색→확인 지연").samples, [100.0])

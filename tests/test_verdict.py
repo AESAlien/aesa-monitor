@@ -75,6 +75,16 @@ class VerdictTest(unittest.TestCase):
         self.state.apply(Beam(BeamType.CONFIRMATION, 650, 7, 0, 20.2, 3.1, 3, 3))
         self.assertEqual(self.state.latest_confirmation_delay(), 150)
 
+    def test_confirmation_delay_ignores_nearby_but_different_detection(self):
+        # 같은 표적을 이전 줄의 겹친 칸에서 찾은 탐지(방향이 조금 다름)는 확인 빔의 근거가 아니다.
+        # 확인 빔은 탐색 플롯 방향 그대로 조향되므로 방향이 같은 탐지로만 잰다(0.5°로 짝지으면 320 ms로 잡혔다).
+        self.state.apply(search(280, 2))
+        self.state.apply(Detection(BeamType.SEARCH, 280, 2, [Plot(50.0, 20.4, 3.3, -100, 80)]))
+        self.state.apply(search(500, 3))
+        self.state.apply(Detection(BeamType.SEARCH, 500, 3, [Plot(50.0, 20.2, 3.1, -100, 80)]))
+        self.state.apply(Beam(BeamType.CONFIRMATION, 600, 7, 0, 20.2, 3.1, 3, 3))
+        self.assertEqual(self.state.latest_confirmation_delay(), 100)
+
     def test_track_misses_raise_level(self):
         self.state.apply(Beam(BeamType.TRACKING, 1000, 1, 0, 20.0, 1.5, 3, 3))
         self.state.apply(Detection(BeamType.TRACKING, 1000, 1, [Plot(50.0, 20.0, 1.5, -250, 80)]))

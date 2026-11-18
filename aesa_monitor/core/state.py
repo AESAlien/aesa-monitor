@@ -39,7 +39,9 @@ BEAM_SLOT_MS = 10
 # 확인 빔이 어느 탐색 탐지에서 나왔는지 찾을 때 보는 범위. 탐색 프레임 시간(약 1.9 s)보다 짧아야
 # 앞 프레임의 탐지와 짝이 지어지지 않는다.
 CONFIRMATION_SEARCH_WINDOW_MS = 1000
-CONFIRMATION_MATCH_DEG = 0.5
+# 처리부는 확인 빔을 탐색 플롯의 방위·고각 그대로 조향한다(녹화에서 차이 0°). 0.5°처럼 넓게 잡으면 같은 표적을
+# 이전 줄의 겹친 탐색 칸에서 찾은 다른 탐지와 짝이 지어져 지연이 320 ms처럼 크게 잡혔다. 계산 오차만 허용한다.
+CONFIRMATION_MATCH_DEG = 0.01
 EVENT_LOG_SIZE = 200
 GAP_HISTORY_SIZE = 2000
 # 보관할 탐색 프레임 수. 프레임 하나가 약 1.9 s이므로 1시간 남짓이다.
@@ -120,6 +122,13 @@ class MonitorState:
         self.processor_restarts = 0
         # 탐색 프레임별 빔 종류 수
         self.frames = FrameCounter(FRAME_HISTORY_SIZE)
+        # 운용 OFF(0xCA01)를 받았는지. OFF 뒤 첫 빔은 빈 칸으로 세지 않고 새 운용 구간으로 본다.
+        self._operation_stopped = False
+        # 지금 운용 구간의 첫 빔 시각. 이보다 앞선 탐색 칸 방문은 탐색 프레임 시간 계산에 쓰지 않는다.
+        self._operation_start_ms: Optional[int] = None
+        self.operation_restarts = 0
+        # 화면 표시 시각 상한(실시간 화면을 부드럽게 보이려고 app이 정한다). None이면 받은 마지막 시각.
+        self.view_limit_ms: Optional[int] = None
 
     # 입력
 
@@ -149,6 +158,8 @@ class MonitorState:
                 self._log(f"운용 명령: {'운용(ON)' if event.running else f'정지(OFF, {event.status})'}",
                           "info" if event.running else "warn", received_at)
             self.operator_control = event
+            if not event.running:
+                self._operation_stopped = True
         elif isinstance(event, SimulatorAttitude):
             if self.simulator_attitude != event:
                 self._log(f"모의기 자세 수신 (yaw {event.yaw_deg:.2f}°)", "info", received_at)
@@ -222,6 +233,8 @@ class MonitorState:
         self._search_hits.clear()
         self.confirmation_delays.clear()
         self.frames.clear()
+        self._operation_stopped = False
+        self._operation_start_ms = None
 
     def _apply_beam(self, beam: Beam) -> None:
         if (self._latest_beam_ms is not None and
@@ -230,7 +243,17 @@ class MonitorState:
             self.processor_restarts += 1
             self._log("처리부 시각이 되돌아감 (처리부 재시작으로 보고 기록을 지움)", "warn")
 
-        if self._latest_beam_ms is not None:
+        if self._latest_beam_ms is not None and self._is_operation_restart(beam):
+            # 운용 OFF→ON. 처리부는 OFF 동안 빔을 보내지 않으므로 그 시간은 빠진 빔이 아니다.
+            # 진행 중이던 탐색 프레임은 미완료로 닫고, 탐색 프레임 시간·확인 지연은 새 구간부터 다시 잰다.
+            self.frames.break_frame()
+            self._search_hits.clear()
+            self._last_search_interval_ms = None
+            self._operation_start_ms = beam.timestamp_ms
+            self._operation_stopped = False
+            self.operation_restarts += 1
+            self._log("운용 재개: 처리부가 빔을 처음부터 다시 보냄 (OFF 동안은 빠진 빔으로 세지 않음)", "info")
+        elif self._latest_beam_ms is not None:
             missed = (beam.timestamp_ms - self._latest_beam_ms) // BEAM_SLOT_MS - 1
             if missed > 0:
                 self.beam_gaps.append((beam.timestamp_ms, int(missed)))
@@ -245,6 +268,18 @@ class MonitorState:
             self._apply_search_beam(beam)
         elif beam.beam_type == BeamType.CONFIRMATION:
             self._match_confirmation(beam)
+
+    def _is_operation_restart(self, beam: Beam) -> bool:
+        """운용 OFF→ON 뒤 첫 빔인지.
+
+        캡처에서 OFF(0xCA01)를 봤거나, 처리부 빔 명령 카운트가 1로 돌아왔으면(처리부는 운용 전환마다
+        카운트를 0으로 초기화한다) 새 운용 구간이다. 캡처를 늦게 시작해 OFF를 못 봐도 카운트로 알 수 있다.
+        """
+        if beam.command_count == 1:
+            return True
+        # OFF 직전에 보낸 빔이 OFF 명령보다 늦게 캡처될 수 있으므로 시간이 비었을 때만 새 구간으로 본다.
+        return (self._operation_stopped and self._latest_beam_ms is not None
+                and beam.timestamp_ms - self._latest_beam_ms > BEAM_SLOT_MS)
 
     def _apply_detection(self, detection: Detection) -> None:
         self.tracking.apply_detection(detection)
@@ -287,6 +322,11 @@ class MonitorState:
 
         cell.azimuth_deg = self.unwrap_azimuth(beam.azimuth_deg)
         cell.elevation_deg = beam.elevation_deg
+        if self._operation_start_ms is not None and cell.last_ms < self._operation_start_ms:
+            # 운용 OFF 앞의 방문이다. OFF 시간이 들어간 간격은 탐색 프레임 시간이 아니다.
+            cell.previous_ms = None
+            cell.last_ms = beam.timestamp_ms
+            return
         cell.previous_ms = cell.last_ms
         cell.last_ms = beam.timestamp_ms
         self._last_search_interval_ms = cell.last_ms - cell.previous_ms
@@ -304,7 +344,14 @@ class MonitorState:
     # 조회
 
     def now_ms(self) -> Optional[int]:
-        """화면에 표시할 현재 처리부 시각."""
+        """화면에 표시할 현재 처리부 시각. view_limit_ms가 있으면 그 시각을 넘지 않는다."""
+        latest = self.latest_ms()
+        if latest is None or self.view_limit_ms is None:
+            return latest
+        return min(latest, self.view_limit_ms)
+
+    def latest_ms(self) -> Optional[int]:
+        """받은 메시지 중 가장 늦은 처리부 시각."""
         candidates = [value for value in (
             self._latest_beam_ms,
             self.status.processor_time_ms if self.status else None,
@@ -358,6 +405,8 @@ class MonitorState:
         start = now - window_ms
         result = []
         for beam in reversed(self.beams):
+            if beam.timestamp_ms > now:
+                continue  # 표시 시각(view_limit_ms)보다 늦게 받은 빔은 아직 그리지 않는다
             if beam.timestamp_ms < start:
                 break
             result.append(beam)

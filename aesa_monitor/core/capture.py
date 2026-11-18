@@ -239,6 +239,8 @@ class TcpStream:
 class _Connection:
     peer: Optional[str] = None
     open: bool = False
+    # FIN·RST로 닫혔는지. 닫힌 뒤에는 새 SYN을 볼 때까지 다시 열지 않는다.
+    finished: bool = False
     streams: Dict[Endpoint, TcpStream] = field(default_factory=dict)
 
 
@@ -287,9 +289,12 @@ class CaptureDecoder:
         output: List[object] = []
         if segment.flags & TCP_SYN:
             stream.restart(segment.sequence)
+            connection.finished = False
             output.extend(self._open(connection, time_s))
         frames = stream.feed(segment.sequence, segment.payload)
-        if frames and not connection.open:
+        if frames and not connection.open and not connection.finished:
+            # SYN을 못 본 연결(캡처를 연결 도중에 시작)은 첫 메시지에서 연결로 본다.
+            # 한쪽이 FIN을 보낸 뒤 상대가 마저 보낸 메시지는 다시 연결된 것이 아니다(끊김이 두 번 보이던 문제).
             output.extend(self._open(connection, time_s))
         for frame in frames:
             message_id = decode_header(frame[:HEADER.size]).message_id
@@ -307,6 +312,7 @@ class CaptureDecoder:
                     output.extend(self._announce(connection.peer, time_s))
             output.append(CapturedFrame(time_s, segment.source, segment.destination, connection.peer, frame))
         if segment.flags & (TCP_FIN | TCP_RST):
+            connection.finished = True
             output.extend(self._close(connection, time_s, "RST" if segment.flags & TCP_RST else "FIN"))
         return output
 

@@ -193,6 +193,36 @@ class DecoderTest(unittest.TestCase):
         self.assertEqual([item.peer for item in captured], [PEER_CONSOLE, PEER_SIMULATOR, PEER_SIMULATOR, PEER_CONSOLE])
         self.assertEqual(captured[1].source, PROCESSOR)
 
+    def test_messages_after_fin_do_not_reopen_the_link(self):
+        # 운용통제기가 먼저 FIN을 보내도 처리부가 이미 보내던 메시지가 뒤따른다. 끊김 한 번으로 보여야 한다.
+        console = Conversation(CONSOLE, PROCESSOR)
+        frames = console.open() + [
+            console.send(PROCESSOR, encode(TrackList([]))),
+            console.close(CONSOLE),
+            console.send(PROCESSOR, encode(TrackList([]))),
+            console.send(PROCESSOR, encode(TrackList([]))),
+            console.close(PROCESSOR),
+        ]
+        decoder = CaptureDecoder(CaptureEndpoints(PROCESSOR, CONSOLE, SIMULATOR, MONITOR))
+        items = []
+        for index, frame in enumerate(frames):
+            items += decoder.feed(index * 0.01, LINKTYPE_ETHERNET, frame)
+        links = [(item.peer, item.connected) for item in items if isinstance(item, CapturedPeerLink)]
+        self.assertEqual(links, [(PEER_CONSOLE, True), (PEER_CONSOLE, False)])
+        self.assertEqual(len([item for item in items if isinstance(item, CapturedFrame)]), 3)
+
+    def test_new_syn_after_close_reopens_the_link(self):
+        decoder = CaptureDecoder(CaptureEndpoints(PROCESSOR, CONSOLE, SIMULATOR, MONITOR))
+        first = Conversation(CONSOLE, PROCESSOR)
+        second = Conversation(CONSOLE, PROCESSOR, start=90000, server_start=70000)  # 같은 포트로 다시 접속
+        frames = first.open() + [first.close(CONSOLE), first.close(PROCESSOR)] + second.open() + [
+            second.send(PROCESSOR, encode(TrackList([])))]
+        items = []
+        for index, frame in enumerate(frames):
+            items += decoder.feed(index * 0.01, LINKTYPE_ETHERNET, frame)
+        links = [(item.peer, item.connected) for item in items if isinstance(item, CapturedPeerLink)]
+        self.assertEqual(links, [(PEER_CONSOLE, True), (PEER_CONSOLE, False), (PEER_CONSOLE, True)])
+
     def test_classifies_by_address_on_syn(self):
         decoder = CaptureDecoder(CaptureEndpoints(PROCESSOR, CONSOLE, SIMULATOR, MONITOR))
         items = decoder.feed(0.0, LINKTYPE_ETHERNET, Conversation(SIMULATOR, PROCESSOR).open()[0])
