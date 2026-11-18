@@ -121,7 +121,8 @@ class StateFramesTest(unittest.TestCase):
     def test_state_counts_frames_and_clears_on_restart(self):
         state = MonitorState()
         for index in range(9):
-            state.apply(Beam(SEARCH, 10000 + index * 10, index % 4, index, 0.0, 0.0, 6.0, 6.0))
+            # 처리부 빔 명령 카운트는 1부터 센다(1로 돌아오면 운용 OFF→ON).
+            state.apply(Beam(SEARCH, 10000 + index * 10, index % 4, index + 1, 0.0, 0.0, 6.0, 6.0))
         self.assertEqual(len(state.frames.complete_frames()), 2)
 
         state.apply(Beam(SEARCH, 0, 0, 0, 0.0, 0.0, 6.0, 6.0))  # 처리부 재시작

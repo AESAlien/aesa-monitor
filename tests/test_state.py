@@ -1,7 +1,7 @@
 import unittest
 
 from aesa_monitor.core.events import ConnectionChanged
-from aesa_monitor.core.protocol import Beam, BeamType, MonitorStatus, Track, TrackList
+from aesa_monitor.core.protocol import Beam, BeamType, MonitorStatus, OperatorControl, Track, TrackList
 from aesa_monitor.core.state import MonitorState, ViewMode
 
 
@@ -138,3 +138,83 @@ class ViewModeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def counted(timestamp, count, beam_id):
+    return Beam(int(BeamType.SEARCH), timestamp, beam_id, count, float(beam_id), 0.0, 6.0, 6.0)
+
+
+class OperationRestartTest(unittest.TestCase):
+    """운용 OFF→ON: 처리부는 OFF 동안 빔을 보내지 않고, ON이면 카운트 1·탐색 0번부터 다시 보낸다."""
+
+    def run_until_off(self, state):
+        for index in range(10):
+            state.apply(counted(1000 + index * 10, index + 1, index % 4))
+
+    def test_off_time_is_not_counted_as_missed_beams(self):
+        state = MonitorState()
+        self.run_until_off(state)
+        state.apply(OperatorControl(0))
+        state.apply(OperatorControl(1))
+        state.apply(counted(20000, 1, 0))
+        state.apply(counted(20010, 2, 1))
+        self.assertEqual(list(state.beam_gaps), [])
+        self.assertEqual(state.missed_beam_slots(60000), 0)
+        self.assertEqual(state.operation_restarts, 1)
+
+    def test_count_reset_alone_starts_a_new_run(self):
+        # 캡처를 늦게 켜서 OFF 명령을 못 봐도 카운트가 1로 돌아오면 새 운용 구간이다.
+        state = MonitorState()
+        self.run_until_off(state)
+        state.apply(counted(20000, 1, 0))
+        self.assertEqual(list(state.beam_gaps), [])
+
+    def test_sweep_time_is_not_measured_across_off(self):
+        state = MonitorState()
+        self.run_until_off(state)
+        self.assertEqual(state.search_sweep_ms(), 40)
+        state.apply(OperatorControl(0))
+        state.apply(counted(20000, 1, 0))
+        self.assertIsNone(state.search_sweep_ms())
+        for index in range(1, 5):
+            state.apply(counted(20000 + index * 10, index + 1, index % 4))
+        self.assertEqual(state.search_sweep_ms(), 40)
+
+    def test_frame_in_progress_at_off_is_closed_incomplete(self):
+        state = MonitorState()
+        self.run_until_off(state)  # 0 1 2 3 | 0 1 2 3 | 0 1 → 완료 1개(앞 프레임은 0번부터라 완료)
+        complete = len(state.frames.complete_frames())
+        state.apply(OperatorControl(0))
+        state.apply(counted(20000, 1, 0))
+        self.assertEqual(len(state.frames.complete_frames()), complete)
+        self.assertFalse(state.frames.frames[-1].complete)
+
+    def test_late_beam_after_off_command_is_not_a_restart(self):
+        # OFF 직전에 보낸 빔이 OFF 명령보다 늦게 캡처돼도(시간 공백 없음) 새 구간으로 보지 않는다.
+        state = MonitorState()
+        self.run_until_off(state)
+        state.apply(OperatorControl(0))
+        state.apply(counted(1100, 11, 2))
+        self.assertEqual(state.operation_restarts, 0)
+        state.apply(counted(20000, 1, 0))
+        self.assertEqual(state.operation_restarts, 1)
+        self.assertEqual(list(state.beam_gaps), [])
+
+    def test_real_gap_inside_a_run_is_still_counted(self):
+        state = MonitorState()
+        self.run_until_off(state)
+        state.apply(counted(1150, 11, 2))  # 1090 다음 1100~1140 네 칸이 빔
+        self.assertEqual(state.missed_beam_slots(60000), 5)
+
+
+class ViewLimitTest(unittest.TestCase):
+    def test_beams_after_view_limit_are_not_shown_yet(self):
+        state = MonitorState()
+        for index in range(10):
+            state.apply(beam(index * 10, BeamType.SEARCH, index))
+        state.view_limit_ms = 50
+        self.assertEqual(state.now_ms(), 50)
+        self.assertEqual(state.latest_ms(), 90)
+        self.assertEqual([item.timestamp_ms for item in state.recent_beams(20)], [30, 40, 50])
+        state.view_limit_ms = None
+        self.assertEqual(state.now_ms(), 90)

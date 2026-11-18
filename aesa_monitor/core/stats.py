@@ -15,7 +15,7 @@ from aesa_monitor.core.config import TrackingParameters
 from aesa_monitor.core.events import ConnectionChanged, Event
 from aesa_monitor.core.frames import FrameCounter, FrameShare
 from aesa_monitor.core.geometry import wrap_degrees
-from aesa_monitor.core.protocol import Beam, BeamType, Detection, TrackList
+from aesa_monitor.core.protocol import Beam, BeamType, Detection, OperatorControl, TrackList
 from aesa_monitor.core.state import BEAM_SLOT_MS, TIME_RESET_THRESHOLD_MS
 from aesa_monitor.core.tracking import Outcome, TrackingHistory
 from aesa_monitor.core.verdict import (
@@ -23,7 +23,8 @@ from aesa_monitor.core.verdict import (
 )
 
 CONFIRMATION_WINDOW_MS = 1000
-DIRECTION_MATCH_DEG = 0.5
+# 확인 빔은 탐색 플롯 방향 그대로 조향된다. 넓게 잡으면 다른 탐지와 짝이 지어진다(state.CONFIRMATION_MATCH_DEG 참고).
+DIRECTION_MATCH_DEG = 0.01
 PLOT_MATCH_DEG = 1.0
 
 # (거리 km, 방위, 고각, 도플러)
@@ -41,6 +42,7 @@ class BeamRecord:
     outcome: Optional[str] = None             # 녹화에서만: 갱신/미탐/종료
     angle_error_m: Optional[float] = None     # 녹화에서만: 빔 축과 연관 탐지의 수직 거리
     segment: int = 0                           # 처리부가 다시 시작할 때마다 1 증가
+    run: int = 0                               # 운용 OFF→ON(처리부가 빔을 처음부터 다시 보냄)마다 1 증가
 
 
 @dataclass
@@ -94,9 +96,12 @@ def records_from_events(events: Iterable[Tuple[float, Event]]) -> Tuple[List[Bea
     pending: Dict[Tuple[int, int], BeamRecord] = {}
     extra = {"disconnects": 0, "restarts": 0}
     segment = 0
+    run = 0
     latest: Optional[int] = None
     connected = False
     drop_pending = False
+    operation_stopped = False
+    extra["operation_restarts"] = 0
     for _, event in events:
         if isinstance(event, ConnectionChanged):
             if connected and not event.connected:
@@ -116,9 +121,15 @@ def records_from_events(events: Iterable[Tuple[float, Event]]) -> Tuple[List[Bea
                 pending.clear()
                 history = TrackingHistory(cycle_history_size=None)
                 latest = None
+            if latest is not None and (event.command_count == 1 or (
+                    operation_stopped and event.timestamp_ms - latest > BEAM_SLOT_MS)):
+                # 운용 OFF→ON. OFF 동안 빔이 없던 시간은 빔 간격·탐색 프레임 계산에서 뺀다(state와 같은 기준).
+                run += 1
+                operation_stopped = False
+                extra["operation_restarts"] += 1
             latest = event.timestamp_ms if latest is None else max(latest, event.timestamp_ms)
             record = BeamRecord(event.timestamp_ms, event.beam_type, event.beam_id,
-                                event.azimuth_deg, event.elevation_deg, segment=segment)
+                                event.azimuth_deg, event.elevation_deg, segment=segment, run=run)
             records.append(record)
             pending[(event.beam_id, event.timestamp_ms)] = record
             if len(pending) > 5000:
@@ -132,6 +143,8 @@ def records_from_events(events: Iterable[Tuple[float, Event]]) -> Tuple[List[Bea
             history.apply_detection(event)
         elif isinstance(event, TrackList):
             history.apply_tracks(event.tracks)
+        elif isinstance(event, OperatorControl) and not event.running:
+            operation_stopped = True
     # 트랙 목록이 올 때마다 판정이 갱신되므로 구간 끝에서 한 번에 옮긴다.
     _apply_outcomes(records, history, segment)
     return records, extra
@@ -188,16 +201,17 @@ def _mean(values: Sequence[float]) -> Optional[float]:
     return sum(values) / len(values) if values else None
 
 
-def _by_segment(records: Sequence[BeamRecord]) -> Dict[int, List[BeamRecord]]:
-    result: Dict[int, List[BeamRecord]] = {}
+def _by_run(records: Sequence[BeamRecord]) -> Dict[Tuple[int, int], List[BeamRecord]]:
+    """빔이 끊김 없이 이어진 구간별로 나눈다: 처리부 실행(segment) 안의 운용 구간(run)."""
+    result: Dict[Tuple[int, int], List[BeamRecord]] = {}
     for record in records:
-        result.setdefault(record.segment, []).append(record)
+        result.setdefault((record.segment, record.run), []).append(record)
     return result
 
 
 def _confirmation_delays(records: Sequence[BeamRecord]) -> List[float]:
     delays = []
-    for segment in _by_segment(records).values():
+    for segment in _by_run(records).values():
         hits: List[Tuple[int, float, float]] = []
         for record in segment:
             if record.beam_type == BeamType.SEARCH and record.plots:
@@ -281,6 +295,10 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
         if extra.get("restarts"):
             items.append(StatItem(group, "처리부 재시작", f"{extra['restarts']}회", level=WARN,
                                   note="처리부 시각이 되돌아간 횟수. 구간별로 따로 계산한다"))
+        if extra.get("operation_restarts"):
+            items.append(StatItem(group, "운용 OFF→ON", f"{extra['operation_restarts']}회",
+                                  note="처리부가 빔을 처음부터 다시 보낸 횟수. OFF 동안 빔이 없던 시간은 빔 간격·"
+                                       "빠진 칸·탐색 프레임 시간에서 뺀다"))
 
     group = "빔 스케줄"
     shares = {beam_type: counts[beam_type] / total for beam_type in BeamType}
@@ -290,7 +308,7 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
         chart="frames", note="전체 기록 기준. 누르면 탐색 프레임별 빔 수를 그린다"))
 
     counter = FrameCounter()
-    for segment in _by_segment(records).values():
+    for segment in _by_run(records).values():
         for record in segment:
             counter.add(record.beam_type, record.beam_id, record.time_ms)
         counter.break_frame()
@@ -306,7 +324,7 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
                                "녹화 시작·끝에 걸려 잘린 프레임은 뺀다. 누르면 프레임별 빔 수를 그린다"))
 
     intervals: List[float] = []
-    for segment in _by_segment(records).values():
+    for segment in _by_run(records).values():
         times = sorted(record.time_ms for record in segment)
         intervals.extend(float(b - a) for a, b in zip(times, times[1:]))
     gaps = [value for value in intervals if value > BEAM_SLOT_MS]
@@ -317,7 +335,7 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
                           note=f"빠진 칸 {missed_slots}개 (처리부 지연, 모니터 큐 누락 또는 응답 없는 빔)"))
 
     sweeps: List[float] = []
-    for segment in _by_segment(records).values():
+    for segment in _by_run(records).values():
         last_seen: Dict[int, int] = {}
         for record in segment:
             if record.beam_type != BeamType.SEARCH:
@@ -345,7 +363,7 @@ def compute_stats(records: Sequence[BeamRecord], parameters: TrackingParameters,
                           note="" if has_direction else "탐지 CSV에는 빔 방향이 없어 플롯 위치로 짝을 찾음"))
 
     periods: List[float] = []
-    for segment in _by_segment(records).values():
+    for segment in _by_run(records).values():
         last_tracking: Dict[int, int] = {}
         for record in segment:
             if record.beam_type != BeamType.TRACKING:
