@@ -133,13 +133,25 @@ def show_error(title: str, text: str) -> None:
         pass
 
 
-def read_settings_values() -> dict:
+def read_settings_values(path: Optional[Path] = None) -> dict:
+    """모니터 설정 파일 값. path가 없으면 exe 폴더의 monitor.env."""
     from aesa_monitor.core.config import read_env_file
 
+    path = SETTINGS_PATH if path is None else path
     try:
-        return read_env_file(SETTINGS_PATH) if SETTINGS_PATH.is_file() else {}
+        return read_env_file(path) if path.is_file() else {}
     except Exception:
         return {}
+
+
+def option_value(arguments: List[str], option: str) -> Optional[str]:
+    """명령줄에서 '--옵션 값' 또는 '--옵션=값'의 값을 찾는다. 없으면 None."""
+    for index, item in enumerate(arguments):
+        if item == option and index + 1 < len(arguments):
+            return arguments[index + 1]
+        if item.startswith(option + "="):
+            return item[len(option) + 1:]
+    return None
 
 
 def add_wireshark_to_path() -> None:
@@ -305,7 +317,10 @@ def build_arguments(arguments: List[str]) -> List[str]:
 
     if not given("--env") and (APP_DIR / ".env").is_file():
         arguments += ["--env", str(APP_DIR / ".env")]
-    server = read_settings_values().get(SERVER_KEY, "")
+    # MONITOR_SERVER는 모니터가 실제로 읽을 설정 파일(--settings로 고른 파일, 없으면 exe 폴더의 monitor.env)에서 읽는다.
+    # 기본 파일에서 읽으면 --settings로 다른 처리부를 지정해도 기본 처리부에 붙고 그 네트워크의 랜카드를 고른다.
+    selected = option_value(arguments, "--settings")
+    server = read_settings_values(Path(selected) if selected else None).get(SERVER_KEY, "")
     if server and not given("--server"):
         arguments += ["--server", server]
     return arguments

@@ -3,6 +3,7 @@
 import importlib.util
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -84,6 +85,64 @@ class ResolveCommandTest(unittest.TestCase):
 
     def test_settings_template_uses_placeholder(self):
         self.assertIn("MONITOR_CAPTURE_COMMAND='dumpcap -i {interface}", win.SETTINGS_TEMPLATE)
+
+
+class BuildArgumentsTest(unittest.TestCase):
+    """MONITOR_SERVER는 실제로 쓸 설정 파일(--settings)에서 읽는다."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        root = Path(self.directory.name)
+        self.default = root / "monitor.env"
+        self.default.write_text("MONITOR_SERVER=192.168.10.20:3200\n", encoding="utf-8")
+        self.custom = root / "custom.env"
+        self.custom.write_text("MONITOR_SERVER=127.0.0.1:43200\n", encoding="utf-8")
+        patches = [mock.patch.object(win, "SETTINGS_PATH", self.default), mock.patch.object(win, "APP_DIR", root)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.directory.cleanup)
+
+    def server_of(self, arguments):
+        result = win.build_arguments(arguments)
+        return result[result.index("--server") + 1] if "--server" in result else None
+
+    def test_default_settings_file(self):
+        self.assertEqual(self.server_of([]), "192.168.10.20:3200")
+
+    def test_selected_settings_file(self):
+        self.assertEqual(self.server_of(["--settings", str(self.custom)]), "127.0.0.1:43200")
+        self.assertEqual(self.server_of([f"--settings={self.custom}"]), "127.0.0.1:43200")
+
+    def test_selected_file_without_server_does_not_fall_back_to_default(self):
+        empty = Path(self.directory.name) / "empty.env"
+        empty.write_text("MONITOR_FONT_SIZE=14\n", encoding="utf-8")
+        self.assertIsNone(self.server_of(["--settings", str(empty)]))
+
+    def test_explicit_server_wins(self):
+        self.assertEqual(self.server_of(["--settings", str(self.custom), "--server", "10.0.0.1:3200"]), "10.0.0.1:3200")
+
+
+class PackageFilesTest(unittest.TestCase):
+    """배포 zip에 넣는 파일이 저장소에 실제로 있는지(빌드 결과물 windows/dist는 제외)."""
+
+    def test_files_copied_by_workflow_exist(self):
+        import re
+
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "windows-exe.yml").read_text(encoding="utf-8")
+        copies = [line for line in workflow.splitlines() if line.strip().startswith("Copy-Item")]
+        paths = {path for line in copies for path in re.findall(r"windows/[\w./-]+", line)
+                 if not path.startswith("windows/dist/")}
+        self.assertIn("windows/processor.env.example", paths)
+        for path in sorted(paths):
+            self.assertTrue((root / path).is_file(), path)
+
+    def test_processor_env_has_communication_endpoints(self):
+        root = Path(__file__).resolve().parents[1]
+        text = (root / "windows" / "processor.env.example").read_text(encoding="utf-8")
+        for key in ("COMM_SERVER_ADDRESS", "COMM_OPERATOR_CONSOLE_ADDRESS", "COMM_SCENARIO_SIMULATOR_ADDRESS"):
+            self.assertIn(key, text)
 
 
 if __name__ == "__main__":
