@@ -4,8 +4,11 @@ rem Output: windows\dist\aesa-monitor.exe
 setlocal
 cd /d "%~dp0"
 
-set "PY=python"
-where py >nul 2>nul && set "PY=py -3"
+rem PY can be set beforehand (CI: set PY=python). Otherwise prefer the py launcher.
+if not defined PY (
+  set "PY=python"
+  where py >nul 2>nul && set "PY=py -3"
+)
 
 echo [1/3] Python
 %PY% --version || goto :error
