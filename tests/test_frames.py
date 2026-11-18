@@ -89,6 +89,23 @@ class FrameCounterTest(unittest.TestCase):
 
         self.assertEqual([frame.complete for frame in counter.frames], [True, False])
 
+    def test_first_frame_with_lead_in_request_beams_is_not_complete(self):
+        counter = FrameCounter()
+        # 확인·추적 빔 도중에 시작했다. 탐색 0번 앞의 두 빔은 앞 프레임의 꼬리다(#2).
+        feed(counter, [(TRACKING, 9), (CONFIRMATION, 9), (SEARCH, 0), (SEARCH, 1), (SEARCH, 2), (SEARCH, 3),
+                       (SEARCH, 0), (SEARCH, 1), (SEARCH, 2), (SEARCH, 3), (SEARCH, 0)])
+
+        self.assertEqual([frame.complete for frame in counter.frames], [False, True])
+        self.assertEqual([frame.index for frame in counter.complete_frames()], [2])
+
+    def test_segment_after_break_with_lead_in_beams_is_not_complete(self):
+        counter = FrameCounter()
+        feed(counter, [(SEARCH, 0), (SEARCH, 1), (SEARCH, 2), (SEARCH, 3), (SEARCH, 0)])
+        counter.break_frame()
+        feed(counter, [(TRACKING, 7), (SEARCH, 0), (SEARCH, 1), (SEARCH, 2), (SEARCH, 3), (SEARCH, 0)])
+
+        self.assertEqual([frame.complete for frame in counter.frames], [True, False, False])
+
     def test_break_frame_closes_current_as_incomplete(self):
         counter = FrameCounter()
         feed(counter, [(SEARCH, 0), (SEARCH, 1), (CONFIRMATION, 5)])
