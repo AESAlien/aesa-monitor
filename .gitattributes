@@ -1,0 +1,4 @@
+# Windows 배치 파일은 CRLF로 둔다(LF면 cmd에서 goto·레이블이 깨질 수 있다)
+*.bat text eol=crlf
+# PowerShell 스크립트도 CRLF로 둔다(Windows PowerShell 5.1)
+*.ps1 text eol=crlf
