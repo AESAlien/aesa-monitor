@@ -28,7 +28,7 @@ class FrameShare:
     start_ms: int              # 프레임 첫 빔의 처리부 시각
     end_ms: int                # 다음 프레임 첫 탐색 빔의 처리부 시각(진행 중이면 마지막 빔 시각)
     counts: Dict[int, int]     # BeamType 값 → 빔 수
-    complete: bool             # 탐색 빔 0번부터 격자 끝까지 다 돌고 닫힌 프레임인지
+    complete: bool             # 탐색 빔 0번부터 격자 끝까지 다 돌고 닫힌 프레임인지(앞 프레임 꼬리 빔이 섞이면 False)
 
     @property
     def total(self) -> int:
@@ -90,6 +90,8 @@ class FrameCounter:
         self._counts: Dict[int, int] = {int(beam_type): 0 for beam_type in BEAM_TYPES}
         self._first_search_id: Optional[int] = None
         self._last_search_id: Optional[int] = None
+        # 첫 탐색 빔보다 먼저 확인·추적 빔이 들어왔는지. 그 빔은 앞 프레임의 꼬리라 이 프레임은 앞이 잘린 것이다.
+        self._lead_in = False
 
     def clear(self) -> None:
         self.frames.clear()
@@ -106,6 +108,8 @@ class FrameCounter:
         self._last_ms = time_ms
         if beam_type in self._counts:
             self._counts[beam_type] += 1
+            if beam_type != BeamType.SEARCH and self._first_search_id is None:
+                self._lead_in = True
         if beam_type == BeamType.SEARCH:
             if self._first_search_id is None:
                 self._first_search_id = beam_id
@@ -118,7 +122,7 @@ class FrameCounter:
             self._close(self._last_ms, closed=False)
 
     def _close(self, end_ms: int, closed: bool) -> None:
-        complete = (closed and self._first_search_id == 0 and self._last_search_id is not None
+        complete = (closed and not self._lead_in and self._first_search_id == 0 and self._last_search_id is not None
                     and self._last_search_id + 1 >= self._grid_size)
         self.frames.append(FrameShare(self._next_index, self._start_ms, end_ms, dict(self._counts), complete))
         self._next_index += 1
