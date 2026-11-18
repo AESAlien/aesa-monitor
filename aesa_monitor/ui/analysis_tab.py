@@ -170,7 +170,7 @@ class AnalysisTab:
         self._timeline_title = section_title(
             timeline_header, "이벤트 타임라인",
             "처리부 메시지 로그(adp_*.log)의 이벤트를 처리부 시각에 놓았습니다.\n"
-            "처리부 시각 0은 로그의 'Six worker threads started' 줄입니다(수 ms 오차, 추정).\n"
+            "처리부 시각 0은 로그의 워커 시작 줄('… worker threads started')입니다(수 ms 오차, 추정).\n"
             "녹화 중 처리부가 다시 시작해 실행이 여럿이면, 위 '처리부 실행'에서 고른 실행 구간만 그립니다.\n"
             "맨 위 회색 띠는 녹화가 있는 구간, 세로 선은 현재 재생 위치입니다. "
             "점이나 목록 행을 누르면 재생 위치를 그 이벤트 1초 전으로 옮깁니다.")

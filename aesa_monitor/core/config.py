@@ -1,8 +1,9 @@
 """모니터 접속 설정과 화면 설명에 쓰는 추적 설정.
 
 데이터 처리부와 같은 .env 파일에서 서버 주소와 모니터 주소를 읽는다.
-처리부는 수락한 연결을 원격 주소와 포트로 구분하므로, 모니터는
-COMM_MONITOR_ADDRESS:COMM_MONITOR_PORT에 바인딩한 뒤 접속해야 한다.
+모니터 주소(COMM_MONITOR_*)는 복사본 수신(copy)에만 필요하다. 처리부는 수락한 연결을 원격 주소와
+포트로 구분하므로, copy에서는 모니터가 그 주소에 바인딩한 뒤 접속해야 한다. 처리부 main의 .env에는
+이 키가 없으므로 통신 캡처(capture, 기본)에서는 없어도 된다(있으면 모니터 복사본 연결을 캡처에서 뺄 때 쓴다).
 추적 설정(TARGET_*)은 추적 탭에서 처리부의 계산 기준을 보여줄 때만 쓰며,
 없으면 .env.example과 같은 기본값을 쓴다.
 운용통제기·모의기 주소(COMM_OPERATOR_CONSOLE_*, COMM_SCENARIO_SIMULATOR_*)는 통신 캡처에서
@@ -46,7 +47,7 @@ TRACKING_KEYS = {
 @dataclass(frozen=True)
 class MonitorConfig:
     server: Endpoint
-    local: Endpoint
+    local: Optional[Endpoint]   # COMM_MONITOR_*. 복사본 수신에만 필요하고 없으면 None이다.
     tracking: TrackingParameters = TrackingParameters()
     console: Optional[Endpoint] = None
     simulator: Optional[Endpoint] = None
@@ -136,13 +137,11 @@ def load_config(
             _parse_port(_require(values, "COMM_SERVER_PORT"), "COMM_SERVER_PORT"),
         )
 
+    local_endpoint: Optional[Endpoint]
     if local is not None:
         local_endpoint = parse_endpoint(local)
     else:
-        local_endpoint = (
-            _require(values, "COMM_MONITOR_ADDRESS"),
-            _parse_port(_require(values, "COMM_MONITOR_PORT"), "COMM_MONITOR_PORT"),
-        )
+        local_endpoint = _optional_endpoint(values, "COMM_MONITOR")
 
     return MonitorConfig(server_endpoint, local_endpoint, read_tracking_parameters(values),
                          _optional_endpoint(values, "COMM_OPERATOR_CONSOLE"),

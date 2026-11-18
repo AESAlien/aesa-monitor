@@ -12,7 +12,7 @@ import socket
 import threading
 from typing import Dict, Optional
 
-from aesa_monitor.core.config import MonitorConfig
+from aesa_monitor.core.config import ConfigError, MonitorConfig
 from aesa_monitor.core.events import SOURCE_COPY, ConnectionChanged, Event
 from aesa_monitor.core.protocol import MessageFramer, ProtocolError, decode
 
@@ -124,8 +124,15 @@ class ProcessorConnection:
 
 
 def create_source(kind: str, config: MonitorConfig, events: "queue.Queue[Event]", capture_command: str = ""):
-    """데이터 출처를 만든다. kind는 copy(복사본 수신) 또는 capture(통신 캡처)다."""
+    """데이터 출처를 만든다. kind는 capture(통신 캡처) 또는 copy(복사본 수신)다.
+
+    copy는 모니터 주소(COMM_MONITOR_* 또는 --local)가 있어야 한다. 없으면 ConfigError를 낸다.
+    """
     if kind == SOURCE_COPY:
+        if config.local is None:
+            raise ConfigError("복사본 수신(copy)에는 모니터 주소가 필요합니다: .env의 COMM_MONITOR_ADDRESS·"
+                              "COMM_MONITOR_PORT 또는 --local. 처리부 main은 복사본을 보내지 않으므로 "
+                              "보통은 통신 캡처(--source capture)를 씁니다")
         return ProcessorConnection(config, events)
     if kind == "capture":
         from aesa_monitor.core.settings import DEFAULT_CAPTURE_COMMAND

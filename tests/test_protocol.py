@@ -81,7 +81,9 @@ class StructSizeTest(unittest.TestCase):
         self.assertEqual(sizes["ST_Trk"], protocol.TRACK.size)
         self.assertEqual(sizes["ST_TrkMsg"], protocol.TRACK_MESSAGE_MAXIMUM_SIZE)
         self.assertEqual(sizes["ST_RadarAttMsg"], protocol.RADAR_ATTITUDE_MESSAGE_SIZE)
-        self.assertEqual(sizes["ST_MonitorStatusMsg"], protocol.MONITOR_STATUS_MESSAGE_SIZE)
+        # 0xAD01은 복사본 수신(이전 방식) 전용이라 처리부 main에는 없다. 그 코드가 있는 처리부에서만 대조한다.
+        if "ST_MonitorStatusMsg" in sizes:
+            self.assertEqual(sizes["ST_MonitorStatusMsg"], protocol.MONITOR_STATUS_MESSAGE_SIZE)
         self.assertEqual(sizes["ST_PlotHeader"], protocol.PLOT_HEADER.size)
         self.assertEqual(sizes["ST_Plot"], protocol.PLOT.size)
         self.assertEqual(sizes["ST_PlotMsg"], protocol.PLOT_MESSAGE_MAXIMUM_SIZE)
@@ -92,6 +94,8 @@ class StructSizeTest(unittest.TestCase):
         text = (PROTOCOL_DIRECTORY / "ST_MsgHeader.hpp").read_text(encoding="utf-8")
         cpp_ids = {name: int(value, 16) for name, value in re.findall(r"(\w+) = (0x[0-9A-Fa-f]+)", text)}
         for message_id in MessageId:
+            if message_id == MessageId.MONITOR_STATUS and message_id.name not in cpp_ids:
+                continue  # 복사본 수신 전용(위와 같은 이유)
             self.assertEqual(cpp_ids[message_id.name], message_id.value, message_id.name)
 
 

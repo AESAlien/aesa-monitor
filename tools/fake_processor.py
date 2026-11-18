@@ -304,11 +304,13 @@ class ProcessorLogs:
         self.csv.write("beamType,requestId,transmitTime_ms,plotCount,"
                        "plotIndex,slantRange_m,azimuth_deg,elevation_deg,dopplerVelocity_mps,power_db\n")
         self.paths = (Path(self.message.name), Path(self.csv.name))
-        for logger, text in (("main", "Application starting"), ("main", "Communication server opened"),
-                             ("BeamWorker", "Worker started"), ("TargetWorker", "Worker started"),
-                             ("CommReceive", "Worker started"), ("CommSendSimulator", "Worker started"),
-                             ("CommSendConsole", "Worker started"), ("CommSendMonitor", "Worker started"),
-                             ("main", "Six worker threads started; beam tick = 10 ms")):
+        # main 로거 문구는 현재 처리부(aesa-processor main의 src/app/src/main.cpp)와 같게 쓴다.
+        for logger, text in (("main", "[1/12] Logging managers initialized"),
+                             ("main", "[5/12] Application configuration loaded"),
+                             ("main", "[8/12] Workers initialized"),
+                             ("main", "[9/12] Communication server opened"),
+                             ("main", "[10/12] All 7 worker threads started"),
+                             ("main", "[11/12] Application is running; waiting for shutdown signal")):
             self.write(logger, "info", text, 0)
 
     def write(self, logger: str, level: str, text: str, processor_ms: int) -> None:
@@ -442,7 +444,7 @@ def main() -> int:
     attitude = RadarAttitude(37.5, 127.0, 0.05, 0.0, 0.0, YAW_DEG)
     if processor.log:
         processor.log.write("BeamEvent", "info", "Operation state changed: ON", 0)
-        processor.log.write("BeamEvent", "info", f"Attitude applied: roll=0, pitch=0, yaw={YAW_DEG}", 5)
+        processor.log.write("BeamEvent", "info", "Attitude applied", 5)
     if peers is not None:
         peers.start(attitude)
         print(f"fake peers connected: simulator {options.simulator_bind}, console {options.console_bind}",
@@ -462,9 +464,6 @@ def main() -> int:
                 peers.send(messages)
             if processor.now_ms % 100 == 0:
                 messages.append(MonitorStatus(processor.now_ms, options.speed, False, True, True))
-            if processor.now_ms == 40000 and processor.log:
-                processor.log.write("BeamEvent", "warning",
-                                    f"Attitude ignored (already set): roll=0, pitch=0, yaw={YAW_DEG}", 40000)
             if client is not None:
                 try:
                     client.sendall(b"".join(encode(message) for message in messages))

@@ -19,8 +19,10 @@ DEFAULT_SSH_OPTIONS = (
     "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 )
 SOURCES = ("local", "ssh")
-# 데이터 출처. copy: 처리부가 보내는 복사본을 받는다. capture: 처리부·모의기·운용통제기 사이 패킷을 캡처한다.
+# 데이터 출처. capture(기본): 처리부·모의기·운용통제기 사이 패킷을 캡처한다.
+# copy: 처리부가 보내는 복사본을 받는다. 처리부 main에는 복사본 송신 코드가 없어 feature/129-monitor-feed 처리부에서만 된다.
 DATA_SOURCES = ("copy", "capture")
+DEFAULT_DATA_SOURCE = "capture"
 # 표준 출력으로 pcap을 내보내는 캡처 명령. {port}는 처리부 서버 포트로 바뀐다.
 # --immediate-mode가 없으면 libpcap이 패킷을 묶어서 넘겨 화면이 늦고 뭉쳐서 갱신된다.
 DEFAULT_CAPTURE_COMMAND = "tcpdump -i any --immediate-mode -U -s 0 -w - tcp port {port}"
@@ -44,7 +46,7 @@ class FetchSettings:
 
 @dataclass(frozen=True)
 class MonitorSettings:
-    data_source: str = "copy"
+    data_source: str = DEFAULT_DATA_SOURCE
     capture_command: str = DEFAULT_CAPTURE_COMMAND
     record_root: str = str(Path.home() / "aesa-records")
     font_size: int = 12
@@ -102,7 +104,7 @@ def load_settings(path: Optional[Path] = None) -> MonitorSettings:
     fetch_settings = FetchSettings(**fetch)
     if fetch_settings.source not in SOURCES:
         raise ConfigError(f"MONITOR_LOG_SOURCE must be one of {', '.join(SOURCES)}")
-    if main.get("data_source", "copy") not in DATA_SOURCES:
+    if main.get("data_source", DEFAULT_DATA_SOURCE) not in DATA_SOURCES:
         raise ConfigError(f"MONITOR_SOURCE must be one of {', '.join(DATA_SOURCES)}")
     if not 8 <= int(main.get("font_size", 12)) <= 32:
         raise ConfigError("MONITOR_FONT_SIZE must be 8..32")
