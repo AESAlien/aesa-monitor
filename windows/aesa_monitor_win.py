@@ -1,0 +1,239 @@
+"""aesa-monitor Windows 실행파일 진입점 (PyInstaller로 aesa-monitor.exe를 만들 때 쓴다).
+
+저장소 코드(aesa_monitor)는 고치지 않고, Windows에서 실행할 때 필요한 것만 여기서 맞춘다.
+
+- 설정·로그 위치를 exe가 있는 폴더로 둔다. onefile exe에서 aesa_monitor의 __file__은 실행할 때마다
+  새로 풀리는 임시 폴더라서, 그대로 두면 monitor.env를 못 찾고 종료할 때 저장한 값도 사라진다.
+- 캡처 명령을 shlex(POSIX 규칙)로 나누지 않고 문자열 그대로 CreateProcess에 넘긴다.
+  POSIX 규칙은 Windows 경로의 역슬래시를 지운다.
+- 창 없는 exe에서 dumpcap·ssh를 띄울 때 콘솔 창이 뜨지 않게 한다(CREATE_NO_WINDOW, stdin=DEVNULL).
+- Wireshark 폴더를 PATH 앞에 넣어 MONITOR_CAPTURE_COMMAND에 'dumpcap'만 써도 되게 한다.
+- monitor.env의 MONITOR_SERVER(이 진입점에서만 쓰는 키)를 --server 기본값으로 쓴다.
+  exe 폴더에 처리부 .env가 있으면 --env 기본값으로 쓴다.
+- 글꼴을 맑은 고딕으로 맞춘다(Windows 기본 Segoe UI에는 한글이 없어 글자마다 대체 글꼴이 섞인다).
+- 표준 출력·오류를 exe 폴더의 aesa-monitor.log에 남기고, 시작 오류는 메시지 상자로 보인다.
+"""
+
+from __future__ import annotations
+
+import datetime
+import io
+import os
+import subprocess
+import sys
+import traceback
+import types
+from pathlib import Path
+from typing import List, Optional
+
+FROZEN = getattr(sys, "frozen", False)
+WINDOWS = sys.platform == "win32"
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+SETTINGS_PATH = APP_DIR / "monitor.env"
+LOG_PATH = APP_DIR / "aesa-monitor.log"
+SERVER_KEY = "MONITOR_SERVER"
+
+if not FROZEN:
+    # 소스에서 실행할 때(python windows\aesa_monitor_win.py): 저장소 폴더를 import 경로에 넣는다.
+    sys.path.insert(0, str(APP_DIR.parent))
+
+SETTINGS_TEMPLATE = """\
+# aesa-monitor 설정 (Windows 실행파일용). 값이 없으면 기본값을 쓴다. 종료할 때 글자 크기 등이 저장된다.
+
+# 처리부(Zynq) 서버 주소 ADDRESS:PORT. Windows 실행파일에서만 쓰는 키다(--server와 같음).
+# exe 폴더에 처리부 .env가 있으면 그 파일의 운용통제기·모의기 주소와 추적 설정도 함께 읽는다.
+MONITOR_SERVER=192.168.10.20:3200
+
+# 데이터 출처: capture(통신 캡처)
+MONITOR_SOURCE=capture
+# Wireshark의 dumpcap으로 캡처한다(Wireshark + Npcap 설치 필요). {port}는 처리부 서버 포트로 바뀐다.
+# -i 에는 Zynq와 연결된 랜카드를 넣는다. 번호·이름은 명령 프롬프트에서 dumpcap -D 로 확인한다.
+# -P: pcap 형식, -q: 패킷 수 출력 안 함
+MONITOR_CAPTURE_COMMAND='dumpcap -i 1 -f "tcp port {port}" -P -q -w -'
+
+# 녹화 세션 폴더를 만들 곳
+MONITOR_RECORD_DIR=~/aesa-records
+MONITOR_FONT_SIZE=12
+MONITOR_AUTO_RECORD=0
+
+# 처리부 로그 가져오기: local 또는 ssh(보드). ssh는 Windows 10 이상의 OpenSSH 클라이언트를 쓴다.
+MONITOR_LOG_SOURCE=ssh
+MONITOR_LOG_LOCAL_DIR=
+MONITOR_LOG_SSH_TARGET=root@192.168.10.20
+MONITOR_LOG_SSH_PORT=22
+MONITOR_LOG_REMOTE_DIR=/tmp/aesa/logs
+MONITOR_LOG_SSH_OPTIONS="-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL"
+"""
+
+
+class Tee(io.TextIOBase):
+    """여러 스트림에 같이 쓴다. 시작 오류 문구를 메시지 상자에 보이려고 쓴다."""
+
+    def __init__(self, *streams) -> None:
+        super().__init__()
+        self._streams = [stream for stream in streams if stream is not None]
+
+    def write(self, text: str) -> int:
+        for stream in self._streams:
+            try:
+                stream.write(text)
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+
+
+def setup_streams() -> io.StringIO:
+    """창 없는 exe는 sys.stdout·sys.stderr가 None이다. 로그 파일로 돌리고, 오류는 버퍼에도 모은다."""
+    try:
+        log = open(LOG_PATH, "a", encoding="utf-8", buffering=1)
+        log.write(f"\n--- {datetime.datetime.now():%Y-%m-%d %H:%M:%S} 시작, 인자 {sys.argv[1:]}\n")
+    except OSError:
+        log = None
+    errors = io.StringIO()
+    sys.stdout = Tee(sys.stdout, log)
+    sys.stderr = Tee(sys.stderr, log, errors)
+    return errors
+
+
+def show_error(title: str, text: str) -> None:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(title, text, parent=root)
+        root.destroy()
+    except Exception:  # 메시지 상자도 못 띄우면 로그만 남는다.
+        pass
+
+
+def read_settings_values() -> dict:
+    from aesa_monitor.core.config import read_env_file
+
+    try:
+        return read_env_file(SETTINGS_PATH) if SETTINGS_PATH.is_file() else {}
+    except Exception:
+        return {}
+
+
+def add_wireshark_to_path() -> None:
+    roots = [os.environ.get(name) for name in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)")]
+    for root in roots:
+        if not root:
+            continue
+        folder = Path(root) / "Wireshark"
+        if (folder / "dumpcap.exe").is_file():
+            os.environ["PATH"] = str(folder) + os.pathsep + os.environ.get("PATH", "")
+            return
+
+
+def patch_subprocess() -> None:
+    """자식 프로세스(dumpcap, ssh, scp)가 콘솔 창을 띄우지 않게 한다."""
+    original = subprocess.Popen.__init__
+
+    def init(self, args, *positional, **keywords):
+        if not positional:
+            flags = keywords.get("creationflags", 0) or 0
+            if not flags & (subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS):
+                keywords["creationflags"] = flags | subprocess.CREATE_NO_WINDOW
+            if keywords.get("stdin") is None:
+                keywords["stdin"] = subprocess.DEVNULL
+        original(self, args, *positional, **keywords)
+
+    subprocess.Popen.__init__ = init
+
+
+def patch_capture_command() -> None:
+    """캡처 명령 문자열을 나누지 않고 그대로 넘긴다(Windows CreateProcess가 직접 해석)."""
+    from aesa_monitor.io import capture
+
+    capture.shlex = types.SimpleNamespace(split=lambda command: command)
+
+
+def patch_fonts() -> None:
+    import tkinter as tk
+    import tkinter.font as tkfont
+
+    original = tk.Tk.__init__
+    names = ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont",
+             "TkSmallCaptionFont", "TkIconFont", "TkTooltipFont")
+
+    def init(self, *positional, **keywords):
+        original(self, *positional, **keywords)
+        try:
+            families = set(tkfont.families(self))
+            family = next((name for name in ("Malgun Gothic", "맑은 고딕") if name in families), None)
+            if family is not None:
+                for name in names:
+                    tkfont.Font(root=self, name=name, exists=True).configure(family=family)
+        except tk.TclError:
+            pass
+
+    tk.Tk.__init__ = init
+
+
+def point_settings_to_app_dir() -> None:
+    import aesa_monitor.core.settings as settings
+
+    settings.PROJECT_DIRECTORY = APP_DIR
+    settings.DEFAULT_SETTINGS_PATH = SETTINGS_PATH
+    if not SETTINGS_PATH.exists():
+        try:
+            SETTINGS_PATH.write_text(SETTINGS_TEMPLATE, encoding="utf-8")
+        except OSError:
+            pass
+
+
+def build_arguments(arguments: List[str]) -> List[str]:
+    arguments = list(arguments)
+
+    def given(option: str) -> bool:
+        return any(item == option or item.startswith(option + "=") for item in arguments)
+
+    if not given("--env") and (APP_DIR / ".env").is_file():
+        arguments += ["--env", str(APP_DIR / ".env")]
+    server = read_settings_values().get(SERVER_KEY, "")
+    if server and not given("--server"):
+        arguments += ["--server", server]
+    return arguments
+
+
+def main(arguments: Optional[List[str]] = None) -> int:
+    errors = setup_streams()
+    try:
+        if WINDOWS:
+            add_wireshark_to_path()
+            patch_subprocess()
+            patch_fonts()
+        point_settings_to_app_dir()
+        if WINDOWS:
+            patch_capture_command()
+        final = build_arguments(sys.argv[1:] if arguments is None else arguments)
+        print(f"인자 {final}", file=sys.stdout)
+
+        from aesa_monitor.__main__ import main as monitor_main
+
+        code = monitor_main(final)
+    except SystemExit as error:  # argparse 오류·--help
+        code = error.code if isinstance(error.code, int) else 1
+    except Exception:
+        text = traceback.format_exc()
+        sys.stderr.write(text)
+        show_error("aesa-monitor 오류", f"{text}\n\n로그: {LOG_PATH}")
+        return 1
+    if code not in (0, None) and errors.getvalue().strip():
+        show_error("aesa-monitor", f"{errors.getvalue().strip()}\n\n설정: {SETTINGS_PATH}\n로그: {LOG_PATH}")
+    return code or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

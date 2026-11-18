@@ -40,3 +40,9 @@ adp_detection_*.csv
 *~
 .DS_Store
 Thumbs.db
+
+# Windows 실행파일 빌드 (exe와 중간 파일은 위의 build/, dist/로 무시된다)
+# 실행·빌드 로그
+*.log
+# 환경 점검 결과 (이 PC의 IP·MAC 주소가 들어 있다)
+windows/check_env.txt
