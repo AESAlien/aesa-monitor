@@ -36,7 +36,7 @@ DEFAULT_SERVER_IP=192.168.10.20
 DEFAULT_SERVER_PORT=3200
 SD_DEVICE=/dev/mmcblk0p1
 SD_MOUNT=/mnt/sd
-PID_FILE="$WORK_DIR/adp.pid"   # "PID 시작시각" (시작시각: /proc/PID/stat 22번째 칸, 부팅 후 클럭 틱)
+PID_FILE="$WORK_DIR/adp.pid"   # "PID 시작시각 부팅ID" (시작시각: /proc/PID/stat 22번째 칸, 부팅 후 클럭 틱)
 PORT_WAIT_SECONDS=15   # 처리부가 서버 포트를 열 때까지 기다리는 시간
 STOP_WAIT_SECONDS=10   # SIGTERM 뒤 처리부가 끝나기를 기다리는 시간
 BIN=adp
@@ -119,6 +119,11 @@ proc_field() {
     sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f"$2"
 }
 
+boot_id() {
+    # 부팅마다 바뀌는 ID. 비정상 재부팅 뒤 남은 PID 파일을 알아보는 데 쓴다.
+    cat /proc/sys/kernel/random/boot_id 2>/dev/null
+}
+
 saved_pid() {
     # PID 파일의 PID (검증하지 않음, 메시지용)
     [ -f "$PID_FILE" ] && cut -d' ' -f1 "$PID_FILE" 2>/dev/null
@@ -126,21 +131,25 @@ saved_pid() {
 
 running_pid() {
     # PID 파일의 처리부가 지금도 살아 있으면 PID를 출력한다.
-    # 처리부가 죽은 뒤 같은 PID를 다른 프로세스가 받았을 수 있으므로, 저장한 시작시각과 같은지 확인한다.
+    # 처리부가 죽거나 보드가 재부팅된 뒤 같은 PID를 다른 프로세스가 받았을 수 있으므로 셋을 모두 확인한다.
+    #   1. 실행 파일이 작업 폴더의 adp인지 (항상)
+    #   2. 시작시각이 저장한 값과 같은지 (PID 파일에 있을 때)
+    #   3. 부팅 ID가 지금과 같은지 (PID 파일에 있을 때). 시작시각은 부팅마다 0부터 다시 센다.
     [ -f "$PID_FILE" ] || return 1
-    read -r pid started < "$PID_FILE" || [ -n "$pid" ] || return 1
+    read -r pid started booted < "$PID_FILE" || [ -n "$pid" ] || return 1
     case "$pid" in ''|*[!0-9]*) return 1 ;; esac
     [ -d "/proc/$pid" ] || return 1
     # 끝났지만 아직 거둬지지 않은 프로세스(좀비, 상태 Z)는 실행 중이 아니다.
     [ "$(proc_field "$pid" 1)" != "Z" ] || return 1
+    case "$(readlink "/proc/$pid/exe" 2>/dev/null)" in
+        "$WORK_DIR/$BIN"|"$WORK_DIR/$BIN (deleted)") ;;
+        *) return 1 ;;
+    esac
     if [ -n "$started" ]; then
         [ "$(proc_field "$pid" 20)" = "$started" ] || return 1
-    else
-        # 시작시각이 없는 예전 PID 파일: 실행 파일이 작업 폴더의 adp인지로 확인한다.
-        case "$(readlink "/proc/$pid/exe" 2>/dev/null)" in
-            "$WORK_DIR/$BIN"|"$WORK_DIR/$BIN (deleted)") ;;
-            *) return 1 ;;
-        esac
+    fi
+    if [ -n "$booted" ]; then
+        [ "$(boot_id)" = "$booted" ] || return 1
     fi
     echo "$pid"
 }
@@ -239,7 +248,7 @@ do_start() {
     say "처리부 시작 ($(head -n 1 COMMIT 2>/dev/null))"
     nohup "./$BIN" >> logs/console.out 2>&1 < /dev/null &
     pid=$!
-    echo "$pid $(proc_field "$pid" 20)" > "$PID_FILE"
+    echo "$pid $(proc_field "$pid" 20) $(boot_id)" > "$PID_FILE"
     i=0
     while [ $i -lt $PORT_WAIT_SECONDS ]; do
         sleep 1

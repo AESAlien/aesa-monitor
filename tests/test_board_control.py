@@ -128,10 +128,30 @@ if __name__ == "__main__":
     unittest.main()
 
 
-@unittest.skipIf(os.name == "nt" or not shutil.which("sh") or not shutil.which("sha256sum") or not shutil.which("nohup"),
-                 "POSIX 셸 필요")
+# 가짜 처리부. run_aesa.sh가 /proc/PID/exe로 작업 폴더의 adp인지 확인하므로 셸 스크립트가 아닌 실행 파일이어야 한다.
+FAKE_ADP_SOURCE = r"""
+#include <signal.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
+static volatile sig_atomic_t stop;
+static void on_term(int signal_number) { (void)signal_number; stop = 1; }
+int main(void) {
+    mkdir("logs", 0755);
+    FILE *log = fopen("logs/adp_20261119_100000.log", "w");
+    if (log) { fputs("run\n", log); fclose(log); }
+    signal(SIGTERM, on_term);
+    while (!stop) usleep(100000);
+    return 0;
+}
+"""
+C_COMPILER = shutil.which("cc") or shutil.which("gcc")
+
+
+@unittest.skipIf(os.name == "nt" or not shutil.which("sh") or not shutil.which("sha256sum") or not shutil.which("nohup")
+                 or not C_COMPILER, "POSIX 셸과 C 컴파일러 필요")
 class RunAesaScriptTest(unittest.TestCase):
-    """보드 run_aesa.sh를 가짜 id·ip·date·netstat·poweroff로 실행한다(보드 없이 실패 처리 확인)."""
+    """보드 run_aesa.sh를 가짜 id·ip·date·netstat·poweroff와 가짜 adp로 실행한다(보드 없이 실패 처리 확인)."""
 
     def setUp(self):
         self.folder = Path(tempfile.mkdtemp())
@@ -155,9 +175,9 @@ class RunAesaScriptTest(unittest.TestCase):
             path = self.stub / name
             path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
             path.chmod(0o755)
-        adp = self.fat / "adp"
-        adp.write_text("#!/bin/sh\nmkdir -p logs; echo run > logs/adp_20261119_100000.log\n"
-                       "trap 'exit 0' TERM\nwhile :; do sleep 0.2; done\n", encoding="utf-8")
+        source = self.folder / "fake_adp.c"
+        source.write_text(FAKE_ADP_SOURCE, encoding="utf-8")
+        subprocess.run([C_COMPILER, "-o", str(self.fat / "adp"), str(source)], check=True)
         (self.fat / "aesa.env").write_text("COMM_SERVER_ADDRESS=192.168.10.20\nCOMM_SERVER_PORT=3200\n",
                                            encoding="utf-8")
         subprocess.run("sha256sum adp > SHA256SUMS", shell=True, cwd=self.fat, check=True)
@@ -258,11 +278,39 @@ class RunAesaScriptTest(unittest.TestCase):
         self.others = getattr(self, "others", []) + [process]
         return process
 
-    def test_pid_file_records_start_time(self):
+    def test_pid_file_records_start_time_and_boot_id(self):
         self.start()
-        pid, started = (self.work / "adp.pid").read_text().split()
-        stat = Path(f"/proc/{pid}/stat").read_text()
-        self.assertEqual(stat.rsplit(") ", 1)[1].split()[19], started)
+        pid, started, booted = (self.work / "adp.pid").read_text().split()
+        self.assertEqual(self.start_time(int(pid)), started)
+        self.assertEqual(Path("/proc/sys/kernel/random/boot_id").read_text().strip(), booted)
+
+    @staticmethod
+    def start_time(pid):
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+
+    @staticmethod
+    def boot_id():
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+    def test_stop_ignores_other_executable_with_matching_start_time_and_boot(self):
+        # 비정상 재부팅 뒤 같은 PID·같은 시작시각을 받은 다른 프로그램 흉내: 실행 파일 확인으로 걸러야 한다.
+        for with_boot_id in (False, True):  # 부팅 ID 없는 PID 파일(이전 버전)과 있는 파일
+            with self.subTest(with_boot_id=with_boot_id):
+                other = self.unrelated_process()
+                line = f"{other.pid} {self.start_time(other.pid)}" + (f" {self.boot_id()}" if with_boot_id else "")
+                (self.work / "adp.pid").write_text(line + "\n", encoding="utf-8")
+                result = self.run_script("stop")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("이미 종료", result.stdout)
+                self.assertIsNone(other.poll(), "다른 프로세스에 신호를 보냈음")
+
+    def test_pid_file_from_previous_boot_is_not_running(self):
+        self.start()
+        pid, started, _ = (self.work / "adp.pid").read_text().split()
+        (self.work / "adp.pid").write_text(f"{pid} {started} 00000000-0000-0000-0000-000000000000\n",
+                                           encoding="utf-8")
+        self.assertIn("실행 중 아님", self.run_script("status").stdout)
+        subprocess.run(["kill", "-9", pid], check=True)  # 정리(이 프로세스는 이제 PID 파일로 찾지 못함)
 
     def test_stop_does_not_signal_reused_pid(self):
         other = self.unrelated_process()
