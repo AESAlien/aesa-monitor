@@ -105,7 +105,7 @@ try {
     Write-Host "  1) 작업 표시줄에서 SD '안전하게 제거' 후 보드에 꽂기"
     Write-Host "  2) 보드 시리얼에서 petalinux 로그인 후: sudo sh /run/media/mmcblk0p1/aesa/install_board.sh"
     Write-Host "  3) 모니터 [메뉴] -> [처리부 제어] -> [상태]"
-    Write-Host "     또는: ssh -i `"$key`" petalinux@192.168.10.20 `"sudo -n aesactl status`""
+    Write-Host "     또는: ssh -i `"$key`" -o HostKeyAlgorithms=+ssh-rsa petalinux@192.168.10.20 `"sudo -n /usr/local/sbin/aesactl status`""
 } catch {
     Write-Host ""
     Write-Host "실패: $($_.Exception.Message)" -ForegroundColor Red

@@ -1,6 +1,8 @@
+import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -124,3 +126,125 @@ class BoardScriptTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(os.name == "nt" or not shutil.which("sh") or not shutil.which("sha256sum") or not shutil.which("nohup"),
+                 "POSIX 셸 필요")
+class RunAesaScriptTest(unittest.TestCase):
+    """보드 run_aesa.sh를 가짜 id·ip·date·netstat·poweroff로 실행한다(보드 없이 실패 처리 확인)."""
+
+    def setUp(self):
+        self.folder = Path(tempfile.mkdtemp())
+        self.addCleanup(self._cleanup)
+        self.stub = self.folder / "stub"
+        self.fat = self.folder / "fat" / "aesa"
+        self.work = self.folder / "work"
+        for path in (self.stub, self.fat, self.work):
+            path.mkdir(parents=True)
+        stubs = {
+            "id": "echo 0",
+            "ip": f'case "$*" in *"-o addr"*) echo "2: eth0 inet 192.168.10.20/24";; '
+                  f'*"addr show"*) echo "    inet 192.168.10.20/24";; esac; exit 0',
+            "date": f'[ "$1" = "-s" ] && exit 0; /bin/date "$@"',
+            "netstat": f'[ -f "{self.folder}/listen" ] && [ -f "{self.work}/adp.pid" ] && '
+                       f'kill -0 "$(cat "{self.work}/adp.pid")" 2>/dev/null && '
+                       f'echo "tcp 0 0 0.0.0.0:3200 0.0.0.0:* LISTEN"; exit 0',
+            "poweroff": f'touch "{self.folder}/powered-off"',
+        }
+        for name, body in stubs.items():
+            path = self.stub / name
+            path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+            path.chmod(0o755)
+        adp = self.fat / "adp"
+        adp.write_text("#!/bin/sh\nmkdir -p logs; echo run > logs/adp_20261119_100000.log\n"
+                       "trap 'exit 0' TERM\nwhile :; do sleep 0.2; done\n", encoding="utf-8")
+        (self.fat / "aesa.env").write_text("COMM_SERVER_ADDRESS=192.168.10.20\nCOMM_SERVER_PORT=3200\n",
+                                           encoding="utf-8")
+        subprocess.run("sha256sum adp > SHA256SUMS", shell=True, cwd=self.fat, check=True)
+        text = (ROOT / "board" / "run_aesa.sh").read_text(encoding="utf-8")
+        replacements = {
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH": f"PATH={self.stub}:$PATH",
+            "WORK_DIR=/opt/aesa": f"WORK_DIR={self.work}",
+            "SD_DEVICE=/dev/mmcblk0p1": "SD_DEVICE=/dev/aesa-test-none",
+            "PORT_WAIT_SECONDS=15": "PORT_WAIT_SECONDS=2",
+            "STOP_WAIT_SECONDS=10": "STOP_WAIT_SECONDS=2",
+        }
+        for old, new in replacements.items():
+            self.assertIn(old, text)
+            text = text.replace(old, new)
+        self.script = self.fat / "run_aesa.sh"
+        self.script.write_text(text, encoding="utf-8")
+
+    def _cleanup(self):
+        pid_file = self.work / "adp.pid"
+        if pid_file.is_file():
+            subprocess.run(["kill", "-9", pid_file.read_text().strip()], capture_output=True)
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def run_script(self, *arguments):
+        return subprocess.run(["sh", str(self.script), *arguments], capture_output=True, text=True, timeout=30)
+
+    def start(self):
+        (self.folder / "listen").touch()
+        result = self.run_script("start")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def break_fat_logs(self):
+        (self.fat / "logs").write_text("FAT에 logs 폴더를 만들 수 없게 같은 이름의 파일", encoding="utf-8")
+
+    def test_start_fails_when_port_never_opens(self):
+        result = self.run_script("start")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("포트가 열리지 않았습니다", result.stderr)
+
+    def test_start_then_stop_copies_logs(self):
+        self.start()
+        result = self.run_script("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.fat / "logs" / "adp_20261119_100000.log").is_file())
+
+    def test_stop_fails_when_log_folder_cannot_be_made(self):
+        self.start()
+        self.break_fat_logs()
+        result = self.run_script("stop")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("logs 폴더를 만들지 못했습니다", result.stderr)
+
+    def test_stop_fails_when_copy_fails(self):
+        self.start()
+        (self.fat / "logs").mkdir()
+        (self.fat / "logs" / "adp_20261119_100000.log").symlink_to(self.folder / "없는폴더" / "x.log")
+        result = self.run_script("stop")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("복사하지 못했습니다", result.stderr)
+        self.assertNotIn("SD FAT로 복사:", result.stdout)
+
+    def test_stop_after_crash_still_saves_logs(self):
+        self.start()
+        subprocess.run(["kill", "-9", (self.work / "adp.pid").read_text().strip()], check=True)
+        time.sleep(0.3)
+        result = self.run_script("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("이미 종료", result.stdout)
+        self.assertFalse((self.work / "adp.pid").exists())
+        self.assertTrue((self.fat / "logs" / "adp_20261119_100000.log").is_file())
+
+    def test_poweroff_reports_copy_failure_but_powers_off(self):
+        self.start()
+        self.break_fat_logs()
+        result = self.run_script("poweroff")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("복사하지 못한 채 보드를 끕니다", result.stderr)
+        deadline = time.monotonic() + 5
+        while not (self.folder / "powered-off").exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertTrue((self.folder / "powered-off").exists())
+
+    def test_restart_reports_copy_failure_but_restarts(self):
+        self.start()
+        self.break_fat_logs()
+        result = self.run_script("restart")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("다시 시작했지만", result.stderr)
+        self.assertIn("실행 중", self.run_script("status").stdout)

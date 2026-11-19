@@ -32,7 +32,7 @@ AESA 데이터 처리부 - 시연용 묶음 (Zybo Z7, PetaLinux 2022, SD 부팅)
      리눅스 PC에서 SD를 직접 고칠 수도 있다(보드 없이):
        sudo sh <FAT 마운트>/aesa/install_board.sh --root <ext4 마운트>
   4) 노트북에서 확인 (모니터 [메뉴] -> [처리부 제어] -> [상태])
-       또는 명령 프롬프트: ssh -i %USERPROFILE%\.ssh\aesa_board_ed25519 petalinux@192.168.10.20 "sudo -n aesactl status"
+       또는 명령 프롬프트: ssh -i %USERPROFILE%\.ssh\aesa_board_ed25519 -o HostKeyAlgorithms=+ssh-rsa petalinux@192.168.10.20 "sudo -n /usr/local/sbin/aesactl status"
 
 [시연 순서]
   보드 전원 -> (부팅이 끝나면 IP 192.168.10.20이 자동으로 들어간다)
@@ -42,8 +42,10 @@ AESA 데이터 처리부 - 시연용 묶음 (Zybo Z7, PetaLinux 2022, SD 부팅)
       (ext4라 전원을 바로 뽑지 않는다. 그냥 끄더라도 poweroff/reboot 때는 처리부를 멈추고 로그를 SD로 복사한다)
 
 [보드에서 직접] (시리얼 또는 ssh)
-  sudo aesactl start ['YYYY-MM-DD HH:MM:SS']   시각을 주면 먼저 보드 시각을 맞춘다
-  sudo aesactl stop | restart | status | log | savelog | settime '시각' | poweroff
+  sudo /usr/local/sbin/aesactl start ['YYYY-MM-DD HH:MM:SS']   시각을 주면 먼저 보드 시각을 맞춘다
+  sudo /usr/local/sbin/aesactl stop | restart | status | log | savelog | settime '시각' | poweroff
+  (ssh로 접속하면 PATH에 /usr/local/sbin이 없을 수 있어 전체 경로로 쓴다. 보드 호스트 키가 RSA라 노트북 ssh에는 -o HostKeyAlgorithms=+ssh-rsa가 필요)
+  start는 포트가 15초 안에 열리지 않으면, stop·poweroff·savelog는 로그를 SD로 복사하지 못하면 실패로 끝난다.
   설치 전에는 sudo sh /run/media/mmcblk0p1/aesa/run_aesa.sh <명령> 으로 같은 일을 한다.
 
 [참고]

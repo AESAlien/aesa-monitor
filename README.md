@@ -229,7 +229,8 @@ python3 -m aesa_monitor.io.log_fetch --source ssh --target petalinux@192.168.10.
 
 ## 처리부 제어 (보드)
 
-상단 `메뉴`의 `처리부 제어`는 `aesa_monitor/io/board_control.py`로 보드의 `aesactl`을 ssh로 실행한다.
+상단 `메뉴`의 `처리부 제어`는 `aesa_monitor/io/board_control.py`로 보드의 `aesactl`을 ssh로 실행한다(전체 경로 `/usr/local/sbin/aesactl`).
+실패(포트가 열리지 않음, 로그를 SD로 복사하지 못함 등)는 보드 스크립트의 종료 코드로 전달되어 창에 `실패`로 보인다.
 접속 정보는 로그 가져오기와 같은 `MONITOR_LOG_SSH_*`를 쓴다.
 
 | 버튼 | 보드에서 실행 | 비고 |

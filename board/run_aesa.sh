@@ -3,13 +3,15 @@
 #
 # 두 곳에서 같은 스크립트를 쓴다.
 #   SD FAT:  sh <SD FAT>/aesa/run_aesa.sh <명령>        (설치 전, 시리얼에서)
-#   설치 후: sudo aesactl <명령>                        (install_board.sh가 /usr/local/sbin/aesactl로 복사)
+#   설치 후: sudo /usr/local/sbin/aesactl <명령>        (install_board.sh가 복사)
 #
 # 명령
 #   start [시각]    IP 설정 -> SD 원본 복사·검증 -> 백그라운드 실행 -> 포트 확인
 #                   시각("YYYY-MM-DD HH:MM:SS")을 주면 먼저 보드 시각을 맞춘다(로그 파일 이름이 이 시각을 쓴다).
+#                   PORT_WAIT_SECONDS 안에 포트가 열리지 않으면 실패(종료 코드 1). 처리부 프로세스는 남겨 둔다.
 #   stop            SIGTERM으로 종료 -> 로그를 SD FAT(aesa/logs)로 복사
-#   restart [시각]
+#                   처리부가 이미 끝나 있어도(비정상 종료) 로그는 복사한다. 복사에 실패하면 종료 코드 1.
+#   restart [시각]  stop의 로그 복사가 실패해도 다시 시작하고, 끝에 실패(종료 코드 1)로 알린다.
 #   status          실행 여부, IP, 포트, 연결, 최근 로그
 #   log             최신 adp_*.log 실시간 보기 (Ctrl+C로 나가도 처리부는 계속 실행)
 #   savelog         로그만 SD FAT로 복사
@@ -17,6 +19,7 @@
 #   net             eth0에 처리부 IP만 넣는다
 #   boot            부팅 때 init이 부른다: net, 그리고 board.conf의 AESA_AUTOSTART=1이면 start
 #   poweroff        처리부 종료·로그 저장 후 보드를 끈다 (ext4라 전원을 바로 뽑지 않는다)
+#                   로그 복사가 실패해도 보드는 끈다(로그는 ext4의 /opt/aesa/logs에 남는다). 이때 종료 코드 1.
 #
 # 원본(SD FAT)은 실행 권한이 없으므로 ext4의 작업 폴더로 복사해서 실행한다.
 # 처리부는 작업 폴더의 .env와 logs/를 상대 경로로 쓴다.
@@ -34,11 +37,14 @@ DEFAULT_SERVER_PORT=3200
 SD_DEVICE=/dev/mmcblk0p1
 SD_MOUNT=/mnt/sd
 PID_FILE="$WORK_DIR/adp.pid"
+PORT_WAIT_SECONDS=15   # 처리부가 서버 포트를 열 때까지 기다리는 시간
+STOP_WAIT_SECONDS=10   # SIGTERM 뒤 처리부가 끝나기를 기다리는 시간
 BIN=adp
 ENV_SRC=aesa.env
 
 say() { echo "[aesa] $*"; }
-die() { echo "[aesa] 오류: $*" >&2; exit 1; }
+fail() { echo "[aesa] 오류: $*" >&2; }
+die() { fail "$@"; exit 1; }
 
 # root가 아니면 sudo로 다시 실행한다 (IP 설정, /opt 쓰기, 시각 설정에 root 필요).
 if [ "$(id -u)" -ne 0 ]; then
@@ -112,6 +118,8 @@ running_pid() {
     [ -f "$PID_FILE" ] || return 1
     pid=$(cat "$PID_FILE" 2>/dev/null)
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ -d "/proc/$pid" ] || return 1
+    # 끝났지만 아직 거둬지지 않은 프로세스(좀비, 상태 Z)는 실행 중이 아니다.
+    [ "$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f1)" != "Z" ] || return 1
     echo "$pid"
 }
 
@@ -177,11 +185,27 @@ copy_files() {
 }
 
 save_logs() {
-    [ -d "$WORK_DIR/logs" ] || { say "저장할 로그가 없습니다."; return 0; }
-    [ -n "$SRC_DIR" ] || { say "SD FAT를 찾지 못해 로그를 복사하지 않았습니다 (보드: $WORK_DIR/logs)."; return 0; }
-    mkdir -p "$SRC_DIR/logs" && cp "$WORK_DIR"/logs/* "$SRC_DIR/logs/" 2>/dev/null
-    sync
-    say "로그를 SD FAT로 복사: $SRC_DIR/logs"
+    # 작업 폴더의 로그를 SD FAT로 복사한다. 하나라도 복사하지 못하면 1을 돌려준다(로그는 보드에 그대로 남는다).
+    set -- "$WORK_DIR"/logs/*
+    [ -e "$1" ] || { say "저장할 로그가 없습니다."; return 0; }
+    if [ -z "$SRC_DIR" ]; then
+        fail "SD FAT를 찾지 못해 로그를 복사하지 못했습니다 (보드: $WORK_DIR/logs)."
+        return 1
+    fi
+    if ! mkdir -p "$SRC_DIR/logs" 2>/dev/null; then
+        fail "SD FAT에 logs 폴더를 만들지 못했습니다: $SRC_DIR/logs (보드: $WORK_DIR/logs)"
+        return 1
+    fi
+    if ! cp "$@" "$SRC_DIR/logs/"; then
+        sync
+        fail "로그를 SD FAT로 복사하지 못했습니다 (SD가 가득 찼거나 읽기 전용일 수 있음). 보드: $WORK_DIR/logs"
+        return 1
+    fi
+    if ! sync; then
+        fail "SD FAT 쓰기(sync)에 실패했습니다. 보드: $WORK_DIR/logs"
+        return 1
+    fi
+    say "로그 $#개를 SD FAT로 복사: $SRC_DIR/logs"
 }
 
 do_start() {
@@ -194,27 +218,35 @@ do_start() {
     nohup "./$BIN" >> logs/console.out 2>&1 < /dev/null &
     echo $! > "$PID_FILE"
     i=0
-    while [ $i -lt 10 ]; do
+    while [ $i -lt $PORT_WAIT_SECONDS ]; do
         sleep 1
-        pid=$(running_pid) || { say "처리부가 바로 종료되었습니다. 최근 로그:"; tail -n 15 logs/console.out "$(latest_log)" 2>/dev/null; exit 1; }
+        pid=$(running_pid) || { fail "처리부가 바로 종료되었습니다. 최근 로그:"; tail -n 15 logs/console.out "$(latest_log)" >&2 2>/dev/null; exit 1; }
         if listening; then
             say "실행 중: PID $pid, $SERVER_IP:$SERVER_PORT 대기"
             return 0
         fi
         i=$((i + 1))
     done
-    say "주의: 10초가 지나도 $SERVER_PORT 포트가 열리지 않았습니다. status로 확인하세요."
+    # 프로세스는 살아 있지만 접속을 받지 못한다(멈춤·설정 오류). 성공으로 알리면 실험을 시작해 버리므로 실패로 끝낸다.
+    tail -n 15 logs/console.out "$(latest_log)" >&2 2>/dev/null
+    die "${PORT_WAIT_SECONDS}초가 지나도 $SERVER_PORT 포트가 열리지 않았습니다. 처리부(PID $pid)는 남아 있습니다. 위 로그를 확인하고 stop 후 다시 시작하세요."
 }
 
 do_stop() {
-    pid=$(running_pid) || { say "실행 중이 아닙니다."; rm -f "$PID_FILE"; return 0; }
-    say "종료 요청 (SIGTERM, PID $pid)"
-    kill -TERM "$pid"
-    i=0
-    while [ $i -lt 10 ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
-    if kill -0 "$pid" 2>/dev/null; then
-        say "10초 안에 끝나지 않아 강제 종료 (SIGKILL)"
-        kill -KILL "$pid" 2>/dev/null
+    if pid=$(running_pid); then
+        say "종료 요청 (SIGTERM, PID $pid)"
+        kill -TERM "$pid"
+        i=0
+        while [ $i -lt $STOP_WAIT_SECONDS ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+        if kill -0 "$pid" 2>/dev/null; then
+            say "${STOP_WAIT_SECONDS}초 안에 끝나지 않아 강제 종료 (SIGKILL)"
+            kill -KILL "$pid" 2>/dev/null
+        fi
+    elif [ -f "$PID_FILE" ]; then
+        # 처리부가 먼저 끝났다(비정상 종료 등). 이 실행의 로그가 가장 필요하므로 그래도 복사한다.
+        say "처리부가 이미 종료되어 있습니다 (PID 파일: $(cat "$PID_FILE" 2>/dev/null)). 로그는 복사합니다."
+    else
+        say "실행 중이 아닙니다."
     fi
     rm -f "$PID_FILE"
     save_logs
@@ -241,19 +273,29 @@ do_boot() {
 }
 
 do_poweroff() {
-    running_pid >/dev/null && do_stop
+    # 로그 복사가 실패해도 끈다. 끄지 않으면 전원을 그냥 뽑게 되어 ext4가 더 위험하다. 로그는 /opt/aesa/logs에 남는다.
+    do_stop
+    status=$?
     sync
     say "보드를 끕니다. 10초쯤 기다린 뒤 전원을 빼세요."
     (sleep 1; poweroff) >/dev/null 2>&1 &
+    [ $status -eq 0 ] || die "로그를 SD FAT로 복사하지 못한 채 보드를 끕니다. 다음 부팅 후 savelog로 다시 복사하세요."
+}
+
+do_restart() {
+    do_stop
+    status=$?
+    do_start "$1"
+    [ $status -eq 0 ] || die "처리부는 다시 시작했지만 이전 실행의 로그를 SD FAT로 복사하지 못했습니다. 보드: $WORK_DIR/logs"
 }
 
 case "$1" in
     start)    do_start "$2" ;;
-    stop)     do_stop ;;
-    restart)  do_stop; do_start "$2" ;;
+    stop)     do_stop || exit 1 ;;
+    restart)  do_restart "$2" ;;
     status)   do_status ;;
     log)      log=$(latest_log); [ -n "$log" ] || die "로그가 없습니다."; tail -f "$log" ;;
-    savelog)  save_logs ;;
+    savelog)  save_logs || exit 1 ;;
     settime)  [ -n "$2" ] || die "사용법: settime 'YYYY-MM-DD HH:MM:SS'"; set_time "$2" ;;
     net)      setup_ip ;;
     boot)     do_boot ;;

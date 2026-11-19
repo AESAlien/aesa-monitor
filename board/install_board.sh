@@ -218,7 +218,7 @@ if [ -z "$(passwd_field "$ACCOUNT" 1)" ]; then
 else
     HOME_DIR=$(passwd_field "$ACCOUNT" 6)
     if [ ! -x "$ROOT/usr/bin/sudo" ] && [ ! -x "$ROOT/bin/sudo" ]; then
-        warn "sudo가 설치되어 있지 않습니다. 모니터 버튼(sudo -n aesactl)이 동작하지 않습니다. 이미지에 sudo를 넣거나 root 계정을 써야 합니다."
+        warn "sudo가 설치되어 있지 않습니다. 모니터 버튼(sudo -n /usr/local/sbin/aesactl)이 동작하지 않습니다. 이미지에 sudo를 넣거나 root 계정을 써야 합니다."
     fi
     mkdir -p "$ROOT/etc/sudoers.d"
     chmod 755 "$ROOT/etc/sudoers.d"
@@ -289,6 +289,6 @@ if [ -z "$ROOT" ]; then
 fi
 
 say "끝 (주의 ${WARNINGS}개)"
-say "확인: 노트북에서 ssh $ACCOUNT@$SERVER_IP 'sudo -n aesactl status'"
+say "확인: 노트북에서 ssh -o HostKeyAlgorithms=+ssh-rsa $ACCOUNT@$SERVER_IP 'sudo -n /usr/local/sbin/aesactl status'"
 [ -n "$ROOT" ] && say "SD를 안전하게 꺼낸 뒤(umount) 보드에 꽂으세요."
 exit 0
