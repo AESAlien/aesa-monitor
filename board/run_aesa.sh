@@ -22,6 +22,7 @@
 #   net             eth0에 처리부 IP만 넣는다
 #   boot            부팅 때 init이 부른다: net, 그리고 board.conf의 AESA_AUTOSTART=1이면 start
 #   poweroff        처리부 종료·로그 저장 후 보드를 끈다 (ext4라 전원을 바로 뽑지 않는다)
+#   (start·stop·restart·poweroff·savelog·boot는 잠금으로 한 번에 하나만 실행한다. 겹치면 나중 명령이 실패)
 #                   로그 복사가 실패해도 보드는 끈다(로그는 ext4의 /opt/aesa/logs에 남는다). 이때 종료 코드 1.
 #
 # 원본(SD FAT)은 실행 권한이 없으므로 ext4의 작업 폴더로 복사해서 실행한다.
@@ -43,6 +44,7 @@ PID_FILE="$WORK_DIR/adp.pid"   # "PID 시작시각 부팅ID" (시작시각: /pro
 PORT_WAIT_SECONDS=15   # 처리부가 서버 포트를 열 때까지 기다리는 시간
 STOP_WAIT_SECONDS=10   # SIGTERM 뒤 처리부가 끝나기를 기다리는 시간
 SAVE_STATE="$WORK_DIR/savelog.state"   # 마지막 로그 저장 결과 (status에 보임)
+LOCK_DIR=/run/aesactl.lock             # 바꾸는 명령은 한 번에 하나만 (재부팅하면 사라지는 /run)
 BIN=adp
 ENV_SRC=aesa.env
 
@@ -363,6 +365,28 @@ do_restart() {
     do_start "$1"
     [ $status -eq 0 ] || die "처리부는 다시 시작했지만 이전 실행의 로그를 SD FAT로 복사하지 못했습니다. 보드: $WORK_DIR/logs"
 }
+
+acquire_lock() {
+    # 처리부를 바꾸는 명령(start·stop·restart·poweroff·savelog·boot)은 한 번에 하나만 실행한다.
+    # 모니터 창을 닫았다 다시 열거나 두 노트북에서 동시에 눌러도, 앞 명령이 끝나기 전에는 거부한다.
+    # 앞 명령의 프로세스가 이미 없으면(강제 종료 등) 남은 잠금을 지우고 가져온다.
+    [ -d "$(dirname "$LOCK_DIR")" ] || LOCK_DIR=/tmp/aesactl.lock
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        holder=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+        if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+            die "다른 aesactl 명령이 실행 중입니다 ($(cat "$LOCK_DIR/command" 2>/dev/null), PID $holder). 끝난 뒤 다시 하세요."
+        fi
+        rm -rf "$LOCK_DIR"
+        mkdir "$LOCK_DIR" 2>/dev/null || die "잠금($LOCK_DIR)을 만들지 못했습니다."
+    fi
+    echo $$ > "$LOCK_DIR/pid"
+    echo "$*" > "$LOCK_DIR/command"
+    trap 'rm -rf "$LOCK_DIR"' EXIT
+}
+
+case "$1" in
+    start|stop|restart|poweroff|savelog|boot) acquire_lock "$1" ;;
+esac
 
 # 로그를 복사하는 명령은 ssh가 먼저 끊겨도(모니터 제한 시간) 끝까지 복사하고 결과를 SAVE_STATE에 남긴다.
 case "$1" in

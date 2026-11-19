@@ -215,6 +215,7 @@ class RunAesaScriptTest(unittest.TestCase):
             "SD_DEVICE=/dev/mmcblk0p1": "SD_DEVICE=/dev/aesa-test-none",
             "PORT_WAIT_SECONDS=15": "PORT_WAIT_SECONDS=2",
             "STOP_WAIT_SECONDS=10": "STOP_WAIT_SECONDS=2",
+            "LOCK_DIR=/run/aesactl.lock": f"LOCK_DIR={self.folder}/aesactl.lock",
         }
         for old, new in replacements.items():
             self.assertIn(old, text)
@@ -393,3 +394,34 @@ class RunAesaScriptTest(unittest.TestCase):
         subprocess.run(command, shell=True, timeout=30)
         self.assertTrue((self.fat / "logs" / "adp_20261119_100000.log").is_file())
         self.assertIn("완료: 복사", (self.work / "savelog.state").read_text(encoding="utf-8"))
+
+    def hold_lock(self, pid, command="stop"):
+        lock = self.folder / "aesactl.lock"
+        lock.mkdir()
+        (lock / "pid").write_text(f"{pid}\n", encoding="utf-8")
+        (lock / "command").write_text(f"{command}\n", encoding="utf-8")
+        return lock
+
+    def test_command_is_refused_while_another_holds_the_lock(self):
+        # 앞 명령(예: 중지 중 로그 복사)이 끝나기 전에 다른 창·노트북에서 보낸 시작은 거부한다.
+        other = self.unrelated_process()
+        lock = self.hold_lock(other.pid)
+        (self.folder / "listen").touch()
+        result = self.run_script("start")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("다른 aesactl 명령이 실행 중", result.stderr)
+        self.assertFalse((self.work / "adp.pid").exists(), "처리부를 띄웠음")
+        self.assertTrue(lock.is_dir(), "남의 잠금을 지웠음")
+
+    def test_status_is_not_blocked_by_the_lock(self):
+        other = self.unrelated_process()
+        self.hold_lock(other.pid)
+        result = self.run_script("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stale_lock_is_taken_over_and_released(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        lock = self.hold_lock(dead.pid)
+        self.start()
+        self.assertFalse(lock.exists(), "명령이 끝났는데 잠금이 남음")
