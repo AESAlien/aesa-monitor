@@ -2,7 +2,7 @@ import unittest
 
 from aesa_monitor.core.config import TrackingParameters
 from aesa_monitor.core.events import PEER_SIMULATOR, ConnectionChanged, PeerLinkChanged
-from aesa_monitor.core.problems import BAD, WARN, scan_events
+from aesa_monitor.core.problems import BAD, MASS_LOSS_WINDOW_MS, WARN, ProblemDetector, scan_events
 from aesa_monitor.core.protocol import (
     Beam, BeamType, Detection, MonitorStatus, OperatorControl, Plot, Track, TrackList,
 )
@@ -170,9 +170,10 @@ class OffBeamTest(unittest.TestCase):
         self.assertEqual([problem for problem in problems if problem.track_id == 7], [])
 
 
-def tracked(recording, track_ids, until_ms, missed=(), unanswered_at=None, ends=None):
+def tracked(recording, track_ids, until_ms, missed=(), unanswered_at=None, ends=None, keep_listed=False):
     """트랙들을 추적 주기마다 갱신한다. missed: {(트랙, 빔 시각)} 미탐, unanswered_at: 결과 없이 나간 마지막 빔 시각.
-    ends: {트랙: 시각} 그 시각부터 처리부 트랙 목록에서 빠지는 트랙(없으면 until_ms까지 유지).
+    ends: {트랙: 시각} 그 시각부터 빔이 나가지 않고 처리부 트랙 목록에서 빠지는 트랙(없으면 until_ms까지 유지).
+    keep_listed: ends가 지난 트랙도 until_ms까지 트랙 목록에 남긴다(한 번에 여러 트랙이 사라지는 경우).
 
     트랙마다 빔 슬롯을 1 ms씩 비켜 둔다. 반환: 마지막 갱신 시각 {트랙: 시각}.
     """
@@ -191,7 +192,8 @@ def tracked(recording, track_ids, until_ms, missed=(), unanswered_at=None, ends=
             recording.add(beam_ms + 1, Detection(BeamType.TRACKING, beam_ms, track_id, plots))
             if hit:
                 last[track_id] = beam_ms
-        recording.add(base + 50, TrackList([track(track_id, last[track_id]) for track_id in alive]))
+        listed = track_ids if keep_listed else alive
+        recording.add(base + 50, TrackList([track(track_id, last[track_id]) for track_id in listed]))
     if unanswered_at is not None:
         for offset, track_id in enumerate(track_ids):
             recording.add(unanswered_at + offset, Beam(BeamType.TRACKING, unanswered_at + offset, track_id, 0, 20.0,
@@ -326,6 +328,39 @@ class TrackEndTest(unittest.TestCase):
         groups = of_kind(problems, "mass-loss")
         self.assertEqual([group.amount for group in groups], [3, 3])
         self.assertFalse(groups[0].open)
+
+    def test_losses_seen_together_are_grouped_by_processor_time(self):
+        # 빠른 재생: 트랙 1(10초에 소실)과 트랙 7·8(5초에 소실)이 한 번에 목록에서 빠짐. 번호 순으로 보면 10초 → 5초 순이라
+        # 5초 넘게 떨어진 셋이 '3개 동시 소실'로 묶였다. 처리부 시각 순으로 보면 셋은 3초 창 하나에 들지 않는다.
+        limit = PARAMETERS.max_consecutive_tracking_misses
+        interval = PARAMETERS.tracking_interval_ms
+        early, late = [7, 8], [1]
+        early_end = 3005 + interval * limit
+        late_end = early_end + 5000
+        recording = Recording()
+        recording.beams(0, 16000, skip=tracking_slots(16000, 3))
+        misses = {(track_id, early_end - interval * (index + 1)) for track_id in early for index in range(limit)}
+        misses |= {(track_id, late_end - interval * (index + 1)) for track_id in late for index in range(limit)}
+        tracked(recording, late + early, late_end, missed=misses, ends={7: early_end, 8: early_end},
+                keep_listed=True)
+        recording.add(late_end + 100, TrackList([]))
+        problems = recording.scan()
+        self.assertEqual(of_kind(problems, "mass-loss"), [])
+        self.assertEqual(sorted(problem.track_id for problem in of_kind(problems, "ended")), [1, 7, 8])
+
+    def test_out_of_order_losses_group_only_within_window(self):
+        # 소실이 처리부 시각 순서대로 오지 않아도 결과가 같다: 3초 창 안의 셋만 묶이고, 창 밖 하나는 따로다.
+        for order in ([1, 7, 8, 9], [7, 1, 8, 9], [9, 8, 7, 1]):
+            with self.subTest(order=order):
+                detector = ProblemDetector(PARAMETERS)
+                at = {1: 10000, 7: 5000, 8: 5050, 9: 5100}
+                grouped = {track_id: detector._group_loss(track_id, [], at[track_id], 0.0, 4000)
+                           for track_id in order}
+                groups = of_kind(detector.problems, "mass-loss")
+                self.assertEqual([group.amount for group in groups], [3])
+                self.assertEqual(groups[0].start_ms, 5000)
+                self.assertLessEqual(groups[0].end_ms - groups[0].start_ms, MASS_LOSS_WINDOW_MS)
+                self.assertFalse(grouped[1])
 
     def test_reused_track_id_after_processor_restart_is_watched_again(self):
         # 재시작 전에 트랙 7이 영역 이탈(정상)로 분류되어도, 재시작 뒤 같은 번호의 새 트랙 미탐은 기록한다.

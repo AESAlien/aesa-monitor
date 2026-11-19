@@ -21,6 +21,7 @@ PeerLinkChanged)는 그 간격보다 짧게 끊겼다 이어질 수 있으므로
 
 from __future__ import annotations
 
+from bisect import insort
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
@@ -52,6 +53,7 @@ CLOCK_SAMPLES = 400
 # 시나리오 한 주기가 끝나 모의기가 표적을 없애면 모든 트랙이 함께 미탐 한도로 지워진다(2026-11-19 녹화: 10개가 1초 안에).
 MASS_LOSS_WINDOW_MS = 3000
 MASS_LOSS_MIN_TRACKS = 3
+MASS_LOSS_KEEP_MS = 3 * MASS_LOSS_WINDOW_MS   # 늦게 온 소실도 묶을 수 있게 최근 소실을 두는 시간
 
 CATEGORY_BEAM = "빔"
 CATEGORY_TRACK = "추적"
@@ -117,12 +119,13 @@ class ProblemDetector:
     _epoch: int = 0
     _samples: Deque[Tuple[int, float]] = field(default_factory=lambda: deque(maxlen=CLOCK_SAMPLES))
     _live_tracks: Set[int] = field(default_factory=set)
-    # 최근 미탐 한도로 사라진 트랙: (마지막 사이클 시각, 트랙, 끝 미탐 구간 시작 시각)
-    _recent_losses: Deque[Tuple[int, int, int]] = field(default_factory=deque)
+    # 최근 미탐 한도로 사라진 트랙: (마지막 사이클 시각, 트랙, 끝 미탐 구간 시작 시각). 시각 순으로 둔다.
+    _recent_losses: List[Tuple[int, int, int]] = field(default_factory=list)
     # 정상 종료(영역 이탈)나 동시 소실로 처리한 트랙. 늦게 확정되는 사이클의 미탐을 다시 기록하지 않는다.
     _quiet_tracks: Set[int] = field(default_factory=set)
     _mass_loss: Optional[Problem] = None
     _mass_loss_ids: Set[int] = field(default_factory=set)
+    _mass_loss_span: Tuple[int, int] = (0, 0)   # 지금 사건에 든 소실의 처음·마지막 처리부 시각
 
     # 바깥에서 쓰는 것
 
@@ -221,46 +224,71 @@ class ProblemDetector:
 
         MASS_LOSS_WINDOW_MS 안에 MASS_LOSS_MIN_TRACKS개 이상이면 트랙마다의 '미탐'·'종료' 대신
         '트랙 N개 동시 소실' 하나로 남긴다. 사건 하나로는 남기므로 모의기 정지 같은 이상도 사라지지 않는다.
-        한 사건은 첫 소실부터 MASS_LOSS_WINDOW_MS까지만 받는다. 그 뒤의 소실은 새 묶음으로 따로 센다
+        한 사건에 든 소실은 처음과 마지막이 MASS_LOSS_WINDOW_MS 안이다. 벗어나는 소실은 새 묶음으로 따로 센다
         (열린 사건의 유예 시간 안이라도 합치지 않는다: 4초 간격의 두 묶음이 '6개 동시 소실'이 되지 않게).
+        소실이 처리부 시각 순서대로 오지 않아도(빠른 재생에서 한 번에 여러 트랙이 사라짐, 처리부가 트랙을 지우는
+        때가 원인마다 다름) 묶음은 처리부 시각으로 정한다. 최근 소실은 시각 순으로 조금 넉넉히(MASS_LOSS_KEEP_MS) 두고,
+        이 소실을 포함하는 창 가운데 소실이 가장 많은 창을 고른다.
         """
         run_start = self._trailing_run_start(cycles)
-        self._recent_losses.append((last_ms, track_id, run_start if run_start is not None else last_ms))
-        while self._recent_losses and self._recent_losses[0][0] < last_ms - MASS_LOSS_WINDOW_MS:
-            self._recent_losses.popleft()
+        loss = (last_ms, track_id, run_start if run_start is not None else last_ms)
+        insort(self._recent_losses, loss)
+        newest_ms = self._recent_losses[-1][0]
+        self._recent_losses = [item for item in self._recent_losses if item[0] >= newest_ms - MASS_LOSS_KEEP_MS]
+        if loss not in self._recent_losses:
+            return False  # 이미 지난 소실들보다 한참 앞선 소실: 따로 기록한다
         group = self._mass_loss
         item = self._open.get(("mass-loss", None))
         if item is None or item.problem is not group:
             group = None  # 유예 시간이 지나 이미 닫혔다
-        if group is not None and group.start_ms is not None and last_ms - group.start_ms > MASS_LOSS_WINDOW_MS:
+        low, high = self._mass_loss_span
+        if group is not None and max(high, last_ms) - min(low, last_ms) > MASS_LOSS_WINDOW_MS:
+            if last_ms < low:
+                return False  # 지금 사건보다 앞선 소실이 늦게 왔다: 사건은 그대로 두고 따로 기록한다
             group = None
         if group is None:
             # 새 묶음은 언제나 새 사건이다. 열린 동시 소실 사건이 남아 있어도 _report가 그것에 붙이지 않게 닫는다.
             self._close_mass_loss()
         # 이미 어느 사건에 들어간 소실은 새 묶음의 개수에 넣지 않는다.
         fresh = [item for item in self._recent_losses if item[1] not in self._quiet_tracks]
-        if group is None and len(fresh) < MASS_LOSS_MIN_TRACKS:
-            return False
-        first_ms = min(item[0] for item in fresh)
-        if group is not None and group.start_ms is not None:
-            first_ms = min(first_ms, group.start_ms)
-        for _at_ms, lost_id, since_ms in fresh:
+        if group is None:
+            fresh = self._densest_window(fresh, last_ms)
+            if len(fresh) < MASS_LOSS_MIN_TRACKS:
+                return False
+            low = high = fresh[0][0]
+        for at_ms, lost_id, since_ms in fresh:
+            if max(high, at_ms) - min(low, at_ms) > MASS_LOSS_WINDOW_MS:
+                continue  # 이 사건의 창 밖(지금 사건보다 앞선 소실): 따로 둔다
+            low, high = min(low, at_ms), max(high, at_ms)
             self._quiet_tracks.add(lost_id)
             self._retract("miss", lost_id, since_ms)
             self._retract("ended", lost_id, since_ms)
-            problem = self._report("mass-loss", CATEGORY_TRACK, WARN, "", "", first_ms,
-                                   self._clock_for(first_ms, now_s), amount=1,
+            at_s = self._clock_for(at_ms, now_s)
+            problem = self._report("mass-loss", CATEGORY_TRACK, WARN, "", "", at_ms, at_s, amount=1,
                                    grace_ms=grace + MASS_LOSS_WINDOW_MS)
             if problem is not self._mass_loss:
                 self._mass_loss, self._mass_loss_ids = problem, set()
             self._mass_loss_ids.add(lost_id)
-            if problem.start_ms is None or first_ms < problem.start_ms:
-                problem.start_ms = first_ms
+            if problem.start_ms is None or at_ms < problem.start_ms:
+                problem.start_ms, problem.start_s = at_ms, min(problem.start_s, at_s)
             problem.title = f"트랙 {problem.amount}개 동시 소실"
             problem.detail = (f"{MASS_LOSS_WINDOW_MS / 1000:g}초 안에 미탐 한도로 함께 사라짐 — 시나리오 한 주기 종료"
                               f"(모의기 표적 제거) 또는 모의기 정지 추정 "
                               f"(트랙 {', '.join(f'#{item}' for item in sorted(self._mass_loss_ids))})")
-        return True
+        self._mass_loss_span = (low, high)
+        return track_id in self._quiet_tracks
+
+    @staticmethod
+    def _densest_window(losses: List[Tuple[int, int, int]], at_ms: int) -> List[Tuple[int, int, int]]:
+        """시각 순 소실 가운데, at_ms를 포함하는 MASS_LOSS_WINDOW_MS 창에서 소실이 가장 많은 창의 소실(같으면 이른 창)."""
+        best: List[Tuple[int, int, int]] = []
+        for start, _track, _since in losses:
+            if not at_ms - MASS_LOSS_WINDOW_MS <= start <= at_ms:
+                continue
+            inside = [item for item in losses if start <= item[0] <= start + MASS_LOSS_WINDOW_MS]
+            if len(inside) > len(best):
+                best = inside
+        return best
 
     def _close_mass_loss(self) -> None:
         """열린 동시 소실 사건을 닫는다. 다음 소실은 새 사건으로 연다."""
@@ -268,6 +296,7 @@ class ProblemDetector:
         if item is not None:
             item.problem.open = False
         self._mass_loss = None
+        self._mass_loss_span = (0, 0)
         self._mass_loss_ids = set()
 
     def _retract(self, kind: str, track_id: int, since_ms: int) -> None:
@@ -440,7 +469,13 @@ class ProblemDetector:
         #           다음 추적 빔은 나갔는데 결과 없이 지워진 트랙(모의기 응답 없음).
         current = set(history.latest_tracks)
         operation_off = state.paused() is True
-        for track_id in sorted(self._live_tracks - current):
+        # 사라진 트랙은 마지막 사이클의 처리부 시각 순으로 본다(트랙 번호 순이 아니다). 빠른 재생에서는 한 번에
+        # 몇 초 치 소실이 함께 보이므로, 시각 순이 아니면 동시 소실 묶음이 창보다 넓게 묶일 수 있다.
+        def last_cycle_ms(track_id: int) -> int:
+            cycles = history.cycles(track_id)
+            return cycles[-1].time_ms if cycles else now_ms
+
+        for track_id in sorted(self._live_tracks - current, key=lambda item: (last_cycle_ms(item), item)):
             if operation_off:
                 continue
             cycles = history.cycles(track_id)
