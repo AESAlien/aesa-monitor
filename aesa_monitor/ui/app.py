@@ -29,6 +29,7 @@ from aesa_monitor.io.session import Session, load_session
 from aesa_monitor.ui.analysis_tab import AnalysisTab
 from aesa_monitor.ui.beam_tab import BeamTab
 from aesa_monitor.ui.comm_tab import CommTab
+from aesa_monitor.ui.board_dialog import BoardDialog
 from aesa_monitor.ui.fetch_dialog import FetchDialog
 from aesa_monitor.ui.style import (
     ACCENT, ACCENT_SOFT, BACKGROUND, BAD, BORDER, DEFAULT_FONT_SIZE, FONT_BODY, FONT_TITLE, Fonts, MUTED, OK, PANEL, TEXT,
@@ -231,6 +232,7 @@ class MonitorApp:
                        activebackground=ACCENT_SOFT, activeforeground=TEXT, disabledforeground=MUTED)
         menu.add_command(label="폴더 열기…", command=self.choose_folder)
         menu.add_command(label="파일 열기…", command=self.choose_file)
+        menu.add_command(label="처리부 제어…", command=self.control_board)
         menu.add_command(label="로그 가져오기…", command=self.fetch_logs)
         menu.add_separator()
         menu.add_command(label="", state=tk.DISABLED)
@@ -463,6 +465,13 @@ class MonitorApp:
             return
         self.fetch_dialog = FetchDialog(self._root, self._settings.fetch, destination, self._save_fetch_settings,
                                         lambda result: self.open_session(result.destination.parent))
+
+    def control_board(self) -> None:
+        dialog = getattr(self, "board_dialog", None)
+        if dialog is not None and dialog.window.winfo_exists():
+            dialog.window.lift()
+            return
+        self.board_dialog = BoardDialog(self._root, lambda: self._settings.fetch, self.fetch_logs)
 
     def _save_fetch_settings(self, fetch) -> None:
         from dataclasses import replace

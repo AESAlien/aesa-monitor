@@ -212,19 +212,49 @@ copy는 `--source copy`로 쓴다. 처리부는 접속한 상대를 원격 주�
 ```sh
 python3 -m aesa_monitor.io.log_fetch --dest ~/aesa-records/test/processor_logs                 # monitor.env 설정
 python3 -m aesa_monitor.io.log_fetch --source local --local-dir ~/aesa/closedloop/logs --dest DIR
-python3 -m aesa_monitor.io.log_fetch --source ssh --target root@192.168.10.20 --dest DIR
+python3 -m aesa_monitor.io.log_fetch --source ssh --target petalinux@192.168.10.20 --dest DIR
 ```
 
 | 방식 | 언제 | 동작 |
 | --- | --- | --- |
 | local | 처리부를 이 PC에서 실행 | `MONITOR_LOG_LOCAL_DIR`의 `adp_*.log`, `adp_detection_*.csv`를 복사. 크기가 같으면 건너뜀 |
-| ssh | 처리부를 보드에서 실행 | `scp -O ... root@192.168.10.20:/tmp/aesa/logs/adp_* DIR/`. 보드 dropbear에 맞춘 옵션 포함 |
+| ssh | 처리부를 보드에서 실행 | `scp -O ... petalinux@192.168.10.20:/opt/aesa/logs/adp_* DIR/`. 보드 dropbear에 맞춘 옵션 포함 |
 
 저장 위치: 녹화 중이면 그 세션 폴더, 세션을 열어 둔 상태면 그 폴더, 아니면 새 세션 폴더의 `processor_logs/`.
 
 **ssh 주의**
-- 버튼에서는 비밀번호를 입력할 수 없다(BatchMode). 보드에 공개키를 먼저 등록해야 한다. 보드는 initramfs라 재부팅하면 등록이 사라질 수 있다(추측).
-- 보드의 `run_adp.sh`는 처리부를 `/tmp/aesa`에서 실행한다. 실행 중에 가져오면 쓰는 중인 마지막 줄은 건너뛴다.
+- 버튼에서는 비밀번호를 입력할 수 없다(BatchMode). 보드에 공개키를 먼저 등록해야 한다(아래 `보드 준비`).
+- 보드는 처리부를 `/opt/aesa`에서 실행한다(`aesactl`). 실행 중에 가져오면 쓰는 중인 마지막 줄은 건너뛴다.
+- 예전 기본값(`root@192.168.10.20`, `/tmp/aesa/logs`, 키 옵션 없는 dropbear 옵션)이 monitor.env에 그대로 있으면 지금 기본값으로 읽는다.
+
+## 처리부 제어 (보드)
+
+상단 `메뉴`의 `처리부 제어`는 `aesa_monitor/io/board_control.py`로 보드의 `aesactl`을 ssh로 실행한다(전체 경로 `/usr/local/sbin/aesactl`).
+실패(포트가 열리지 않음, 로그를 SD로 복사하지 못함 등)는 보드 스크립트의 종료 코드로 전달되어 창에 `실패`로 보인다.
+접속 정보는 로그 가져오기와 같은 `MONITOR_LOG_SSH_*`를 쓴다.
+
+| 버튼 | 보드에서 실행 | 비고 |
+| --- | --- | --- |
+| 상태 | `sudo -n aesactl status` | 창을 열 때 한 번 자동 실행 |
+| 시작 / 재시작 | `sudo -n aesactl start '노트북 시각'` | 보드에 시계가 없어 노트북 시각을 먼저 넣는다(로그 파일 이름이 이 시각) |
+| 중지 | `sudo -n aesactl stop` | 로그를 보드 SD FAT(`aesa/logs`)로도 복사 |
+| 시각 맞추기 | `sudo -n aesactl settime '노트북 시각'` | |
+| 보드 끄기 | `sudo -n aesactl poweroff` | 처리부 중지·로그 저장 후 poweroff |
+
+```sh
+python3 -m aesa_monitor.io.board_control status     # 명령줄
+```
+
+### 보드 준비 (한 번)
+
+`board/`의 스크립트를 SD FAT(`aesa/`)에 넣고 보드에서 `install_board.sh`를 한 번 실행한다. 자세한 순서는 `board/README.txt`.
+
+| 파일 | 하는 일 |
+| --- | --- |
+| `board/run_aesa.sh` | 처리부 실행·관리. 설치 후 `/usr/local/sbin/aesactl` |
+| `board/install_board.sh` | 부팅 때 eth0 고정 IP, init 스크립트(부팅 `aesactl boot`, 종료 `aesactl stop`), petalinux sudo 규칙(aesactl만), ssh 공개키. 보드(시리얼) 또는 리눅스 PC(`--root`)에서 실행 |
+| `board/board.conf` | `AESA_AUTOSTART=1`이면 부팅하자마자 처리부 시작(기본 0: 모니터 [시작]으로) |
+| `windows/prepare_board_sd.bat` | 노트북에서: 위 파일을 SD에 복사, 노트북 키(`~/.ssh/aesa_board_ed25519`) 생성, 공개키를 SD `aesa/authorized_keys`에 넣음 |
 
 ## 처리부 로그와 시각 맞추기
 
@@ -247,10 +277,10 @@ python3 -m aesa_monitor.io.log_fetch --source ssh --target root@192.168.10.20 --
 | `MONITOR_AUTO_RECORD` | 0 | 1이면 시작하자마자 녹화 |
 | `MONITOR_LOG_SOURCE` | local | local 또는 ssh |
 | `MONITOR_LOG_LOCAL_DIR` | (빈 값) | local: 처리부 logs 폴더 |
-| `MONITOR_LOG_SSH_TARGET` | root@192.168.10.20 | ssh: 사용자@주소 |
+| `MONITOR_LOG_SSH_TARGET` | petalinux@192.168.10.20 | ssh: 사용자@주소 (처리부 제어도 같이 씀) |
 | `MONITOR_LOG_SSH_PORT` | 22 | ssh 포트 |
-| `MONITOR_LOG_REMOTE_DIR` | /tmp/aesa/logs | 보드의 로그 폴더 |
-| `MONITOR_LOG_SSH_OPTIONS` | dropbear용 옵션 | scp에 그대로 붙이는 옵션 |
+| `MONITOR_LOG_REMOTE_DIR` | /opt/aesa/logs | 보드의 로그 폴더 |
+| `MONITOR_LOG_SSH_OPTIONS` | dropbear용 옵션 + `IdentityFile=~/.ssh/aesa_board_ed25519` | scp·ssh에 그대로 붙이는 옵션 |
 
 ## 구조
 

@@ -59,6 +59,11 @@ jobs:
           # 처리부 기본 설정은 이 저장소의 사본을 넣는다(다른 저장소 구성에 기대지 않게).
           Copy-Item windows/processor.env.example $folder/.env
           Copy-Item windows/setup_network.bat, windows/setup_network.ps1, windows/README.txt $folder/
+          Copy-Item windows/setup_power.bat, windows/setup_power.ps1 $folder/
+          Copy-Item windows/prepare_board_sd.bat, windows/prepare_board_sd.ps1 $folder/
+          # 보드 SD에 넣는 스크립트(prepare_board_sd.bat이 board 폴더에서 복사한다)
+          New-Item -ItemType Directory -Force $folder/board | Out-Null
+          Copy-Item board/run_aesa.sh, board/install_board.sh, board/board.conf, board/README.txt $folder/board/
           Compress-Archive -Path $folder -DestinationPath "package/$name.zip"
           "name=$name" >> $env:GITHUB_OUTPUT
 

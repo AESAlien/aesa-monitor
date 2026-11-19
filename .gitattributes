@@ -2,3 +2,5 @@
 *.bat text eol=crlf
 # PowerShell 스크립트도 CRLF로 둔다(Windows PowerShell 5.1)
 *.ps1 text eol=crlf
+# 보드 SD에 넣는 파일은 LF로 둔다(CRLF면 sh가 깨진다. 설정 파일은 스크립트가 CR을 지우고 읽는다)
+board/** text eol=lf

@@ -38,13 +38,16 @@ LOG_PATH = APP_DIR / "aesa-monitor.log"
 SERVER_KEY = "MONITOR_SERVER"
 INTERFACE_PLACEHOLDER = "{interface}"
 LOOPBACK_DEVICE = r"\Device\NPF_Loopback"
-# 랜카드 GUID와 IPv4 주소를 한 줄에 하나씩 '{GUID}|주소|접두 길이|이름'으로 낸다.
+# 랜카드 GUID와 IPv4 주소를 한 줄에 하나씩 '{GUID}|주소|접두 길이|상태|이름'으로 낸다.
+# 상태는 Get-NetAdapter의 Status(Up, Disconnected, Disabled 등). 케이블이 빠진 랜카드도 고정 주소는 남아 있을 수 있다.
 ADAPTER_QUERY = (
     "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
     "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { "
     "$adapter = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue; "
-    "if ($adapter) { '{0}|{1}|{2}|{3}' -f $adapter.InterfaceGuid, $_.IPAddress, $_.PrefixLength, $adapter.Name } }"
+    "if ($adapter) { '{0}|{1}|{2}|{3}|{4}' -f $adapter.InterfaceGuid, $_.IPAddress, $_.PrefixLength, "
+    "$adapter.Status, $adapter.Name } }"
 )
+ADAPTER_UP = "Up"
 ADAPTER_QUERY_TIMEOUT_SECONDS = 15
 
 if not FROZEN:
@@ -73,13 +76,14 @@ MONITOR_RECORD_DIR=~/aesa-records
 MONITOR_FONT_SIZE=12
 MONITOR_AUTO_RECORD=0
 
-# 처리부 로그 가져오기: local 또는 ssh(보드). ssh는 Windows 10 이상의 OpenSSH 클라이언트를 쓴다.
+# 처리부 로그 가져오기·처리부 제어: local 또는 ssh(보드). ssh는 Windows 10 이상의 OpenSSH 클라이언트를 쓴다.
+# 보드 계정·키는 prepare_board_sd.bat(노트북)과 보드의 install_board.sh가 설정한다.
 MONITOR_LOG_SOURCE=ssh
 MONITOR_LOG_LOCAL_DIR=
-MONITOR_LOG_SSH_TARGET=root@192.168.10.20
+MONITOR_LOG_SSH_TARGET=petalinux@192.168.10.20
 MONITOR_LOG_SSH_PORT=22
-MONITOR_LOG_REMOTE_DIR=/tmp/aesa/logs
-MONITOR_LOG_SSH_OPTIONS="-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL"
+MONITOR_LOG_REMOTE_DIR=/opt/aesa/logs
+MONITOR_LOG_SSH_OPTIONS="-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o IdentityFile=~/.ssh/aesa_board_ed25519"
 """
 
 
@@ -187,6 +191,14 @@ class Adapter:
     address: str   # IPv4 주소
     prefix: int    # 접두 길이(24 = 255.255.255.0)
     name: str      # Windows 연결 이름(예: 이더넷 2)
+    status: str = ADAPTER_UP  # Get-NetAdapter Status. Up만 패킷을 받는다
+
+    @property
+    def up(self) -> bool:
+        return self.status.strip().lower() == ADAPTER_UP.lower()
+
+    def describe(self) -> str:
+        return f"{self.name} {self.address}/{self.prefix} [{self.status}]"
 
     @property
     def device(self) -> str:
@@ -194,16 +206,16 @@ class Adapter:
 
 
 def parse_adapters(text: str) -> List[Adapter]:
-    """ADAPTER_QUERY 출력('{GUID}|주소|접두 길이|이름' 줄)을 읽는다. 형식이 맞지 않는 줄은 건너뛴다."""
+    """ADAPTER_QUERY 출력('{GUID}|주소|접두 길이|상태|이름' 줄)을 읽는다. 형식이 맞지 않는 줄은 건너뛴다."""
     adapters = []
     for line in text.splitlines():
-        parts = line.strip().split("|", 3)
-        if len(parts) != 4:
+        parts = line.strip().split("|", 4)
+        if len(parts) != 5:
             continue
-        guid, address, prefix, name = parts
+        guid, address, prefix, status, name = parts
         try:
             ipaddress.IPv4Address(address)
-            adapters.append(Adapter(guid.strip("{} ").upper(), address, int(prefix), name.strip()))
+            adapters.append(Adapter(guid.strip("{} ").upper(), address, int(prefix), name.strip(), status.strip()))
         except ValueError:
             continue
     return adapters
@@ -224,7 +236,11 @@ def query_adapters() -> List[Adapter]:
 def choose_capture_device(adapters: List[Adapter], server_address: str) -> Tuple[str, str]:
     """처리부 주소와 같은 네트워크의 랜카드를 고른다. (Npcap 장치 이름, 설명)을 돌려준다.
 
-    처리부 주소를 가진 랜카드는 고르지 않는다(처리부를 이 PC에서 돌리는 경우가 아니면 잘못 넣은 주소다).
+    - 처리부 주소를 가진 랜카드는 고르지 않는다(처리부를 이 PC에서 돌리는 경우가 아니면 잘못 넣은 주소다).
+    - 연결된(Up) 랜카드만 고른다. 케이블이 빠진 내장 랜카드에 192.168.10.x가 남아 있으면 그쪽을 골라
+      dumpcap이 아무것도 받지 못하는 일이 생긴다.
+    - 연결된 랜카드가 둘 이상이면 고르지 않고 오류로 알린다(어느 쪽이 처리부와 이어졌는지 알 수 없다).
+      한 랜카드에 주소가 여럿(노트북 1대 구성 .30·.10·.100)인 것은 하나로 센다.
     """
     server = ipaddress.IPv4Address(server_address)
     if server.is_loopback:
@@ -232,14 +248,31 @@ def choose_capture_device(adapters: List[Adapter], server_address: str) -> Tuple
     matches = [adapter for adapter in adapters
                if adapter.address != server_address
                and server in ipaddress.IPv4Network(f"{adapter.address}/{adapter.prefix}", strict=False)]
+    manual = (f"monitor.env의 MONITOR_CAPTURE_COMMAND에서 {INTERFACE_PLACEHOLDER} 대신 랜카드를 직접 넣을 수도 "
+              f"있습니다(dumpcap -D로 확인)")
     if not matches:
-        found = ", ".join(f"{adapter.name} {adapter.address}/{adapter.prefix}" for adapter in adapters) or "없음"
+        found = ", ".join(adapter.describe() for adapter in adapters) or "없음"
         raise ValueError(
             f"처리부 {server_address}와 같은 네트워크 주소를 가진 랜카드가 없습니다(지금 주소: {found}). "
-            f"windows\\setup_network.bat으로 노트북 IP를 설정하거나, monitor.env의 MONITOR_CAPTURE_COMMAND에서 "
-            f"{INTERFACE_PLACEHOLDER} 대신 랜카드를 직접 넣으세요"
+            f"windows\\setup_network.bat으로 노트북 IP를 설정하세요. {manual}"
         )
-    chosen = matches[0]
+    connected = {}
+    for adapter in matches:
+        if adapter.up:
+            connected.setdefault(adapter.guid, adapter)
+    if not connected:
+        found = ", ".join(adapter.describe() for adapter in matches)
+        raise ValueError(
+            f"처리부 {server_address}와 같은 네트워크의 랜카드가 모두 연결되어 있지 않습니다({found}). "
+            f"랜선과 USB 랜 어댑터를 확인하세요"
+        )
+    if len(connected) > 1:
+        found = ", ".join(adapter.describe() for adapter in connected.values())
+        raise ValueError(
+            f"처리부 {server_address}와 같은 네트워크에 연결된 랜카드가 여럿이라 고를 수 없습니다({found}). "
+            f"쓰지 않는 랜카드의 192.168.10.x 주소를 지우거나(setup_network.bat → DHCP), {manual}"
+        )
+    chosen = next(iter(connected.values()))
     return chosen.device, f"{chosen.name} ({chosen.address}/{chosen.prefix})"
 
 

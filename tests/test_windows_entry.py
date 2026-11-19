@@ -15,13 +15,16 @@ sys.modules[spec.name] = win  # dataclass가 모듈을 찾으므로 먼저 등�
 spec.loader.exec_module(win)
 
 QUERY_OUTPUT = """\
-{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}|192.168.10.30|24|이더넷 2
-{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}|192.168.10.10|24|이더넷 2
-{11111111-2222-3333-4444-555555555555}|192.168.0.5|24|Wi-Fi
-{AAAAAAAA-2222-3333-4444-555555555555}|169.254.10.3|16|VMware Network Adapter VMnet1
+{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}|192.168.10.30|24|Up|이더넷 2
+{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}|192.168.10.10|24|Up|이더넷 2
+{11111111-2222-3333-4444-555555555555}|192.168.0.5|24|Up|Wi-Fi
+{AAAAAAAA-2222-3333-4444-555555555555}|169.254.10.3|16|Up|VMware Network Adapter VMnet1
 줄 형식이 아님
-{BBBBBBBB-2222-3333-4444-555555555555}|주소아님|24|이상한 줄
+{CCCCCCCC-2222-3333-4444-555555555555}|192.168.10.31|24|이전 형식(상태 없음)
+{BBBBBBBB-2222-3333-4444-555555555555}|주소아님|24|Up|이상한 줄
 """
+BUILT_IN = "{DDDDDDDD-2222-3333-4444-555555555555}|192.168.10.30|24|Disconnected|이더넷"
+USB = "{EEEEEEEE-2222-3333-4444-555555555555}|192.168.10.30|24|Up|이더넷 3"
 COMMAND = 'dumpcap -i {interface} -f "tcp port 3200" -P -q -w -'
 
 
@@ -29,7 +32,8 @@ class AdapterParseTest(unittest.TestCase):
     def test_reads_guid_address_prefix_and_name(self):
         adapters = win.parse_adapters(QUERY_OUTPUT)
         self.assertEqual(len(adapters), 4)
-        self.assertEqual(adapters[0], win.Adapter("92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934", "192.168.10.30", 24, "이더넷 2"))
+        self.assertEqual(adapters[0],
+                         win.Adapter("92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934", "192.168.10.30", 24, "이더넷 2", "Up"))
         self.assertEqual(adapters[0].device, r"\Device\NPF_{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}")
 
 
@@ -51,8 +55,35 @@ class ChooseDeviceTest(unittest.TestCase):
         self.assertIn("setup_network.bat", str(raised.exception))
         self.assertIn("192.168.10.30/24", str(raised.exception))
 
+    def test_prefers_connected_adapter_over_disconnected_one_on_same_network(self):
+        # 케이블이 빠진 내장 랜카드에 192.168.10.x가 남아 있어도 연결된 USB 랜 어댑터를 고른다.
+        for lines in ((BUILT_IN, USB), (USB, BUILT_IN)):
+            device, description = win.choose_capture_device(win.parse_adapters("\n".join(lines)), "192.168.10.20")
+            self.assertEqual(device, r"\Device\NPF_{EEEEEEEE-2222-3333-4444-555555555555}")
+            self.assertIn("이더넷 3", description)
+
+    def test_only_disconnected_adapters_is_an_error(self):
+        with self.assertRaises(ValueError) as raised:
+            win.choose_capture_device(win.parse_adapters(BUILT_IN), "192.168.10.20")
+        self.assertIn("연결되어 있지 않습니다", str(raised.exception))
+        self.assertIn("Disconnected", str(raised.exception))
+
+    def test_two_connected_adapters_on_network_is_ambiguous(self):
+        other = USB.replace("EEEEEEEE", "FFFFFFFF").replace("이더넷 3", "이더넷 4").replace(".30", ".31")
+        with self.assertRaises(ValueError) as raised:
+            win.choose_capture_device(win.parse_adapters("\n".join((USB, other))), "192.168.10.20")
+        self.assertIn("여럿", str(raised.exception))
+        self.assertIn("이더넷 3", str(raised.exception))
+        self.assertIn("이더넷 4", str(raised.exception))
+
+    def test_several_addresses_on_one_adapter_is_not_ambiguous(self):
+        # 노트북 1대 구성(.30·.10·.100이 한 랜카드)
+        adapters = win.parse_adapters(QUERY_OUTPUT)
+        self.assertEqual(sum(1 for adapter in adapters if adapter.guid.startswith("92DAE06A")), 2)
+        self.assertTrue(win.choose_capture_device(adapters, "192.168.10.20")[0].endswith("0ACBBB9A1934}"))
+
     def test_adapter_holding_processor_address_is_not_chosen(self):
-        adapters = [win.Adapter("11111111-2222-3333-4444-555555555555", "192.168.10.20", 24, "잘못 넣은 주소")]
+        adapters = [win.Adapter("11111111-2222-3333-4444-555555555555", "192.168.10.20", 24, "잘못 넣은 주소", "Up")]
         with self.assertRaises(ValueError):
             win.choose_capture_device(adapters, "192.168.10.20")
 
@@ -132,9 +163,10 @@ class PackageFilesTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "windows-exe.yml").read_text(encoding="utf-8")
         copies = [line for line in workflow.splitlines() if line.strip().startswith("Copy-Item")]
-        paths = {path for line in copies for path in re.findall(r"windows/[\w./-]+", line)
+        paths = {path for line in copies for path in re.findall(r"(?:windows|board)/[\w./-]+", line)
                  if not path.startswith("windows/dist/")}
-        self.assertIn("windows/processor.env.example", paths)
+        for expected in ("windows/processor.env.example", "windows/prepare_board_sd.ps1", "board/install_board.sh"):
+            self.assertIn(expected, paths)
         for path in sorted(paths):
             self.assertTrue((root / path).is_file(), path)
 
