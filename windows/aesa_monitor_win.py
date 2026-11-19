@@ -26,7 +26,7 @@ import subprocess
 import sys
 import traceback
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -38,14 +38,21 @@ LOG_PATH = APP_DIR / "aesa-monitor.log"
 SERVER_KEY = "MONITOR_SERVER"
 INTERFACE_PLACEHOLDER = "{interface}"
 LOOPBACK_DEVICE = r"\Device\NPF_Loopback"
-# 랜카드 GUID와 IPv4 주소를 한 줄에 하나씩 '{GUID}|주소|접두 길이|상태|이름'으로 낸다.
+# 랜카드 주소와 브리지 구성을 읽는다. 줄 형식:
+#   ADDR|{GUID}|주소|접두 길이|상태|브리지 장치(1/0)|이름
+#   MEMBER|{GUID}|상태|이름      브리지(네트워크 어댑터 멀티플렉서)에 묶인 실제 랜카드
 # 상태는 Get-NetAdapter의 Status(Up, Disconnected, Disabled 등). 케이블이 빠진 랜카드도 고정 주소는 남아 있을 수 있다.
+# Windows 네트워크 브리지는 "Microsoft Network Adapter Multiplexor Driver" 장치에 IP를 두고,
+# 묶인 랜카드에는 "멀티플렉서 프로토콜"(ms_implat)이 켜진다.
 ADAPTER_QUERY = (
     "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
     "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { "
     "$adapter = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue; "
-    "if ($adapter) { '{0}|{1}|{2}|{3}|{4}' -f $adapter.InterfaceGuid, $_.IPAddress, $_.PrefixLength, "
-    "$adapter.Status, $adapter.Name } }"
+    "if ($adapter) { 'ADDR|{0}|{1}|{2}|{3}|{4}|{5}' -f $adapter.InterfaceGuid, $_.IPAddress, $_.PrefixLength, "
+    "$adapter.Status, [int]($adapter.InterfaceDescription -like '*Multiplexor*'), $adapter.Name } }; "
+    "Get-NetAdapterBinding -ComponentID ms_implat -ErrorAction SilentlyContinue | Where-Object Enabled | "
+    "ForEach-Object { $member = Get-NetAdapter -Name $_.Name -ErrorAction SilentlyContinue; "
+    "if ($member) { 'MEMBER|{0}|{1}|{2}' -f $member.InterfaceGuid, $member.Status, $member.Name } }"
 )
 ADAPTER_UP = "Up"
 ADAPTER_QUERY_TIMEOUT_SECONDS = 15
@@ -66,6 +73,7 @@ MONITOR_SOURCE=capture
 # Wireshark의 dumpcap으로 캡처한다(Wireshark + Npcap 설치 필요). {port}는 처리부 서버 포트로 바뀐다.
 # {interface}는 처리부 주소(MONITOR_SERVER)와 같은 네트워크 주소를 가진 랜카드로 자동으로 바뀐다.
 #   예: 처리부 192.168.10.20 → 192.168.10.x/24 주소가 있는 랜카드. 노트북 IP는 windows\\setup_network.bat으로 설정한다.
+#   그 주소가 네트워크 브리지에 있으면 브리지에 묶인 랜카드 중 연결된 쪽을 쓴다(둘 다 연결이면 직접 넣으라고 안내).
 #   처리부가 127.0.0.1이면 루프백(\\Device\\NPF_Loopback)을 쓴다.
 # 랜카드를 직접 정하려면 {interface} 대신 장치 이름이나 번호를 넣는다(명령 프롬프트에서 dumpcap -D 로 확인).
 # -P: pcap 형식, -q: 패킷 수 출력 안 함
@@ -75,6 +83,8 @@ MONITOR_CAPTURE_COMMAND='dumpcap -i {interface} -f "tcp port {port}" -P -q -w -'
 MONITOR_RECORD_DIR=~/aesa-records
 MONITOR_FONT_SIZE=12
 MONITOR_AUTO_RECORD=0
+# 운용 OFF→ON(새 시나리오)마다 실시간 화면을 지운다(메뉴 '운용 ON마다 화면 초기화'와 같음)
+MONITOR_RESET_ON_OPERATION_START=0
 
 # 처리부 로그 가져오기·처리부 제어: local 또는 ssh(보드). ssh는 Windows 10 이상의 OpenSSH 클라이언트를 쓴다.
 # 보드 계정·키는 prepare_board_sd.bat(노트북)과 보드의 install_board.sh가 설정한다.
@@ -186,12 +196,33 @@ def patch_subprocess() -> None:
 
 
 @dataclass(frozen=True)
+class Member:
+    """네트워크 브리지에 묶인 실제 랜카드."""
+    guid: str
+    name: str
+    status: str = ADAPTER_UP
+
+    @property
+    def up(self) -> bool:
+        return self.status.strip().lower() == ADAPTER_UP.lower()
+
+    def describe(self) -> str:
+        return f"{self.name} [{self.status}]"
+
+    @property
+    def device(self) -> str:
+        return rf"\Device\NPF_{{{self.guid}}}"
+
+
+@dataclass(frozen=True)
 class Adapter:
     guid: str      # 중괄호 없는 GUID
     address: str   # IPv4 주소
     prefix: int    # 접두 길이(24 = 255.255.255.0)
     name: str      # Windows 연결 이름(예: 이더넷 2)
     status: str = ADAPTER_UP  # Get-NetAdapter Status. Up만 패킷을 받는다
+    bridge: bool = False      # 네트워크 브리지 장치(멀티플렉서)인지
+    members: Tuple[Member, ...] = ()  # bridge일 때 묶인 랜카드
 
     @property
     def up(self) -> bool:
@@ -206,18 +237,29 @@ class Adapter:
 
 
 def parse_adapters(text: str) -> List[Adapter]:
-    """ADAPTER_QUERY 출력('{GUID}|주소|접두 길이|상태|이름' 줄)을 읽는다. 형식이 맞지 않는 줄은 건너뛴다."""
+    """ADAPTER_QUERY 출력을 읽는다. 형식이 맞지 않는 줄은 건너뛴다.
+
+    브리지 장치가 하나뿐이면 MEMBER 줄을 그 브리지의 묶인 랜카드로 붙인다.
+    브리지(또는 NIC 팀) 장치가 둘 이상이면 어느 쪽에 묶였는지 알 수 없어 붙이지 않는다.
+    """
     adapters = []
+    members = []
     for line in text.splitlines():
-        parts = line.strip().split("|", 4)
-        if len(parts) != 5:
-            continue
-        guid, address, prefix, status, name = parts
-        try:
-            ipaddress.IPv4Address(address)
-            adapters.append(Adapter(guid.strip("{} ").upper(), address, int(prefix), name.strip(), status.strip()))
-        except ValueError:
-            continue
+        parts = line.strip().split("|")
+        if parts[0] == "ADDR" and len(parts) >= 7:
+            guid, address, prefix, status, bridge = parts[1:6]
+            name = "|".join(parts[6:])
+            try:
+                ipaddress.IPv4Address(address)
+                adapters.append(Adapter(guid.strip("{} ").upper(), address, int(prefix), name.strip(),
+                                        status.strip(), bridge.strip() == "1"))
+            except ValueError:
+                continue
+        elif parts[0] == "MEMBER" and len(parts) >= 4:
+            members.append(Member(parts[1].strip("{} ").upper(), "|".join(parts[3:]).strip(), parts[2].strip()))
+    bridges = {adapter.guid for adapter in adapters if adapter.bridge}
+    if len(bridges) == 1 and members:
+        adapters = [replace(adapter, members=tuple(members)) if adapter.bridge else adapter for adapter in adapters]
     return adapters
 
 
@@ -273,7 +315,37 @@ def choose_capture_device(adapters: List[Adapter], server_address: str) -> Tuple
             f"쓰지 않는 랜카드의 192.168.10.x 주소를 지우거나(setup_network.bat → DHCP), {manual}"
         )
     chosen = next(iter(connected.values()))
+    if chosen.bridge:
+        return choose_bridge_member(chosen, manual)
     return chosen.device, f"{chosen.name} ({chosen.address}/{chosen.prefix})"
+
+
+def choose_bridge_member(bridge: Adapter, manual: str) -> Tuple[str, str]:
+    """IP가 네트워크 브리지에 있으면 브리지 장치 대신 묶인 실제 랜카드를 캡처한다.
+
+    브리지 장치에서는 처리부와 다른 장비 사이를 지나가는 패킷이 대부분 보이지 않는다(2026-11 노트북 실측:
+    같은 25초 동안 브리지 장치 3개, 묶인 랜카드 15개). 묶인 랜카드 중 연결된 것이 하나면 그것을 고른다.
+    둘 이상이면 어느 쪽이 처리부(보드)와 이어졌는지 알 수 없어 고르지 않는다.
+    """
+    lines = "; ".join(f"{member.name}: dumpcap -i {member.device}" for member in bridge.members)
+    if not bridge.members:
+        raise ValueError(
+            f"{bridge.name}는 네트워크 브리지인데 묶인 랜카드를 찾지 못했습니다. 브리지 장치로는 처리부 통신을 "
+            f"놓칠 수 있습니다. {manual}"
+        )
+    connected = [member for member in bridge.members if member.up]
+    if not connected:
+        found = ", ".join(member.describe() for member in bridge.members)
+        raise ValueError(f"네트워크 브리지 {bridge.name}에 묶인 랜카드가 모두 연결되어 있지 않습니다({found}). 랜선을 확인하세요")
+    if len(connected) > 1:
+        found = ", ".join(member.describe() for member in connected)
+        raise ValueError(
+            f"네트워크 브리지 {bridge.name}에 연결된 랜카드가 여럿이라({found}) 보드가 어느 쪽인지 알 수 없습니다. "
+            f"monitor.env의 MONITOR_CAPTURE_COMMAND에서 {INTERFACE_PLACEHOLDER} 대신 보드와 연결된 랜카드를 "
+            f"넣으세요({lines})"
+        )
+    member = connected[0]
+    return member.device, f"{member.name} ({bridge.name} {bridge.address}/{bridge.prefix}에 묶인 랜카드)"
 
 
 def resolve_capture_command(command: str, server_address: Optional[str],

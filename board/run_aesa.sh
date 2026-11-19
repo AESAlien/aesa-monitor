@@ -15,13 +15,15 @@
 #   restart [시각]  stop의 로그 복사가 실패해도 다시 시작하고, 끝에 실패(종료 코드 1)로 알린다.
 #   status          실행 여부, IP, 포트, 연결, 최근 로그
 #   log             최신 adp_*.log 실시간 보기 (Ctrl+C로 나가도 처리부는 계속 실행)
-#   savelog         로그만 SD FAT로 복사 (SD에 같은 크기로 이미 있는 파일은 건너뜀)
+#   savelog         로그만 SD FAT로 복사 (SD에 내용이 같은 파일이 이미 있으면 건너뜀)
 #                   로그를 복사하는 명령(stop·restart·poweroff·savelog)은 ssh가 끊겨도 끝까지 복사하고,
 #                   결과는 status의 "마지막 로그 저장"에 남는다.
 #   settime 시각    보드 시각만 맞춘다
 #   net             eth0에 처리부 IP만 넣는다
 #   boot            부팅 때 init이 부른다: net, 그리고 board.conf의 AESA_AUTOSTART=1이면 start
 #   poweroff        처리부 종료·로그 저장 후 보드를 끈다 (ext4라 전원을 바로 뽑지 않는다)
+#   (start·stop·restart·poweroff·savelog·boot·settime은 잠금으로 한 번에 하나만 실행한다. 겹치면 나중 명령이
+#    실패한다. AESA_LOCK_WAIT=초를 주면 그만큼 기다린다: init의 부팅·종료가 쓴다)
 #                   로그 복사가 실패해도 보드는 끈다(로그는 ext4의 /opt/aesa/logs에 남는다). 이때 종료 코드 1.
 #
 # 원본(SD FAT)은 실행 권한이 없으므로 ext4의 작업 폴더로 복사해서 실행한다.
@@ -43,6 +45,13 @@ PID_FILE="$WORK_DIR/adp.pid"   # "PID 시작시각 부팅ID" (시작시각: /pro
 PORT_WAIT_SECONDS=15   # 처리부가 서버 포트를 열 때까지 기다리는 시간
 STOP_WAIT_SECONDS=10   # SIGTERM 뒤 처리부가 끝나기를 기다리는 시간
 SAVE_STATE="$WORK_DIR/savelog.state"   # 마지막 로그 저장 결과 (status에 보임)
+# 바꾸는 명령은 한 번에 하나만. flock이 있으면 커널 파일 잠금(프로세스가 끝나면 커널이 푼다),
+# 없으면 심볼릭 링크 잠금(주인 신원 확인). 둘 다 재부팅하면 사라지는 /run에 둔다.
+LOCK_FILE=/run/aesactl.lock
+LOCK_LINK=/run/aesactl.lock-owner
+FLOCK=$(command -v flock 2>/dev/null)
+LOCK_WAIT_SECONDS=${AESA_LOCK_WAIT:-0}   # 잠금을 기다릴 시간. 모니터는 0(바로 거부), init(종료·부팅)은 기다린다
+case "$LOCK_WAIT_SECONDS" in ''|*[!0-9]*) LOCK_WAIT_SECONDS=0 ;; esac
 BIN=adp
 ENV_SRC=aesa.env
 
@@ -53,6 +62,10 @@ die() { fail "$@"; exit 1; }
 # root가 아니면 sudo로 다시 실행한다 (IP 설정, /opt 쓰기, 시각 설정에 root 필요).
 if [ "$(id -u)" -ne 0 ]; then
     if command -v sudo >/dev/null 2>&1; then
+        # 설치된 aesactl이면 경로 그대로 실행해 sudoers 규칙(비밀번호 없는 /usr/local/sbin/aesactl)에 맞춘다.
+        case "$0" in
+            /*) [ -x "$0" ] && exec sudo "$0" "$@" ;;
+        esac
         exec sudo sh "$0" "$@"
     fi
     die "root 권한이 필요합니다 (sudo 없음)."
@@ -224,8 +237,17 @@ save_state() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" > "$SAVE_STATE" 2>/dev/null
 }
 
+same_file() {
+    # same_file 원본 사본 : 내용이 같은지. 크기가 다르면 바로 다름, 같으면 cmp로 내용까지 본다
+    # (보드에 시계가 없어 같은 이름의 로그가 다시 생기거나, 중간에 실패한 사본이 같은 크기일 수 있다).
+    [ "$(wc -c < "$1")" = "$(wc -c < "$2")" ] || return 1
+    command -v cmp >/dev/null 2>&1 || return 1   # 비교할 수 없으면 다시 복사한다
+    cmp -s "$1" "$2"
+}
+
 save_logs() {
-    # 작업 폴더의 로그를 SD FAT로 복사한다. SD에 같은 크기로 이미 있는 파일은 건너뛴다(로그는 덧붙이기만 한다).
+    # 작업 폴더의 로그를 SD FAT로 복사한다. SD에 내용이 같은 파일이 이미 있으면 건너뛴다.
+    # 복사는 임시 이름(.이름.part)에 쓴 뒤 이름을 바꿔서, 중간에 실패한 사본이 정상 파일로 남지 않게 한다.
     # 하나라도 복사하지 못하면 1을 돌려준다(로그는 보드에 그대로 남는다).
     set -- "$WORK_DIR"/logs/*
     [ -e "$1" ] || { say "저장할 로그가 없습니다."; return 0; }
@@ -240,16 +262,19 @@ save_logs() {
         return 1
     fi
     save_state "진행 중: 로그 $#개 확인·복사"
-    say "로그 $#개를 SD FAT로 복사하는 중 (이미 같은 크기로 있는 파일은 건너뜀)..."
+    say "로그 $#개를 SD FAT로 복사하는 중 (내용이 같은 파일은 건너뜀)..."
     copied=0
     same=0
     for file in "$@"; do
-        target="$SRC_DIR/logs/$(basename "$file")"
-        if [ -f "$target" ] && [ "$(wc -c < "$file")" = "$(wc -c < "$target")" ]; then
+        name=$(basename "$file")
+        target="$SRC_DIR/logs/$name"
+        part="$SRC_DIR/logs/.$name.part"
+        if [ -f "$target" ] && same_file "$file" "$target"; then
             same=$((same + 1))
             continue
         fi
-        if ! cp "$file" "$target"; then
+        if [ -d "$target" ] || ! cp "$file" "$part" || ! mv -f "$part" "$target"; then
+            rm -f "$part"
             sync
             save_state "실패: $(basename "$file") 복사 실패 (복사 $copied개 뒤)"
             fail "로그를 SD FAT로 복사하지 못했습니다 (SD가 가득 찼거나 읽기 전용일 수 있음). 보드: $WORK_DIR/logs"
@@ -286,18 +311,20 @@ wait_for_port() {
 }
 
 do_start() {
-    [ -n "$1" ] && set_time "$1"
     if pid=$(running_pid); then
         # 이미 떠 있는 처리부도 포트가 열려 있어야 성공이다(이전 start가 시간 초과로 남긴 처리부일 수 있음).
-        say "이미 실행 중 (PID $pid)"
+        # 시각은 바꾸지 않는다(실행 중에 바꾸면 처리부 로그 시각이 한 파일 안에서 건너뛴다).
+        say "이미 실행 중 (PID $pid)${1:+. 보드 시각은 바꾸지 않음}"
         wait_for_port "$pid"
         return 0
     fi
+    [ -n "$1" ] && set_time "$1"
     setup_ip
     copy_files
     cd "$WORK_DIR" || die "$WORK_DIR로 이동 실패"
     say "처리부 시작 ($(head -n 1 COMMIT 2>/dev/null))"
-    nohup "./$BIN" >> logs/console.out 2>&1 < /dev/null &
+    # 잠금 fd(9)는 넘기지 않는다. 넘기면 처리부가 도는 동안 잠금이 풀리지 않는다.
+    nohup "./$BIN" >> logs/console.out 2>&1 < /dev/null 9>&- &
     pid=$!
     echo "$pid $(proc_field "$pid" 20) $(boot_id)" > "$PID_FILE"
     sleep 1
@@ -353,7 +380,7 @@ do_poweroff() {
     status=$?
     sync
     say "보드를 끕니다. 10초쯤 기다린 뒤 전원을 빼세요."
-    (sleep 1; poweroff) >/dev/null 2>&1 &
+    (sleep 1; poweroff) >/dev/null 2>&1 9>&- &
     [ $status -eq 0 ] || die "로그를 SD FAT로 복사하지 못한 채 보드를 끕니다. 다음 부팅 후 savelog로 다시 복사하세요."
 }
 
@@ -363,6 +390,117 @@ do_restart() {
     do_start "$1"
     [ $status -eq 0 ] || die "처리부는 다시 시작했지만 이전 실행의 로그를 SD FAT로 복사하지 못했습니다. 보드: $WORK_DIR/logs"
 }
+
+my_identity() {
+    # 이 프로세스의 신원: PID, 시작시각, 부팅 ID. PID만으로는 재사용된 PID를 구분하지 못한다.
+    echo "$$ $(proc_field $$ 20) $(boot_id)"
+}
+
+owner_alive() {
+    # owner_alive "PID 시작시각 부팅ID ..." : 그 신원의 프로세스가 지금도 살아 있는지
+    # shellcheck disable=SC2086 # 칸 나누기가 목적
+    set -- $1
+    [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] && [ -d "/proc/$1" ] \
+        && [ "$(proc_field "$1" 1)" != "Z" ] \
+        && [ "$(proc_field "$1" 20)" = "$2" ] && [ "$(boot_id)" = "$3" ]
+}
+
+lock_busy() {
+    die "다른 aesactl 명령이 실행 중입니다 ($1). 끝난 뒤 다시 하세요."
+}
+
+acquire_lock() {
+    # 처리부를 바꾸는 명령(start·stop·restart·poweroff·savelog·boot·settime)은 한 번에 하나만 실행한다.
+    # 모니터 창을 닫았다 다시 열거나 두 노트북에서 동시에 눌러도, 앞 명령이 끝나기 전에는 거부한다.
+    # LOCK_WAIT_SECONDS(AESA_LOCK_WAIT)가 있으면 그만큼 기다린다(종료·부팅 때 init이 쓴다).
+    [ -d "$(dirname "$LOCK_FILE")" ] || { LOCK_FILE=/tmp/aesactl.lock; LOCK_LINK=/tmp/aesactl.lock-owner; }
+    if [ -n "$FLOCK" ]; then
+        acquire_flock "$@"
+    else
+        acquire_link "$@"
+    fi
+}
+
+acquire_flock() {
+    # 커널 파일 잠금. 프로세스가 끝나면(강제 종료 포함) 커널이 풀어 주므로 버려진 잠금이 없다.
+    # 잠금 fd는 이 셸에만 둔다(처리부·백그라운드 작업에는 9>&-로 넘기지 않는다).
+    exec 9>>"$LOCK_FILE" || die "잠금 파일($LOCK_FILE)을 열지 못했습니다."
+    waited=0
+    until "$FLOCK" -n 9; do
+        [ $waited -lt "$LOCK_WAIT_SECONDS" ] || lock_busy "$(cat "$LOCK_FILE.info" 2>/dev/null || echo '내용 모름')"
+        sleep 1
+        waited=$((waited + 1))
+    done
+    # 누가 잡았는지는 안내용으로만 남긴다(잠금 자체는 flock).
+    echo "$*, PID $$" > "$LOCK_FILE.info" 2>/dev/null
+}
+
+acquire_link() {
+    # flock이 없을 때: 심볼릭 링크 하나가 잠금이다. 내용 "PID 시작시각 부팅ID 명령"이 주인이고,
+    # ln -s는 링크와 내용을 한 번에 만든다(주인이 비어 있는 순간이 없음).
+    # 주인 확인은 PID만이 아니라 시작시각·부팅 ID까지 본다(강제 종료 뒤 재사용된 PID를 주인으로 보지 않음).
+    # 버려진 잠금 정리는 그 주인 이름의 정리 잠금을 만든 하나만 한다(reclaim_link). 그래서 여러 명령이
+    # 같은 버려진 잠금을 동시에 정리해도 새 주인의 잠금을 지우지 않는다.
+    LOCK_OWNER="$(my_identity) $*"
+    waited=0
+    tries=0
+    while ! ln -s "$LOCK_OWNER" "$LOCK_LINK" 2>/dev/null; do
+        holder=$(readlink "$LOCK_LINK" 2>/dev/null)
+        busy=""
+        if [ -n "$holder" ] && owner_alive "$holder"; then
+            busy="$(echo "$holder" | cut -d' ' -f4-), PID ${holder%% *}"
+        elif [ -n "$holder" ] && ! reclaim_link "$holder"; then
+            busy="다른 명령이 잠금을 가져가는 중"
+        fi
+        if [ -n "$busy" ]; then
+            # 다른 명령이 잡았거나 가져가는 중: flock과 같게 바로 거부하거나, 기다리라고 했으면 기다린다.
+            [ $waited -lt "$LOCK_WAIT_SECONDS" ] || lock_busy "$busy"
+            sleep 1
+            waited=$((waited + 1))
+            continue
+        fi
+        tries=$((tries + 1))
+        [ $tries -lt 20 ] || die "잠금($LOCK_LINK)을 얻지 못했습니다."
+    done
+    trap release_lock EXIT
+}
+
+reclaim_link() {
+    # reclaim_link 버려진주인 : 버려진 잠금을 지운다. 지웠거나 이미 바뀌었으면 0, 다른 명령이 정리 중이면 1.
+    # 셸에는 "내용이 그대로면 지우기"를 한 번에 하는 명령이 없다. 그래서 지우는 쪽을 하나로 만든다.
+    #   - 정리 잠금 이름에 버려진 주인의 신원을 넣는다(.reclaim.PID_시작시각_부팅ID.세대). ln -s로 만든 쪽 하나만
+    #     정리한다. 잠금이 그 주인인 동안에는 정리하는 쪽 말고는 아무도 잠금을 바꿀 수 없으므로
+    #     (주인은 죽었고, ln -s는 실패한다) '내용 확인 뒤 지우기'가 안전하다.
+    #   - 정리하던 쪽이 도중에 죽으면 그 정리 잠금은 지우지 않고(지우기가 또 같은 경쟁을 만든다) 다음 세대로 넘어간다.
+    #     같은 세대는 하나만 만들 수 있고, 다음 세대는 앞 세대가 모두 죽었을 때만 쓴다.
+    #   - 신원은 다시 나오지 않으므로, 잠금이 그 주인이 아니게 된 뒤에는 그 주인의 정리 잠금이 쓸모없다.
+    #     그때 한꺼번에 치운다(남은 쪽이 그것을 다시 만들어도 잠금이 그 주인이 아니라 아무것도 지우지 않는다).
+    key=$(echo "$1" | cut -d' ' -f1-3 | tr ' ' '_')
+    generation=1
+    while [ $generation -le 5 ]; do
+        guard="$LOCK_LINK.reclaim.$key.$generation"
+        if ln -s "$(my_identity)" "$guard" 2>/dev/null; then
+            [ "$(readlink "$LOCK_LINK" 2>/dev/null)" = "$1" ] && rm -f "$LOCK_LINK"
+            rm -f "$LOCK_LINK.reclaim.$key".*
+            return 0
+        fi
+        keeper=$(readlink "$guard" 2>/dev/null)
+        [ -z "$keeper" ] && return 0   # 정리가 끝나 치워졌다: 다시 시도
+        owner_alive "$keeper" && return 1
+        generation=$((generation + 1))
+    done
+    die "버려진 잠금 정리가 여러 번 중단되었습니다. 보드를 다시 켜거나 $LOCK_LINK* 를 지우세요."
+}
+
+release_lock() {
+    # 심볼릭 링크 잠금: 내 잠금일 때만 지운다. (flock은 프로세스가 끝나면 커널이 푼다)
+    [ "$(readlink "$LOCK_LINK" 2>/dev/null)" = "$LOCK_OWNER" ] && rm -f "$LOCK_LINK"
+    return 0
+}
+
+case "$1" in
+    start|stop|restart|poweroff|savelog|boot|settime) acquire_lock "$1" ;;
+esac
 
 # 로그를 복사하는 명령은 ssh가 먼저 끊겨도(모니터 제한 시간) 끝까지 복사하고 결과를 SAVE_STATE에 남긴다.
 case "$1" in

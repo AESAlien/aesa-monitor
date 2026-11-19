@@ -67,6 +67,8 @@ class MonitorSettings:
     record_root: str = str(Path.home() / "aesa-records")
     font_size: int = 12
     auto_record: bool = False
+    # 운용 OFF→ON(새 시나리오)마다 실시간 화면(트랙·빔 기록, 문제 목록)을 지운다
+    reset_on_operation_start: bool = False
     fetch: FetchSettings = field(default_factory=FetchSettings)
 
     @property
@@ -80,6 +82,7 @@ KEYS = {
     "MONITOR_RECORD_DIR": ("record_root", str),
     "MONITOR_FONT_SIZE": ("font_size", int),
     "MONITOR_AUTO_RECORD": ("auto_record", bool),
+    "MONITOR_RESET_ON_OPERATION_START": ("reset_on_operation_start", bool),
 }
 FETCH_KEYS = {
     "MONITOR_LOG_SOURCE": ("source", str),

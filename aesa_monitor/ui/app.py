@@ -81,7 +81,10 @@ class MonitorApp:
         self._slider_dragging = False
         parameters = config.tracking if config else TrackingParameters()
         # 실시간 문제 자동 기록. 녹화를 열면 녹화에서 다시 계산한 결과(session.problems())를 쓴다.
+        self._parameters = parameters
         self._live_problems = ProblemDetector(parameters)
+        self._live.reset_on_operation_start = settings.reset_on_operation_start
+        self._seen_view_resets = 0
         self._last_problem_update = 0.0
         self._problem_tab_title = ""
         server_text = f"{config.server[0]}:{config.server[1]}" if config else "접속 안 함"
@@ -234,6 +237,11 @@ class MonitorApp:
         menu.add_command(label="파일 열기…", command=self.choose_file)
         menu.add_command(label="처리부 제어…", command=self.control_board)
         menu.add_command(label="로그 가져오기…", command=self.fetch_logs)
+        menu.add_separator()
+        menu.add_command(label="화면 초기화 (실시간)", command=self.reset_live_view)
+        self._reset_on_start = tk.BooleanVar(value=self._settings.reset_on_operation_start)
+        menu.add_checkbutton(label="운용 ON마다 화면 초기화", variable=self._reset_on_start,
+                             command=self._toggle_reset_on_start)
         menu.add_separator()
         menu.add_command(label="", state=tk.DISABLED)
         self._font_menu_index = menu.index(tk.END)
@@ -473,6 +481,29 @@ class MonitorApp:
             return
         self.board_dialog = BoardDialog(self._root, lambda: self._settings.fetch, self.fetch_logs)
 
+    def reset_live_view(self) -> None:
+        """시나리오를 바꿀 때: 실시간 화면의 트랙·빔 기록과 문제 목록을 지운다. 녹화 파일은 그대로 이어서 쓴다."""
+        self._live.reset_view()
+        self._sync_view_reset()
+
+    def _sync_view_reset(self) -> None:
+        # 화면이 초기화되면(메뉴 또는 운용 ON 자동) 문제 목록도 새로 시작한다. 감지기는 바꾸지 않고 비운다
+        # (연결 상태를 이어 가야 초기화 뒤의 처리부 끊김을 놓치지 않는다).
+        if self._live.view_resets != self._seen_view_resets:
+            self._seen_view_resets = self._live.view_resets
+            self._live_problems.reset()
+
+    def _toggle_reset_on_start(self) -> None:
+        from dataclasses import replace
+
+        value = bool(self._reset_on_start.get())
+        self._live.reset_on_operation_start = value
+        self._settings = replace(self._settings, reset_on_operation_start=value)
+        try:
+            save_settings(self._settings, self._settings_path)
+        except OSError as error:
+            messagebox.showwarning("설정 저장", f"monitor.env를 저장하지 못했습니다:\n{error}", parent=self._root)
+
     def _save_fetch_settings(self, fetch) -> None:
         from dataclasses import replace
 
@@ -646,6 +677,7 @@ class MonitorApp:
             except queue.Empty:
                 return
             self._live.apply(event)
+            self._sync_view_reset()
             if isinstance(event, LINK_EVENTS):
                 # 연결 변화는 감지 간격(0.25 s)보다 짧게 끊겼다 이어질 수 있어 사건마다 넘긴다.
                 self._live_problems.observe(event, self._live)

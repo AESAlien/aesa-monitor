@@ -15,16 +15,20 @@ sys.modules[spec.name] = win  # dataclass가 모듈을 찾으므로 먼저 등�
 spec.loader.exec_module(win)
 
 QUERY_OUTPUT = """\
-{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}|192.168.10.30|24|Up|이더넷 2
-{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}|192.168.10.10|24|Up|이더넷 2
-{11111111-2222-3333-4444-555555555555}|192.168.0.5|24|Up|Wi-Fi
-{AAAAAAAA-2222-3333-4444-555555555555}|169.254.10.3|16|Up|VMware Network Adapter VMnet1
+ADDR|{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}|192.168.10.30|24|Up|0|이더넷 2
+ADDR|{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}|192.168.10.10|24|Up|0|이더넷 2
+ADDR|{11111111-2222-3333-4444-555555555555}|192.168.0.5|24|Up|0|Wi-Fi
+ADDR|{AAAAAAAA-2222-3333-4444-555555555555}|169.254.10.3|16|Up|0|VMware Network Adapter VMnet1
 줄 형식이 아님
-{CCCCCCCC-2222-3333-4444-555555555555}|192.168.10.31|24|이전 형식(상태 없음)
-{BBBBBBBB-2222-3333-4444-555555555555}|주소아님|24|Up|이상한 줄
+{CCCCCCCC-2222-3333-4444-555555555555}|192.168.10.31|24|Up|이전 형식(ADDR 없음)
+ADDR|{BBBBBBBB-2222-3333-4444-555555555555}|주소아님|24|Up|0|이상한 줄
 """
-BUILT_IN = "{DDDDDDDD-2222-3333-4444-555555555555}|192.168.10.30|24|Disconnected|이더넷"
-USB = "{EEEEEEEE-2222-3333-4444-555555555555}|192.168.10.30|24|Up|이더넷 3"
+BUILT_IN = "ADDR|{DDDDDDDD-2222-3333-4444-555555555555}|192.168.10.30|24|Disconnected|0|이더넷"
+USB = "ADDR|{EEEEEEEE-2222-3333-4444-555555555555}|192.168.10.30|24|Up|0|이더넷 3"
+# 2026-11-19 시연 노트북: 내장(이더넷 2, 보드)과 USB(이더넷, 스위치)를 네트워크 브리지로 묶고 IP는 브리지에.
+BRIDGE = "ADDR|{BD8954A6-A2A4-4798-AA25-30C516799BA4}|192.168.10.30|24|Up|1|네트워크 브리지"
+BOARD_MEMBER = "MEMBER|{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}|Up|이더넷 2"
+SWITCH_MEMBER = "MEMBER|{E3E48079-09BB-4F22-8488-5C0D7C9F7FE9}|Up|이더넷"
 COMMAND = 'dumpcap -i {interface} -f "tcp port 3200" -P -q -w -'
 
 
@@ -35,6 +39,42 @@ class AdapterParseTest(unittest.TestCase):
         self.assertEqual(adapters[0],
                          win.Adapter("92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934", "192.168.10.30", 24, "이더넷 2", "Up"))
         self.assertEqual(adapters[0].device, r"\Device\NPF_{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}")
+
+    def test_bridge_members_attach_only_when_there_is_one_bridge(self):
+        adapters = win.parse_adapters("\n".join((BRIDGE, BOARD_MEMBER, SWITCH_MEMBER)))
+        self.assertTrue(adapters[0].bridge)
+        self.assertEqual([member.name for member in adapters[0].members], ["이더넷 2", "이더넷"])
+        second = BRIDGE.replace("BD8954A6", "CCCCCCCC").replace("192.168.10.30", "10.0.0.1")
+        adapters = win.parse_adapters("\n".join((BRIDGE, second, BOARD_MEMBER)))
+        self.assertEqual([adapter.members for adapter in adapters], [(), ()])
+
+
+class BridgeChooseTest(unittest.TestCase):
+    def choose(self, *lines):
+        return win.choose_capture_device(win.parse_adapters("\n".join(lines)), "192.168.10.20")
+
+    def test_bridge_with_one_connected_member_captures_that_member(self):
+        device, description = self.choose(BRIDGE, BOARD_MEMBER, SWITCH_MEMBER.replace("|Up|", "|Disconnected|"))
+        self.assertEqual(device, r"\Device\NPF_{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}")
+        self.assertIn("네트워크 브리지", description)
+
+    def test_bridge_with_two_connected_members_is_ambiguous(self):
+        with self.assertRaises(ValueError) as raised:
+            self.choose(BRIDGE, BOARD_MEMBER, SWITCH_MEMBER)
+        message = str(raised.exception)
+        self.assertIn("보드가 어느 쪽인지", message)
+        self.assertIn(r"\Device\NPF_{92DAE06A-C50E-4EEB-8A17-0ACBBB9A1934}", message)  # 붙여 넣을 장치 이름 안내
+        self.assertIn(r"\Device\NPF_{E3E48079-09BB-4F22-8488-5C0D7C9F7FE9}", message)
+
+    def test_bridge_without_known_members_is_not_captured(self):
+        with self.assertRaises(ValueError) as raised:
+            self.choose(BRIDGE)
+        self.assertIn("묶인 랜카드를 찾지 못했습니다", str(raised.exception))
+
+    def test_bridge_with_all_members_disconnected(self):
+        with self.assertRaises(ValueError) as raised:
+            self.choose(BRIDGE, BOARD_MEMBER.replace("|Up|", "|Disconnected|"))
+        self.assertIn("모두 연결되어 있지 않습니다", str(raised.exception))
 
 
 class ChooseDeviceTest(unittest.TestCase):

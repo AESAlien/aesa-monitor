@@ -62,10 +62,22 @@ class BoardDialog:
         self._output.configure(yscrollcommand=scroll.set)
         self._output.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        ttk.Button(self.window, text="닫기", command=self.window.destroy).grid(row=5, column=0, sticky="e", pady=(8, 0))
+        ttk.Button(self.window, text="닫기", command=self.close).grid(row=5, column=0, sticky="e", pady=(8, 0))
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.window.columnconfigure(0, weight=1)
         self.window.rowconfigure(4, weight=1)
         self.run("status")
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    def close(self) -> None:
+        # 실행 중에 닫으면 보드 명령은 계속 도는데, 다시 연 창에서 다음 명령을 보낼 수 있게 된다. 끝날 때까지 막는다.
+        if self._busy:
+            messagebox.showinfo("처리부 제어", "보드 명령이 실행 중입니다. 끝난 뒤에 닫을 수 있습니다.", parent=self.window)
+            return
+        self.window.destroy()
 
     def run(self, name: str) -> None:
         if self._busy:
