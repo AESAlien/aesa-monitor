@@ -44,7 +44,7 @@ PID_FILE="$WORK_DIR/adp.pid"   # "PID 시작시각 부팅ID" (시작시각: /pro
 PORT_WAIT_SECONDS=15   # 처리부가 서버 포트를 열 때까지 기다리는 시간
 STOP_WAIT_SECONDS=10   # SIGTERM 뒤 처리부가 끝나기를 기다리는 시간
 SAVE_STATE="$WORK_DIR/savelog.state"   # 마지막 로그 저장 결과 (status에 보임)
-LOCK_DIR=/run/aesactl.lock             # 바꾸는 명령은 한 번에 하나만 (재부팅하면 사라지는 /run)
+LOCK_LINK=/run/aesactl.lock-owner     # 바꾸는 명령은 한 번에 하나만 (심볼릭 링크, 재부팅하면 사라지는 /run)
 BIN=adp
 ENV_SRC=aesa.env
 
@@ -369,19 +369,32 @@ do_restart() {
 acquire_lock() {
     # 처리부를 바꾸는 명령(start·stop·restart·poweroff·savelog·boot)은 한 번에 하나만 실행한다.
     # 모니터 창을 닫았다 다시 열거나 두 노트북에서 동시에 눌러도, 앞 명령이 끝나기 전에는 거부한다.
-    # 앞 명령의 프로세스가 이미 없으면(강제 종료 등) 남은 잠금을 지우고 가져온다.
-    [ -d "$(dirname "$LOCK_DIR")" ] || LOCK_DIR=/tmp/aesactl.lock
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        holder=$(cat "$LOCK_DIR/pid" 2>/dev/null)
-        if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-            die "다른 aesactl 명령이 실행 중입니다 ($(cat "$LOCK_DIR/command" 2>/dev/null), PID $holder). 끝난 뒤 다시 하세요."
+    # 잠금은 심볼릭 링크 하나다. 링크 내용("PID 명령")이 주인이고, ln -s는 링크와 내용을 한 번에(원자적으로)
+    # 만든다. 그래서 '잠금은 있는데 주인이 아직 비어 있는' 순간이 없다.
+    # 주인 프로세스가 이미 없으면(강제 종료 등) 그 잠금을 지우고 다시 시도한다. 지우기 직전에 내용이
+    # 그대로인지 한 번 더 본다(그사이 다른 명령이 새로 잡은 잠금은 지우지 않는다).
+    [ -d "$(dirname "$LOCK_LINK")" ] || LOCK_LINK=/tmp/aesactl.lock-owner
+    LOCK_OWNER="$$ $*"
+    tries=0
+    while ! ln -s "$LOCK_OWNER" "$LOCK_LINK" 2>/dev/null; do
+        holder=$(readlink "$LOCK_LINK" 2>/dev/null)
+        holder_pid=${holder%% *}
+        if [ -n "$holder" ] && kill -0 "$holder_pid" 2>/dev/null; then
+            die "다른 aesactl 명령이 실행 중입니다 (${holder#* }, PID $holder_pid). 끝난 뒤 다시 하세요."
         fi
-        rm -rf "$LOCK_DIR"
-        mkdir "$LOCK_DIR" 2>/dev/null || die "잠금($LOCK_DIR)을 만들지 못했습니다."
-    fi
-    echo $$ > "$LOCK_DIR/pid"
-    echo "$*" > "$LOCK_DIR/command"
-    trap 'rm -rf "$LOCK_DIR"' EXIT
+        if [ -n "$holder" ] && [ "$(readlink "$LOCK_LINK" 2>/dev/null)" = "$holder" ]; then
+            rm -f "$LOCK_LINK"
+        fi
+        tries=$((tries + 1))
+        [ $tries -lt 5 ] || die "잠금($LOCK_LINK)을 얻지 못했습니다."
+    done
+    trap release_lock EXIT
+}
+
+release_lock() {
+    # 내 잠금일 때만 지운다.
+    [ "$(readlink "$LOCK_LINK" 2>/dev/null)" = "$LOCK_OWNER" ] && rm -f "$LOCK_LINK"
+    return 0
 }
 
 case "$1" in

@@ -262,6 +262,23 @@ class TrackEndTest(unittest.TestCase):
         self.assertIn("3개 동시 소실", groups[0].title)
         self.assertEqual([problem for problem in problems if problem.track_id in ids], [])
 
+    def test_reused_track_id_after_processor_restart_is_watched_again(self):
+        # 재시작 전에 트랙 7이 영역 이탈(정상)로 분류되어도, 재시작 뒤 같은 번호의 새 트랙 미탐은 기록한다.
+        limit = PARAMETERS.max_consecutive_tracking_misses
+        interval = PARAMETERS.tracking_interval_ms
+        recording = Recording()
+        recording.beams(0, 12000, skip=tracking_slots(12000, 1))
+        tracked(recording, [7], 6000, missed={(7, 5005)})
+        recording.add(10000, TrackList([]))
+        recording.offset_s = 13.0  # 처리부 재시작: 처리부 시각이 0부터 다시
+        recording.beams(0, 14000, skip=tracking_slots(14000, 1))
+        misses = {(7, 3005 + interval * index) for index in range(limit)}
+        tracked(recording, [7], 3005 + interval * limit, missed=misses)
+        recording.add(3005 + interval * limit + 100, TrackList([]))
+        problems = recording.scan()
+        self.assertEqual(len([problem for problem in of_kind(problems, "miss") if problem.track_id == 7]), 1)
+        self.assertEqual(len([problem for problem in of_kind(problems, "ended") if problem.track_id == 7]), 1)
+
     def test_restart_does_not_count_as_track_end(self):
         recording = Recording()
         recording.beams(0, 5000)

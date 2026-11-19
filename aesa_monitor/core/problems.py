@@ -345,6 +345,12 @@ class ProblemDetector:
         self._seen_gap = None
         self._seen_delay = None
         self._samples.clear()
+        # 트랙 소실 분류 장부도 비운다. 재시작한 처리부는 트랙 번호를 다시 쓸 수 있어, 남겨 두면
+        # 같은 번호의 새 트랙 미탐을 조용히 건너뛰고, 재시작 전 시각이 새 동시 소실 묶음에 섞인다.
+        self._quiet_tracks.clear()
+        self._recent_losses.clear()
+        self._mass_loss = None
+        self._mass_loss_ids = set()
 
     # 빔
 

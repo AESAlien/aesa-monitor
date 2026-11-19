@@ -215,7 +215,7 @@ class RunAesaScriptTest(unittest.TestCase):
             "SD_DEVICE=/dev/mmcblk0p1": "SD_DEVICE=/dev/aesa-test-none",
             "PORT_WAIT_SECONDS=15": "PORT_WAIT_SECONDS=2",
             "STOP_WAIT_SECONDS=10": "STOP_WAIT_SECONDS=2",
-            "LOCK_DIR=/run/aesactl.lock": f"LOCK_DIR={self.folder}/aesactl.lock",
+            "LOCK_LINK=/run/aesactl.lock-owner": f"LOCK_LINK={self.folder}/aesactl.lock-owner",
         }
         for old, new in replacements.items():
             self.assertIn(old, text)
@@ -396,10 +396,8 @@ class RunAesaScriptTest(unittest.TestCase):
         self.assertIn("완료: 복사", (self.work / "savelog.state").read_text(encoding="utf-8"))
 
     def hold_lock(self, pid, command="stop"):
-        lock = self.folder / "aesactl.lock"
-        lock.mkdir()
-        (lock / "pid").write_text(f"{pid}\n", encoding="utf-8")
-        (lock / "command").write_text(f"{command}\n", encoding="utf-8")
+        lock = self.folder / "aesactl.lock-owner"
+        os.symlink(f"{pid} {command}", lock)
         return lock
 
     def test_command_is_refused_while_another_holds_the_lock(self):
@@ -411,7 +409,7 @@ class RunAesaScriptTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("다른 aesactl 명령이 실행 중", result.stderr)
         self.assertFalse((self.work / "adp.pid").exists(), "처리부를 띄웠음")
-        self.assertTrue(lock.is_dir(), "남의 잠금을 지웠음")
+        self.assertTrue(lock.is_symlink(), "남의 잠금을 지웠음")
 
     def test_status_is_not_blocked_by_the_lock(self):
         other = self.unrelated_process()
@@ -424,4 +422,19 @@ class RunAesaScriptTest(unittest.TestCase):
         dead.wait()
         lock = self.hold_lock(dead.pid)
         self.start()
-        self.assertFalse(lock.exists(), "명령이 끝났는데 잠금이 남음")
+        self.assertFalse(lock.is_symlink(), "명령이 끝났는데 잠금이 남음")
+
+
+    def test_simultaneous_commands_run_one_at_a_time(self):
+        # 두 노트북에서 동시에 시작을 누름: 하나만 실행되고 다른 하나는 잠금 때문에 거부된다.
+        (self.folder / "listen").touch()
+        processes = [subprocess.Popen(["sh", str(self.script), "start"], stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        results = [(process.wait(timeout=30), process.stderr.read()) for process in processes]
+        codes = sorted(code for code, _ in results)
+        self.assertEqual(codes[0], 0, results)
+        self.assertNotEqual(codes[1], 0, results)
+        self.assertTrue(any("다른 aesactl 명령이 실행 중" in error for _, error in results), results)
+        for process in processes:
+            process.stdout.close()
+            process.stderr.close()
