@@ -305,6 +305,28 @@ class TrackEndTest(unittest.TestCase):
         self.assertEqual([group.amount for group in groups], [4])
         self.assertEqual([problem for problem in problems if problem.track_id in first + late], [])
 
+    def test_loss_batches_across_reconnect_are_separate_incidents(self):
+        # 모니터가 처리부와 다시 연결됨(처리부는 재시작하지 않아 시각이 이어짐): 앞 묶음 사건을 닫고 새로 센다.
+        limit = PARAMETERS.max_consecutive_tracking_misses
+        interval = PARAMETERS.tracking_interval_ms
+        first, second = [7, 8, 9], [10, 11, 12]
+        first_end = 3005 + interval * limit
+        second_end = first_end + 4000
+        recording = Recording()
+        recording.beams(0, 16000, skip=tracking_slots(16000, 6))
+        misses = {(track_id, first_end - interval * (index + 1)) for track_id in first for index in range(limit)}
+        misses |= {(track_id, second_end - interval * (index + 1)) for track_id in second for index in range(limit)}
+        ends = {**{track_id: first_end for track_id in first}, **{track_id: second_end for track_id in second}}
+        tracked(recording, first + second, second_end, missed=misses, ends=ends)
+        # 앞 묶음이 사건으로 잡힌 뒤(그 사건의 유예 시간 안), 뒤 묶음의 미탐이 시작되기 전에 다시 연결된다.
+        recording.add(first_end + 600, ConnectionChanged(False))
+        recording.add(first_end + 700, ConnectionChanged(True))
+        recording.add(second_end + 100, TrackList([]))
+        problems = recording.scan()
+        groups = of_kind(problems, "mass-loss")
+        self.assertEqual([group.amount for group in groups], [3, 3])
+        self.assertFalse(groups[0].open)
+
     def test_reused_track_id_after_processor_restart_is_watched_again(self):
         # 재시작 전에 트랙 7이 영역 이탈(정상)로 분류되어도, 재시작 뒤 같은 번호의 새 트랙 미탐은 기록한다.
         limit = PARAMETERS.max_consecutive_tracking_misses

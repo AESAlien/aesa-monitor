@@ -233,8 +233,10 @@ class ProblemDetector:
         if item is None or item.problem is not group:
             group = None  # 유예 시간이 지나 이미 닫혔다
         if group is not None and group.start_ms is not None and last_ms - group.start_ms > MASS_LOSS_WINDOW_MS:
-            self._close_mass_loss()
             group = None
+        if group is None:
+            # 새 묶음은 언제나 새 사건이다. 열린 동시 소실 사건이 남아 있어도 _report가 그것에 붙이지 않게 닫는다.
+            self._close_mass_loss()
         # 이미 어느 사건에 들어간 소실은 새 묶음의 개수에 넣지 않는다.
         fresh = [item for item in self._recent_losses if item[1] not in self._quiet_tracks]
         if group is None and len(fresh) < MASS_LOSS_MIN_TRACKS:
@@ -261,11 +263,10 @@ class ProblemDetector:
         return True
 
     def _close_mass_loss(self) -> None:
-        """지금 묶고 있는 동시 소실 사건을 닫는다. 다음 소실은 새 사건으로 연다."""
-        item = self._open.get(("mass-loss", None))
-        if item is not None and item.problem is self._mass_loss:
+        """열린 동시 소실 사건을 닫는다. 다음 소실은 새 사건으로 연다."""
+        item = self._open.pop(("mass-loss", None), None)
+        if item is not None:
             item.problem.open = False
-            del self._open[("mass-loss", None)]
         self._mass_loss = None
         self._mass_loss_ids = set()
 
@@ -369,10 +370,11 @@ class ProblemDetector:
         self._samples.clear()
         # 트랙 소실 분류 장부도 비운다. 재시작한 처리부는 트랙 번호를 다시 쓸 수 있어, 남겨 두면
         # 같은 번호의 새 트랙 미탐을 조용히 건너뛰고, 재시작 전 시각이 새 동시 소실 묶음에 섞인다.
+        # 열린 동시 소실 사건도 닫는다. 남겨 두면 다시 연결된 뒤의 소실 묶음이 그 사건에 붙어 개수가 부풀어 오른다
+        # (처리부가 재시작하지 않아 시각이 이어지는 재연결은 _watch_restart가 열린 사건을 닫지 않는다).
         self._quiet_tracks.clear()
         self._recent_losses.clear()
-        self._mass_loss = None
-        self._mass_loss_ids = set()
+        self._close_mass_loss()
 
     # 빔
 
