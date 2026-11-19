@@ -3,6 +3,7 @@ import unittest
 from aesa_monitor.core.config import TrackingParameters
 from aesa_monitor.core.events import PEER_SIMULATOR, ConnectionChanged, PeerLinkChanged
 from aesa_monitor.core.problems import BAD, MASS_LOSS_WINDOW_MS, WARN, ProblemDetector, scan_events
+from aesa_monitor.core.state import MonitorState
 from aesa_monitor.core.protocol import (
     Beam, BeamType, Detection, MonitorStatus, OperatorControl, Plot, Track, TrackList,
 )
@@ -42,6 +43,24 @@ class Recording:
     def scan(self):
         self.events.sort(key=lambda item: item[0])
         return scan_events(self.events, PARAMETERS)
+
+    def scan_at(self, update_times):
+        """검사(update)를 정한 녹화 시각에만 한다. 실시간에서 검사가 밀린 경우를 흉내 낸다."""
+        self.events.sort(key=lambda item: item[0])
+        position = [0.0]
+        state = MonitorState(clock=lambda: position[0])
+        detector = ProblemDetector(PARAMETERS)
+        pending = sorted(update_times)
+        for time_s, event in self.events:
+            while pending and time_s >= pending[0]:
+                position[0] = pending.pop(0)
+                detector.update(state)
+            position[0] = time_s
+            state.apply(event, time_s)
+        for time_s in pending:
+            position[0] = time_s
+            detector.update(state)
+        return detector.problems
 
 
 def of_kind(problems, kind):
@@ -230,6 +249,22 @@ class TrackEndTest(unittest.TestCase):
         problems = recording.scan()
         self.assertEqual([problem for problem in problems if problem.track_id == 7], [])
 
+    def test_earlier_miss_is_kept_whatever_the_update_timing(self):
+        # 생애 앞쪽의 미탐(2초)은 영역 이탈(5초 미탐 뒤 다음 빔 없음)과 상관없이 남고, 끝 미탐(5초)은 빠진다.
+        #   [2, 12]: 검사가 밀려 트랙 종료와 앞쪽 사이클 확정을 한 번에 봄(실시간 큐가 쌓인 경우)
+        #   [3, 6, 9, 12]: 끝 미탐이 앞 미탐 사건에 먼저 붙은 뒤 종료를 봄
+        for updates in ([2.0, 12.0], [3.0, 6.0, 9.0, 12.0], [index / 2 for index in range(1, 25)]):
+            with self.subTest(updates=updates):
+                recording = Recording()
+                recording.beams(0, 12000, skip=tracking_slots(12000, 1))
+                tracked(recording, [7], 6000, missed={(7, 2005), (7, 5005)})
+                recording.add(10000, TrackList([]))
+                problems = recording.scan_at(updates)
+                misses = [problem for problem in of_kind(problems, "miss") if problem.track_id == 7]
+                self.assertEqual([(problem.start_ms, problem.end_ms, problem.count) for problem in misses],
+                                 [(2005, 2005, 1)])
+                self.assertEqual(of_kind(problems, "ended"), [])
+
     def test_tracks_cleared_by_operation_off_are_not_recorded(self):
         recording = Recording()
         recording.beams(0, 5500, skip=tracking_slots(5500, 2))
@@ -268,6 +303,25 @@ class TrackEndTest(unittest.TestCase):
         self.assertEqual(groups[0].amount, 3)
         self.assertIn("3개 동시 소실", groups[0].title)
         self.assertEqual([problem for problem in problems if problem.track_id in ids], [])
+
+    def test_earlier_miss_of_track_in_mass_loss_is_kept(self):
+        # 동시 소실에 든 트랙도 생애 앞쪽의 미탐(2초)은 남는다. 끝 미탐 구간만 동시 소실 사건으로 옮긴다.
+        limit = PARAMETERS.max_consecutive_tracking_misses
+        interval = PARAMETERS.tracking_interval_ms
+        ids = [7, 8, 9]
+        end = 4005 + interval * limit
+        for updates in (None, [3.0, 5.5, 8.0, 12.0], [2.0, 12.0]):
+            with self.subTest(updates=updates):
+                recording = Recording()
+                recording.beams(0, 14000, skip=tracking_slots(14000, len(ids)))
+                misses = {(track_id, end - interval * (index + 1)) for track_id in ids for index in range(limit)}
+                tracked(recording, ids, end, missed=misses | {(7, 2005)})
+                recording.add(end + 100, TrackList([]))
+                problems = recording.scan() if updates is None else recording.scan_at(updates)
+                self.assertEqual([group.amount for group in of_kind(problems, "mass-loss")], [3])
+                kept = [(problem.kind, problem.track_id, problem.start_ms, problem.end_ms)
+                        for problem in problems if problem.track_id in ids]
+                self.assertEqual(kept, [("miss", 7, 2005, 2005)])
 
     def test_loss_batches_further_apart_than_window_are_separate_incidents(self):
         # 두 묶음(3개씩)이 4초 간격으로 사라짐: 3초 창 하나에 여섯 개가 다 들어가지 않으므로 '3개 동시 소실' 두 건이다.
@@ -361,6 +415,47 @@ class TrackEndTest(unittest.TestCase):
                 self.assertEqual(groups[0].start_ms, 5000)
                 self.assertLessEqual(groups[0].end_ms - groups[0].start_ms, MASS_LOSS_WINDOW_MS)
                 self.assertFalse(grouped[1])
+
+    def test_late_loss_does_not_rewind_incident_freshness(self):
+        # 사건(5.0~5.1초)에 그보다 앞선 소실(4.9초)이 늦게 붙어도, 사건의 유예 시간은 가장 늦은 소실(5.1초)부터 센다.
+        detector = ProblemDetector(PARAMETERS)
+        grace = 4000
+        grouped = [detector._group_loss(track_id, [], at_ms, 0.0, grace)
+                   for track_id, at_ms in ((7, 5000), (8, 5050), (9, 5100), (10, 4900))]
+        self.assertEqual(grouped, [False, False, True, True])
+        limit_ms = grace + MASS_LOSS_WINDOW_MS
+        detector._close_stale(0.0, 5100 + limit_ms - 50)   # 4.9초 기준으로는 지났지만 5.1초 기준으로는 아직
+        self.assertIn(("mass-loss", None), detector._open)
+        self.assertTrue(detector._group_loss(11, [], 5150, 0.0, grace))
+        groups = of_kind(detector.problems, "mass-loss")
+        self.assertEqual([group.amount for group in groups], [5])
+        self.assertEqual((groups[0].start_ms, groups[0].end_ms), (4900, 5150))
+
+    def test_random_loss_orders_keep_incidents_consistent(self):
+        # 소실 시각·순서를 무작위로 섞어도: 사건 하나의 길이는 창 이하, 한 트랙은 사건 하나에만, 개수는 트랙 수와 같다.
+        import random
+        import re
+        generator = random.Random(20261120)
+        for _ in range(300):
+            detector = ProblemDetector(PARAMETERS)
+            losses = []
+            track_id = 1
+            for _cluster in range(generator.randint(1, 4)):
+                center = generator.randint(0, 20000)
+                for _ in range(generator.randint(1, 5)):
+                    losses.append((track_id, center + generator.randint(-2500, 2500)))
+                    track_id += 1
+            generator.shuffle(losses)
+            for lost_id, at_ms in losses:
+                detector._group_loss(lost_id, [], max(at_ms, 0), 0.0, 4000)
+            seen = set()
+            for group in of_kind(detector.problems, "mass-loss"):
+                members = {int(item) for item in re.findall(r"#(\d+)", group.detail)}
+                self.assertEqual(group.amount, len(members), group.detail)
+                self.assertGreaterEqual(group.amount, 3)
+                self.assertLessEqual(group.end_ms - group.start_ms, MASS_LOSS_WINDOW_MS, losses)
+                self.assertFalse(members & seen, losses)
+                seen |= members
 
     def test_reused_track_id_after_processor_restart_is_watched_again(self):
         # 재시작 전에 트랙 7이 영역 이탈(정상)로 분류되어도, 재시작 뒤 같은 번호의 새 트랙 미탐은 기록한다.

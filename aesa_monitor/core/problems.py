@@ -121,8 +121,11 @@ class ProblemDetector:
     _live_tracks: Set[int] = field(default_factory=set)
     # 최근 미탐 한도로 사라진 트랙: (마지막 사이클 시각, 트랙, 끝 미탐 구간 시작 시각). 시각 순으로 둔다.
     _recent_losses: List[Tuple[int, int, int]] = field(default_factory=list)
-    # 정상 종료(영역 이탈)나 동시 소실로 처리한 트랙. 늦게 확정되는 사이클의 미탐을 다시 기록하지 않는다.
-    _quiet_tracks: Set[int] = field(default_factory=set)
+    # 정상 종료(영역 이탈)나 동시 소실로 처리한 트랙: {트랙: 끝 미탐 구간 시작 시각}. 그 시각부터의 사이클만
+    # 기록하지 않는다(늦게 확정되는 끝 미탐). 그 앞의 미탐은 트랙 생애 중의 문제라 남긴다.
+    _quiet_tracks: Dict[int, int] = field(default_factory=dict)
+    # 최근 소실 트랙의 사이클(동시 소실로 묶을 때 끝 미탐 구간을 문제에서 덜어 내는 데 쓴다)
+    _loss_cycles: Dict[int, list] = field(default_factory=dict)
     _mass_loss: Optional[Problem] = None
     _mass_loss_ids: Set[int] = field(default_factory=set)
     _mass_loss_span: Tuple[int, int] = (0, 0)   # 지금 사건에 든 소실의 처음·마지막 처리부 시각
@@ -233,8 +236,11 @@ class ProblemDetector:
         run_start = self._trailing_run_start(cycles)
         loss = (last_ms, track_id, run_start if run_start is not None else last_ms)
         insort(self._recent_losses, loss)
+        self._loss_cycles[track_id] = list(cycles)
         newest_ms = self._recent_losses[-1][0]
         self._recent_losses = [item for item in self._recent_losses if item[0] >= newest_ms - MASS_LOSS_KEEP_MS]
+        kept = {item[1] for item in self._recent_losses}
+        self._loss_cycles = {key: value for key, value in self._loss_cycles.items() if key in kept}
         if loss not in self._recent_losses:
             return False  # 이미 지난 소실들보다 한참 앞선 소실: 따로 기록한다
         group = self._mass_loss
@@ -260,8 +266,7 @@ class ProblemDetector:
             if max(high, at_ms) - min(low, at_ms) > MASS_LOSS_WINDOW_MS:
                 continue  # 이 사건의 창 밖(지금 사건보다 앞선 소실): 따로 둔다
             low, high = min(low, at_ms), max(high, at_ms)
-            self._quiet_tracks.add(lost_id)
-            self._retract("miss", lost_id, since_ms)
+            self._silence(lost_id, since_ms, self._loss_cycles.get(lost_id, []))
             self._retract("ended", lost_id, since_ms)
             at_s = self._clock_for(at_ms, now_s)
             problem = self._report("mass-loss", CATEGORY_TRACK, WARN, "", "", at_ms, at_s, amount=1,
@@ -299,6 +304,39 @@ class ProblemDetector:
         self._mass_loss_span = (0, 0)
         self._mass_loss_ids = set()
 
+    def _silence(self, track_id: int, since_ms: int, cycles) -> None:
+        """이 트랙의 since_ms(처리부 시각)부터의 사이클은 정상(영역 이탈, 동시 소실)이다. 그 뒤로 시작한 미탐 문제는
+        지우고, 그 앞에서 시작해 이어진 미탐 문제는 since_ms 앞의 미탐만 남게 줄인다. 앞으로 확정되는 since_ms
+        이후 사이클도 기록하지 않는다.
+        """
+        self._quiet_tracks[track_id] = min(since_ms, self._quiet_tracks.get(track_id, since_ms))
+        self._retract("miss", track_id, since_ms)
+        limit = self.parameters.max_consecutive_tracking_misses
+        for problem in self.problems:
+            if (problem.kind != "miss" or problem.track_id != track_id or problem.start_ms is None
+                    or problem.end_ms is None or not problem.start_ms < since_ms <= problem.end_ms):
+                continue
+            runs = []   # since_ms 앞의, 이 문제에 든 미탐 사이클마다 그때까지의 연속 미탐 수
+            consecutive = 0
+            for cycle in cycles:
+                if cycle.time_ms >= since_ms:
+                    break
+                consecutive = consecutive + 1 if cycle.outcome == Outcome.MISSED else 0
+                if cycle.outcome == Outcome.MISSED and cycle.time_ms >= problem.start_ms:
+                    runs.append((cycle.time_ms, consecutive))
+            if not runs:
+                continue  # 사이클 기록이 없다(오래되어 잘림): 그대로 둔다
+            worst_run = max(run for _time, run in runs)
+            problem.count = len(runs)
+            problem.amount = worst_run
+            problem.end_ms = runs[-1][0]
+            problem.end_s = self._clock_for(problem.end_ms, problem.end_s if problem.end_s is not None else 0.0)
+            problem.level = BAD if worst_run >= max(limit - 1, 1) else WARN
+            problem.detail = f"연속 미탐 최대 {worst_run}/{limit}"
+            item = self._open.pop(("miss", track_id), None)   # 트랙이 끝났으므로 더 이어지지 않는다
+            if item is not None:
+                item.problem.open = False
+
     def _retract(self, kind: str, track_id: int, since_ms: int) -> None:
         """since_ms(처리부 시각) 이후에 시작한 이 트랙의 문제를 지운다. 나중에 정상으로 밝혀진 경우에 쓴다."""
         def gone(problem: Problem) -> bool:
@@ -331,7 +369,9 @@ class ProblemDetector:
                 problem.end_ms = at_ms
             if problem.end_s is None or at_s > problem.end_s:
                 problem.end_s = at_s
-            item.last_ms = at_ms if at_ms is not None else item.last_ms
+            # 사건의 마지막 시각은 되돌리지 않는다(앞선 시각의 발생이 늦게 와도 유예 시간은 가장 늦은 발생부터)
+            if at_ms is not None and (item.last_ms is None or at_ms > item.last_ms):
+                item.last_ms = at_ms
             item.last_s = max(item.last_s, at_s)
             return problem
         problem = Problem(kind, category, level, title, detail, at_ms, at_ms, at_s, at_s, track_id,
@@ -403,6 +443,7 @@ class ProblemDetector:
         # (처리부가 재시작하지 않아 시각이 이어지는 재연결은 _watch_restart가 열린 사건을 닫지 않는다).
         self._quiet_tracks.clear()
         self._recent_losses.clear()
+        self._loss_cycles.clear()
         self._close_mass_loss()
 
     # 빔
@@ -492,8 +533,7 @@ class ProblemDetector:
                 # (트랙 생애 앞쪽의 미탐은 그대로 둔다).
                 run_start = self._trailing_run_start(cycles)
                 if run_start is not None:
-                    self._retract("miss", track_id, run_start)
-                    self._quiet_tracks.add(track_id)
+                    self._silence(track_id, run_start, cycles)
                 continue
             last_ms = cycles[-1].time_ms if cycles else now_ms
             if misses and self._group_loss(track_id, cycles, last_ms, now_s, grace):
@@ -516,7 +556,8 @@ class ProblemDetector:
                 if mark in self._seen_cycles or cycle.outcome == Outcome.PENDING:
                     continue
                 self._seen_cycles.add(mark)
-                if track_id in self._quiet_tracks:
+                quiet_from = self._quiet_tracks.get(track_id)
+                if quiet_from is not None and cycle.time_ms >= quiet_from:
                     continue
                 at_s = self._clock_for(cycle.time_ms, now_s)
                 if cycle.outcome == Outcome.MISSED:
