@@ -173,7 +173,8 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/aesactl boot
 ExecStop=/usr/local/sbin/aesactl stop
-TimeoutStopSec=30
+# 종료 때 로그를 SD로 복사한다(ssh 제어의 stop 제한 시간 150초와 맞춤). 넘기면 systemd가 강제로 끝낸다.
+TimeoutStopSec=180
 
 [Install]
 WantedBy=multi-user.target

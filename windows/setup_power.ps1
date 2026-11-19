@@ -1,9 +1,10 @@
 ﻿# aesa 시연용 노트북 전원 설정 (Windows). setup_power.bat을 두 번 눌러 실행한다(관리자 권한 필요).
 #
-# 시연 중 노트북이 잠들거나 USB 랜 어댑터 전원이 꺼지면 캡처가 끊긴다. 현재 전원 계획에서 아래를 끈다.
+# 시연 중 노트북이 잠들거나 USB 랜 어댑터 전원이 꺼지면 캡처가 끊긴다. 지금 쓰는 전원 구성표에서 아래를 끈다.
 #   절전·최대 절전(AC/배터리), 화면 끄기(AC), 덮개 닫을 때 동작(AC/배터리), USB 선택적 절전(AC/배터리)
 #   유선 랜카드의 "전원을 아끼기 위해 컴퓨터가 이 장치를 끌 수 있음"
-# 바꾸기 전 값은 바꾸기 전에 %LOCALAPPDATA%\aesa-monitor\power-backup.json에 저장하고, 메뉴 2번으로 되돌린다.
+# 바꾸기 전에 그 구성표의 GUID와 원래 값을 %LOCALAPPDATA%\aesa-monitor\power-backup.json에 저장하고,
+# 메뉴 2번은 그 구성표에 원래 값을 되돌린 뒤 그 구성표를 다시 활성화한다(그사이 구성표를 바꿨어도 다른 구성표는 건드리지 않음).
 # 바꾸다 실패하면 이번에 바꾼 값을 바로 되돌린다.
 # (랜카드 전원 관리는 되돌리지 않는다. 장치 관리자 > 랜카드 > 전원 관리에서 직접 켤 수 있다.)
 #
@@ -16,6 +17,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $BackupPath = Join-Path $env:LOCALAPPDATA "aesa-monitor\power-backup.json"
+$GuidPattern = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 # 이름, 하위 그룹, 설정, AC에 넣을 값, 배터리(DC)에 넣을 값($null이면 그대로)
 $Settings = @(
     @{ Name = "절전까지 시간";         Group = "SUB_SLEEP";   Setting = "STANDBYIDLE";   Ac = 0; Dc = 0 },
@@ -37,42 +39,63 @@ function Invoke-PowerCfg([string[]]$Arguments) {
     return $output
 }
 
-function Get-CurrentValue($Item) {
+function Get-ActiveScheme {
+    # powercfg /getactivescheme 출력에서 GUID만 꺼낸다(언어와 무관).
+    $text = (Invoke-PowerCfg @("/getactivescheme")) -join "`n"
+    $match = [regex]::Match($text, $GuidPattern)
+    if (-not $match.Success) { throw "지금 전원 구성표 GUID를 읽지 못했습니다: $text" }
+    return $match.Value.ToLower()
+}
+
+function Get-CurrentValue([string]$Scheme, $Item) {
     # powercfg /query 출력은 언어마다 다르지만, 마지막 두 16진수 값이 현재 AC, DC 값이다.
-    $text = (Invoke-PowerCfg @("/query", "SCHEME_CURRENT", $Item.Group, $Item.Setting)) -join "`n"
+    $text = (Invoke-PowerCfg @("/query", $Scheme, $Item.Group, $Item.Setting)) -join "`n"
     $values = @([regex]::Matches($text, "0x[0-9a-fA-F]{8}") | ForEach-Object { [Convert]::ToInt64($_.Value, 16) })
     if ($values.Count -lt 2) { return $null }
     return @{ Ac = $values[-2]; Dc = $values[-1] }
 }
 
-function Set-Value($Item, $Ac, $Dc) {
-    if ($null -ne $Ac) { Invoke-PowerCfg @("/setacvalueindex", "SCHEME_CURRENT", $Item.Group, $Item.Setting, "$Ac") | Out-Null }
-    if ($null -ne $Dc) { Invoke-PowerCfg @("/setdcvalueindex", "SCHEME_CURRENT", $Item.Group, $Item.Setting, "$Dc") | Out-Null }
+function Set-Value([string]$Scheme, $Item, $Ac, $Dc) {
+    if ($null -ne $Ac) { Invoke-PowerCfg @("/setacvalueindex", $Scheme, $Item.Group, $Item.Setting, "$Ac") | Out-Null }
+    if ($null -ne $Dc) { Invoke-PowerCfg @("/setdcvalueindex", $Scheme, $Item.Group, $Item.Setting, "$Dc") | Out-Null }
 }
 
-function Save-Backup($Values) {
+function Read-Backup {
+    if (-not (Test-Path $BackupPath)) { return $null }
+    $backup = Get-Content -Raw $BackupPath | ConvertFrom-Json
+    if (-not $backup.Scheme -or -not $backup.Values) { throw "백업 형식을 알 수 없습니다: $BackupPath" }
+    return $backup
+}
+
+function Save-Backup([string]$Scheme, $Values) {
     # 바꾸기 전 값을 먼저 저장한다. 임시 파일에 쓰고 옮겨서, 쓰다 실패해도 반쪽 파일이 남지 않게 한다.
     New-Item -ItemType Directory -Force -Path (Split-Path $BackupPath) | Out-Null
     $temporary = "$BackupPath.tmp"
-    $Values | ConvertTo-Json | Set-Content -Encoding UTF8 $temporary
+    @{ Scheme = $Scheme; Values = $Values } | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 $temporary
     Move-Item -Force $temporary $BackupPath
 }
 
 function Invoke-Apply {
+    $scheme = Get-ActiveScheme
+    $existing = Read-Backup
+    if ($existing -and $existing.Scheme -ne $scheme) {
+        throw ("이전 백업은 다른 전원 구성표({0})의 것입니다(지금 {1}). 먼저 2번으로 되돌린 뒤 다시 실행하세요." -f
+            $existing.Scheme, $scheme)
+    }
     # 1. 바꾸기 전 값을 모두 읽는다(아직 아무것도 바꾸지 않음).
     $original = [ordered]@{}
     foreach ($item in $Settings) {
         $current = $null
-        try { $current = Get-CurrentValue $item } catch { }
+        try { $current = Get-CurrentValue $scheme $item } catch { }
         if ($null -eq $current) { Write-Host ("  건너뜀: {0} (이 노트북에 없는 설정)" -f $item.Name); continue }
         $original[$item.Setting] = $current
     }
     # 2. 백업을 바꾸기 전에 저장한다. 저장하지 못하면 아무것도 바꾸지 않고 끝낸다.
-    if (Test-Path $BackupPath) {
+    if ($existing) {
         Write-Host "이전 백업이 있어 그대로 둡니다 (처음 값 보존): $BackupPath"
     } else {
-        Save-Backup $original
-        Write-Host "바꾸기 전 값 저장: $BackupPath"
+        Save-Backup $scheme $original
+        Write-Host "바꾸기 전 값 저장 (구성표 $scheme): $BackupPath"
     }
     # 3. 바꾼다. 중간에 실패하면 이번에 바꾼 것을 읽어 둔 값으로 되돌리고 실패로 끝낸다.
     $changed = @()
@@ -81,18 +104,18 @@ function Invoke-Apply {
             $current = $original[$item.Setting]
             if ($null -eq $current) { continue }
             $changed += $item
-            Set-Value $item $item.Ac $item.Dc
+            Set-Value $scheme $item $item.Ac $item.Dc
             Write-Host ("  {0}: AC {1} -> {2}, 배터리 {3} -> {4}" -f $item.Name, $current.Ac, $item.Ac, $current.Dc,
                 $(if ($null -eq $item.Dc) { "그대로" } else { $item.Dc }))
         }
-        Invoke-PowerCfg @("/setactive", "SCHEME_CURRENT") | Out-Null
+        Invoke-PowerCfg @("/setactive", $scheme) | Out-Null
     } catch {
         $failure = $_.Exception.Message
         foreach ($item in $changed) {
             $saved = $original[$item.Setting]
-            try { Set-Value $item $saved.Ac $saved.Dc } catch { }
+            try { Set-Value $scheme $item $saved.Ac $saved.Dc } catch { }
         }
-        try { Invoke-PowerCfg @("/setactive", "SCHEME_CURRENT") | Out-Null } catch { }
+        try { Invoke-PowerCfg @("/setactive", $scheme) | Out-Null } catch { }
         throw "전원 설정을 바꾸다 실패해 이번에 바꾼 값을 되돌렸습니다($failure). 남은 것이 있으면 2번으로 백업 값으로 되돌리세요."
     }
     $wired = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object {
@@ -110,15 +133,20 @@ function Invoke-Apply {
 }
 
 function Invoke-Restore {
-    if (-not (Test-Path $BackupPath)) { throw "백업이 없습니다: $BackupPath (1번을 실행한 적이 없거나 이미 되돌림)" }
-    $backup = Get-Content -Raw $BackupPath | ConvertFrom-Json
+    $backup = Read-Backup
+    if (-not $backup) { throw "백업이 없습니다: $BackupPath (1번을 실행한 적이 없거나 이미 되돌림)" }
+    $scheme = $backup.Scheme
     foreach ($item in $Settings) {
-        $saved = $backup.($item.Setting)
+        $saved = $backup.Values.($item.Setting)
         if ($null -eq $saved) { continue }
-        Set-Value $item $saved.Ac $saved.Dc
+        Set-Value $scheme $item $saved.Ac $saved.Dc
         Write-Host ("  {0}: AC {1}, 배터리 {2}로 되돌림" -f $item.Name, $saved.Ac, $saved.Dc)
     }
-    Invoke-PowerCfg @("/setactive", "SCHEME_CURRENT") | Out-Null
+    $active = Get-ActiveScheme
+    Invoke-PowerCfg @("/setactive", $scheme) | Out-Null
+    if ($active -ne $scheme) {
+        Write-Host "1번을 실행할 때 쓰던 전원 구성표($scheme)로 되돌렸습니다(그사이 $active 로 바뀌어 있었음)."
+    }
     Remove-Item $BackupPath
     Write-Host "완료. 랜카드 전원 관리는 장치 관리자에서 직접 켜야 합니다."
 }

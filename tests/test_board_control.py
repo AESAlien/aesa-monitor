@@ -138,6 +138,14 @@ class BoardScriptTest(unittest.TestCase):
         self.assertIn(f"WORK_DIR={DEFAULT_REMOTE_DIR.rsplit('/logs', 1)[0]}\n", text)
         self.assertIn(f"{AESACTL}", (ROOT / "board" / "install_board.sh").read_text(encoding="utf-8"))
 
+    def test_systemd_stop_timeout_covers_log_copy(self):
+        # 종료 때 aesactl stop의 로그 복사가 systemd TimeoutStopSec에 끊기지 않게, ssh stop 제한 시간 이상으로 둔다.
+        import re
+
+        text = (ROOT / "board" / "install_board.sh").read_text(encoding="utf-8")
+        seconds = int(re.search(r"^TimeoutStopSec=(\d+)$", text, re.M).group(1))
+        self.assertGreaterEqual(seconds, ACTIONS["stop"].timeout)
+
     def test_sudoers_account_matches_monitor_default(self):
         text = (ROOT / "board" / "install_board.sh").read_text(encoding="utf-8")
         self.assertIn(f"ACCOUNT=${{AESA_ACCOUNT:-{DEFAULT_SSH_TARGET.split('@')[0]}}}", text)
