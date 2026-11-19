@@ -218,3 +218,62 @@ class ViewLimitTest(unittest.TestCase):
         self.assertEqual([item.timestamp_ms for item in state.recent_beams(20)], [30, 40, 50])
         state.view_limit_ms = None
         self.assertEqual(state.now_ms(), 90)
+
+
+class ViewResetTest(unittest.TestCase):
+    """시나리오를 바꿀 때의 화면 초기화(메뉴 '화면 초기화', '운용 ON마다 화면 초기화')."""
+
+    def scenario(self, state, start_ms):
+        for index in range(10):
+            state.apply(counted(start_ms + index * 10, index + 1, index % 4))
+        state.apply(TrackList((track(3), track(4))))
+
+    def test_reset_clears_history_but_keeps_connection(self):
+        state = MonitorState()
+        state.apply(ConnectionChanged(True, "capture"))
+        self.scenario(state, 1000)
+        state.apply(OperatorControl(1))
+        self.assertTrue(state.tracks)
+        state.reset_view()
+        self.assertEqual((state.tracks, list(state.beams), state.operation_restarts), ([], [], 0))
+        self.assertTrue(state.connected)
+        self.assertIsNotNone(state.operator_control)
+        self.assertEqual(state.view_resets, 1)
+        self.assertEqual([entry.text for entry in state.event_log], ["화면 초기화"])
+
+    def test_next_beam_after_reset_is_not_counted_as_gap(self):
+        state = MonitorState()
+        self.scenario(state, 1000)
+        state.reset_view()
+        state.apply(counted(9000, 11, 0))
+        self.assertEqual(list(state.beam_gaps), [])
+
+    def test_operation_start_resets_only_when_enabled(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                state = MonitorState()
+                state.reset_on_operation_start = enabled
+                self.scenario(state, 1000)
+                state.apply(OperatorControl(0))
+                state.apply(OperatorControl(1))
+                state.apply(counted(20000, 1, 0))  # 새 시나리오 첫 빔
+                self.assertEqual(state.view_resets, 1 if enabled else 0)
+                self.assertEqual(len(state.beams), 1 if enabled else 11)
+                self.assertEqual(state.beams[-1].timestamp_ms, 20000)  # 첫 빔은 남는다
+                self.assertEqual(state.operation_restarts, 1)
+
+
+class ResetSettingTest(unittest.TestCase):
+    def test_reset_on_operation_start_round_trips_through_monitor_env(self):
+        import tempfile
+        from dataclasses import replace
+        from pathlib import Path
+
+        from aesa_monitor.core.settings import load_settings, save_settings
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "monitor.env"
+            self.assertFalse(load_settings(path).reset_on_operation_start)  # 기본은 끔
+            save_settings(replace(load_settings(path), reset_on_operation_start=True), path)
+            self.assertIn("MONITOR_RESET_ON_OPERATION_START=1", path.read_text(encoding="utf-8"))
+            self.assertTrue(load_settings(path).reset_on_operation_start)

@@ -84,6 +84,8 @@ MONITOR_CAPTURE_COMMAND='dumpcap -i {interface} -f "tcp port {port}" -P -q -w -'
 MONITOR_RECORD_DIR=~/aesa-records
 MONITOR_FONT_SIZE=12
 MONITOR_AUTO_RECORD=0
+# 운용 OFF→ON(새 시나리오)마다 실시간 화면을 지운다(메뉴 '운용 ON마다 화면 초기화'와 같음)
+MONITOR_RESET_ON_OPERATION_START=0
 
 # 처리부 로그 가져오기·처리부 제어: local 또는 ssh(보드). ssh는 Windows 10 이상의 OpenSSH 클라이언트를 쓴다.
 # 보드 계정·키는 prepare_board_sd.bat(노트북)과 보드의 install_board.sh가 설정한다.

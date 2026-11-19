@@ -127,6 +127,10 @@ class MonitorState:
         # 지금 운용 구간의 첫 빔 시각. 이보다 앞선 탐색 칸 방문은 탐색 프레임 시간 계산에 쓰지 않는다.
         self._operation_start_ms: Optional[int] = None
         self.operation_restarts = 0
+        # 화면 초기화 횟수(줄지 않음). app이 바뀐 것을 보고 문제 목록도 새로 시작한다.
+        self.view_resets = 0
+        # True면 운용 OFF→ON(새 시나리오)의 첫 빔에서 화면을 초기화한다(app이 설정에서 넣는다).
+        self.reset_on_operation_start = False
         # 화면 표시 시각 상한(실시간 화면을 부드럽게 보이려고 app이 정한다). None이면 받은 마지막 시각.
         self.view_limit_ms: Optional[int] = None
 
@@ -236,6 +240,21 @@ class MonitorState:
         self._operation_stopped = False
         self._operation_start_ms = None
 
+    def reset_view(self, reason: str = "화면 초기화") -> None:
+        """시나리오를 바꿀 때 쌓인 화면 기록을 지운다.
+
+        지우는 것: 트랙·빔·탐색 칸·추적 사이클 기록, 빠진 빔·확인 지연·프레임, 메시지 수, 이벤트 기록, 재시작 횟수.
+        남기는 것: 연결 상태, 상대 연결, 마지막 운용 명령, 처리부 상태, 자세(다음 시나리오에도 그대로 유효).
+        처리부는 운용 OFF 때 트랙을 이미 지우므로(처리부 로그 'cleared tracks=N') 처리부 쪽은 따로 할 일이 없다.
+        """
+        self.clear_history()
+        self.traffic.clear()
+        self.event_log.clear()
+        self.processor_restarts = 0
+        self.operation_restarts = 0
+        self.view_resets += 1
+        self._log(reason, "info")
+
     def _apply_beam(self, beam: Beam) -> None:
         if (self._latest_beam_ms is not None and
                 beam.timestamp_ms + TIME_RESET_THRESHOLD_MS < self._latest_beam_ms):
@@ -244,6 +263,8 @@ class MonitorState:
             self._log("처리부 시각이 되돌아감 (처리부 재시작으로 보고 기록을 지움)", "warn")
 
         if self._latest_beam_ms is not None and self._is_operation_restart(beam):
+            if self.reset_on_operation_start:
+                self.reset_view("운용 시작: 이전 시나리오 화면을 지움 (메뉴 '운용 ON마다 화면 초기화')")
             # 운용 OFF→ON. 처리부는 OFF 동안 빔을 보내지 않으므로 그 시간은 빠진 빔이 아니다.
             # 진행 중이던 탐색 프레임은 미완료로 닫고, 탐색 프레임 시간·확인 지연은 새 구간부터 다시 잰다.
             self.frames.break_frame()
