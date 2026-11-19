@@ -171,6 +171,8 @@ Wants=network.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# 모니터 명령이 잠금을 잡고 있으면 끝날 때까지 기다린다(바로 거부하면 종료 때 처리부·로그 정리를 못 한다)
+Environment=AESA_LOCK_WAIT=60
 ExecStart=/usr/local/sbin/aesactl boot
 ExecStop=/usr/local/sbin/aesactl stop
 # 종료 때 로그를 SD로 복사한다(ssh 제어의 stop 제한 시간 150초와 맞춤). 넘기면 systemd가 강제로 끝낸다.
@@ -194,6 +196,9 @@ else
 # Short-Description: AESA data processor (aesactl)
 ### END INIT INFO
 # install_board.sh가 만듦. 부팅: 고정 IP(+자동 실행 설정 시 처리부 시작), 종료: 처리부 정지·로그 저장
+# 모니터 명령이 잠금을 잡고 있으면 끝날 때까지 기다린다(바로 거부하면 종료 때 처리부·로그 정리를 못 한다).
+AESA_LOCK_WAIT=60
+export AESA_LOCK_WAIT
 case "$1" in
     start)   /usr/local/sbin/aesactl boot ;;
     stop)    /usr/local/sbin/aesactl stop ;;

@@ -46,8 +46,9 @@ AESA 데이터 처리부 - 시연용 묶음 (Zybo Z7, PetaLinux 2022, SD 부팅)
   sudo /usr/local/sbin/aesactl stop | restart | status | log | savelog | settime '시각' | poweroff
   (ssh로 접속하면 PATH에 /usr/local/sbin이 없을 수 있어 전체 경로로 쓴다. 보드 호스트 키가 RSA라 노트북 ssh에는 -o HostKeyAlgorithms=+ssh-rsa가 필요)
   start는 포트가 15초 안에 열리지 않으면, stop·poweroff·savelog는 로그를 SD로 복사하지 못하면 실패로 끝난다.
-  로그 복사는 SD에 같은 크기로 이미 있는 파일을 건너뛰고, ssh가 끊겨도 끝까지 한다. 결과는 status의 "마지막 로그 저장".
-  start·stop·restart·poweroff·savelog는 잠금(/run/aesactl.lock-owner)으로 한 번에 하나만 실행한다. 겹치면 나중 명령이 실패한다.
+  로그 복사는 SD에 내용이 같은 파일이 이미 있으면 건너뛰고(임시 이름에 쓴 뒤 바꿔 넣음), ssh가 끊겨도 끝까지 한다. 결과는 status의 "마지막 로그 저장".
+  start·stop·restart·poweroff·savelog·settime은 잠금으로 한 번에 하나만 실행한다. 겹치면 나중 명령이 바로 실패한다
+  (flock이 있으면 /run/aesactl.lock 커널 잠금, 없으면 /run/aesactl.lock-owner 링크 잠금. 부팅·종료 때 init은 60초까지 기다린다).
   설치 전에는 sudo sh /run/media/mmcblk0p1/aesa/run_aesa.sh <명령> 으로 같은 일을 한다.
 
 [참고]

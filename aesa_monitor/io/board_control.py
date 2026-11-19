@@ -38,7 +38,7 @@ class Action:
 
 
 # start는 보드에서 최대 15초 포트를 기다린다. stop은 최대 10초 종료를 기다린 뒤 로그를 SD로 복사한다.
-# 로그 복사는 SD에 없거나 크기가 다른 파일만 하지만 SD가 느리면 오래 걸릴 수 있어 넉넉히 둔다.
+# 로그 복사는 SD에 없거나 내용이 다른 파일만 하지만 SD가 느리면 오래 걸릴 수 있어 넉넉히 둔다.
 # 그래도 넘으면 보드는 복사를 끝까지 계속하고(ssh가 끊겨도), 결과는 [상태]의 "마지막 로그 저장"에 남는다.
 ACTIONS: Dict[str, Action] = {action.name: action for action in (
     Action("status", "상태", 20, False),
@@ -126,6 +126,8 @@ def explain_error(stderr: str, stdout: str, settings: FetchSettings) -> str:
                 f"계정({settings.ssh_target.split('@')[0]})이 맞는지 확인하세요.")
     elif "aesactl" in lower and ("not found" in lower or "no such file" in lower):
         hint = f"보드에 {AESACTL}이 없습니다. 보드에서 install_board.sh를 한 번 실행하세요."
+    elif "다른 aesactl 명령이 실행 중" in text:
+        hint = "보드에서 다른 명령(다른 창이나 다른 노트북)이 실행 중입니다. 끝난 뒤 다시 누르세요."
     elif "[aesa]" in text:
         hint = "보드에서 명령이 실패했습니다."
     else:

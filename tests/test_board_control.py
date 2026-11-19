@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -178,7 +179,12 @@ C_COMPILER = shutil.which("cc") or shutil.which("gcc")
 @unittest.skipIf(os.name == "nt" or not shutil.which("sh") or not shutil.which("sha256sum") or not shutil.which("nohup")
                  or not C_COMPILER, "POSIX 셸과 C 컴파일러 필요")
 class RunAesaScriptTest(unittest.TestCase):
-    """보드 run_aesa.sh를 가짜 id·ip·date·netstat·poweroff와 가짜 adp로 실행한다(보드 없이 실패 처리 확인)."""
+    """보드 run_aesa.sh를 가짜 id·ip·date·netstat·poweroff와 가짜 adp로 실행한다(보드 없이 실패 처리 확인).
+
+    잠금은 flock이 있으면 flock(이 클래스), 없으면 심볼릭 링크(RunAesaScriptLinkLockTest)로 같은 시험을 돈다.
+    """
+
+    use_flock = True
 
     def setUp(self):
         self.folder = Path(tempfile.mkdtemp())
@@ -192,11 +198,14 @@ class RunAesaScriptTest(unittest.TestCase):
             "id": "echo 0",
             "ip": f'case "$*" in *"-o addr"*) echo "2: eth0 inet 192.168.10.20/24";; '
                   f'*"addr show"*) echo "    inet 192.168.10.20/24";; esac; exit 0',
-            "date": f'[ "$1" = "-s" ] && exit 0; /bin/date "$@"',
+            "date": f'[ "$1" = "-s" ] && {{ echo "$2" >> "{self.folder}/time-set"; exit 0; }}; /bin/date "$@"',
             "netstat": f'[ -f "{self.folder}/listen" ] && [ -f "{self.work}/adp.pid" ] && '
                        f'kill -0 "$(cut -d" " -f1 "{self.work}/adp.pid")" 2>/dev/null && '
                        f'echo "tcp 0 0 0.0.0.0:3200 0.0.0.0:* LISTEN"; exit 0',
             "poweroff": f'touch "{self.folder}/powered-off"',
+            # SD가 가득 찬 것처럼: fail-copy 파일이 있으면 로그 임시 사본(.part) 복사만 실패한다
+            "cp": f'for last; do :; done; case "$last" in *.part) [ -f "{self.folder}/fail-copy" ] && exit 1;; esac; '
+                  f'exec /bin/cp "$@"',
         }
         for name, body in stubs.items():
             path = self.stub / name
@@ -215,8 +224,17 @@ class RunAesaScriptTest(unittest.TestCase):
             "SD_DEVICE=/dev/mmcblk0p1": "SD_DEVICE=/dev/aesa-test-none",
             "PORT_WAIT_SECONDS=15": "PORT_WAIT_SECONDS=2",
             "STOP_WAIT_SECONDS=10": "STOP_WAIT_SECONDS=2",
+            "LOCK_FILE=/run/aesactl.lock": f"LOCK_FILE={self.folder}/aesactl.lock",
             "LOCK_LINK=/run/aesactl.lock-owner": f"LOCK_LINK={self.folder}/aesactl.lock-owner",
+            # 시험용: 잠금을 잡은 뒤 AESA_TEST_HOLD초 머문다(겹침 시험). 실제 스크립트에는 없다.
+            'start|stop|restart|poweroff|savelog|boot|settime) acquire_lock "$1" ;;':
+                'start|stop|restart|poweroff|savelog|boot|settime) acquire_lock "$1"; '
+                '[ -n "$AESA_TEST_TRACE" ] && echo "$$ $(date +%s.%N) in" >> "$AESA_TEST_TRACE"; '
+                'sleep "${AESA_TEST_HOLD:-0}"; '
+                '[ -n "$AESA_TEST_TRACE" ] && echo "$$ $(date +%s.%N) out" >> "$AESA_TEST_TRACE" ;;',
         }
+        if not self.use_flock:
+            replacements["FLOCK=$(command -v flock 2>/dev/null)"] = "FLOCK="
         for old, new in replacements.items():
             self.assertIn(old, text)
             text = text.replace(old, new)
@@ -232,8 +250,9 @@ class RunAesaScriptTest(unittest.TestCase):
             process.wait()
         shutil.rmtree(self.folder, ignore_errors=True)
 
-    def run_script(self, *arguments):
-        return subprocess.run(["sh", str(self.script), *arguments], capture_output=True, text=True, timeout=30)
+    def run_script(self, *arguments, env=None):
+        return subprocess.run(["sh", str(self.script), *arguments], capture_output=True, text=True, timeout=30,
+                              env=None if env is None else {**os.environ, **env})
 
     def start(self):
         (self.folder / "listen").touch()
@@ -264,13 +283,42 @@ class RunAesaScriptTest(unittest.TestCase):
 
     def test_stop_fails_when_copy_fails(self):
         self.start()
-        (self.fat / "logs").mkdir()
-        (self.fat / "logs" / "adp_20261119_100000.log").symlink_to(self.folder / "없는폴더" / "x.log")
+        (self.folder / "fail-copy").touch()
         result = self.run_script("stop")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("복사하지 못했습니다", result.stderr)
         self.assertNotIn("로그 복사 완료", result.stdout)
         self.assertIn("실패", self.run_script("status").stdout.split("마지막 로그 저장:")[1].splitlines()[0])
+        self.assertEqual([path.name for path in (self.fat / "logs").iterdir() if path.name.endswith(".part")], [],
+                         "임시 파일이 남음")
+
+    def test_directory_at_log_name_is_a_copy_failure(self):
+        # mv는 대상이 폴더면 그 안으로 옮기고 성공해 버린다. 복사 실패로 알려야 한다.
+        self.start()
+        (self.fat / "logs" / "adp_20261119_100000.log").mkdir(parents=True)
+        result = self.run_script("stop")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(list((self.fat / "logs" / "adp_20261119_100000.log").iterdir()), [])
+
+    def test_same_size_but_different_log_is_copied_again(self):
+        # 보드 시계가 되돌아가 같은 이름의 로그가 다시 생기거나, 이전 복사가 같은 크기로 깨졌을 때
+        self.start()
+        self.assertEqual(self.run_script("stop").returncode, 0)
+        saved = self.fat / "logs" / "adp_20261119_100000.log"
+        board = self.work / "logs" / "adp_20261119_100000.log"
+        saved.write_bytes(b"X" * board.stat().st_size)  # 크기는 같고 내용이 다름
+        result = self.run_script("savelog")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(saved.read_bytes(), board.read_bytes())
+
+    def test_start_while_running_does_not_change_board_time(self):
+        (self.folder / "listen").touch()
+        self.assertEqual(self.run_script("start", "2026-11-19 10:00:00").returncode, 0)
+        result = self.run_script("start", "2026-11-19 11:00:00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("시각은 바꾸지 않음", result.stdout)
+        self.assertEqual((self.folder / "time-set").read_text(encoding="utf-8").split("\n")[:-1],
+                         ["2026-11-19 10:00:00"])
 
     def test_stop_after_crash_still_saves_logs(self):
         self.start()
@@ -395,46 +443,128 @@ class RunAesaScriptTest(unittest.TestCase):
         self.assertTrue((self.fat / "logs" / "adp_20261119_100000.log").is_file())
         self.assertIn("완료: 복사", (self.work / "savelog.state").read_text(encoding="utf-8"))
 
-    def hold_lock(self, pid, command="stop"):
-        lock = self.folder / "aesactl.lock-owner"
-        os.symlink(f"{pid} {command}", lock)
-        return lock
+    # 잠금 시험. hold_lock은 다른 명령이 잠금을 잡은 상태를 흉내 낸다.
+
+    @staticmethod
+    def start_time(pid):
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+
+    @staticmethod
+    def boot_id():
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+    def hold_lock(self, command="stop"):
+        """살아 있는 다른 명령이 잠금을 잡은 상태. 잡은 프로세스를 돌려준다(끝내면 풀림)."""
+        if self.use_flock:
+            holder = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl, sys, time; f = open(sys.argv[1], 'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+                 "print('locked', flush=True); time.sleep(60)", str(self.folder / "aesactl.lock")],
+                stdout=subprocess.PIPE, text=True)
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            (self.folder / "aesactl.lock.info").write_text(f"{command}, PID {holder.pid}\n", encoding="utf-8")
+        else:
+            holder = subprocess.Popen(["sleep", "60"])
+            os.symlink(f"{holder.pid} {self.start_time(holder.pid)} {self.boot_id()} {command}",
+                       self.folder / "aesactl.lock-owner")
+        self.others = getattr(self, "others", []) + [holder]
+        return holder
+
+    def lock_free(self):
+        return not (self.folder / "aesactl.lock-owner").is_symlink()
 
     def test_command_is_refused_while_another_holds_the_lock(self):
         # 앞 명령(예: 중지 중 로그 복사)이 끝나기 전에 다른 창·노트북에서 보낸 시작은 거부한다.
-        other = self.unrelated_process()
-        lock = self.hold_lock(other.pid)
+        self.hold_lock()
         (self.folder / "listen").touch()
         result = self.run_script("start")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("다른 aesactl 명령이 실행 중", result.stderr)
+        self.assertIn("stop", result.stderr)  # 누가 잡았는지 안내
         self.assertFalse((self.work / "adp.pid").exists(), "처리부를 띄웠음")
-        self.assertTrue(lock.is_symlink(), "남의 잠금을 지웠음")
+        if not self.use_flock:
+            self.assertTrue((self.folder / "aesactl.lock-owner").is_symlink(), "남의 잠금을 지웠음")
 
     def test_status_is_not_blocked_by_the_lock(self):
-        other = self.unrelated_process()
-        self.hold_lock(other.pid)
-        result = self.run_script("status")
+        self.hold_lock()
+        self.assertEqual(self.run_script("status").returncode, 0)
+
+    def test_lock_of_killed_command_is_taken_over_and_released(self):
+        holder = self.hold_lock()
+        holder.kill()
+        holder.wait()
+        self.start()
+        self.assertTrue(self.lock_free(), "명령이 끝났는데 잠금이 남음")
+
+    def test_waits_for_lock_when_asked(self):
+        # init(종료·부팅)은 AESA_LOCK_WAIT로 기다린다. 앞 명령이 2초 뒤 끝나면 이어서 실행된다.
+        holder = self.hold_lock()
+        killer = subprocess.Popen(["sh", "-c", f"sleep 2; kill {holder.pid}"])
+        self.others = self.others + [killer]
+        result = self.run_script("savelog", env={"AESA_LOCK_WAIT": "8"})
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_stale_lock_is_taken_over_and_released(self):
-        dead = subprocess.Popen(["true"])
-        dead.wait()
-        lock = self.hold_lock(dead.pid)
+    def test_running_processor_does_not_keep_the_lock(self):
+        # 처리부(adp)가 잠금을 물려받으면 도는 동안 모든 명령이 거부된다.
         self.start()
-        self.assertFalse(lock.is_symlink(), "명령이 끝났는데 잠금이 남음")
+        result = self.run_script("savelog")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_settime_takes_the_lock(self):
+        self.hold_lock()
+        self.assertNotEqual(self.run_script("settime", "2026-11-19 10:00:00").returncode, 0)
 
-    def test_simultaneous_commands_run_one_at_a_time(self):
-        # 두 노트북에서 동시에 시작을 누름: 하나만 실행되고 다른 하나는 잠금 때문에 거부된다.
-        (self.folder / "listen").touch()
-        processes = [subprocess.Popen(["sh", str(self.script), "start"], stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE, text=True) for _ in range(2)]
-        results = [(process.wait(timeout=30), process.stderr.read()) for process in processes]
-        codes = sorted(code for code, _ in results)
-        self.assertEqual(codes[0], 0, results)
-        self.assertNotEqual(codes[1], 0, results)
-        self.assertTrue(any("다른 aesactl 명령이 실행 중" in error for _, error in results), results)
+    def run_together(self, count=4, hold="1"):
+        """명령 count개를 동시에 실행한다. 잠금 안에 머문 구간(들어감·나옴 시각)과 종료 코드를 돌려준다."""
+        trace = self.folder / "trace"
+        trace.write_text("", encoding="utf-8")
+        env = {**os.environ, "AESA_TEST_HOLD": hold, "AESA_TEST_TRACE": str(trace)}
+        processes = [subprocess.Popen(["sh", str(self.script), "savelog"], stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True, env=env) for _ in range(count)]
+        codes = []
         for process in processes:
+            codes.append(process.wait(timeout=60))
             process.stdout.close()
             process.stderr.close()
+        spans = {}
+        for line in trace.read_text(encoding="utf-8").splitlines():
+            pid, at, side = line.split()
+            spans.setdefault(pid, {})[side] = float(at)
+        return codes, sorted((span["in"], span["out"]) for span in spans.values())
+
+    def assert_no_overlap(self, spans):
+        for (_, first_out), (second_in, _) in zip(spans, spans[1:]):
+            self.assertLessEqual(first_out, second_in, f"잠금 안 구간이 겹침: {spans}")
+
+    def test_simultaneous_commands_never_overlap(self):
+        # 두 노트북에서 동시에 누름: 잠금 안에는 한 번에 하나만 들어간다. 바로 거부되는 것도 있어야 한다.
+        for _ in range(3):
+            codes, spans = self.run_together()
+            self.assert_no_overlap(spans)
+            self.assertGreaterEqual(codes.count(0), 1)
+            self.assertGreaterEqual(len([code for code in codes if code != 0]), 1, codes)
+            self.assertTrue(self.lock_free())
+
+
+class RunAesaScriptLinkLockTest(RunAesaScriptTest):
+    """flock이 없는 보드: 심볼릭 링크 잠금으로 같은 시험을 돈다. 링크 잠금만의 경우를 더한다."""
+
+    use_flock = False
+
+    def test_reused_pid_is_not_taken_as_lock_owner(self):
+        # 앞 명령이 강제 종료되고 그 PID를 다른 프로세스가 받음: 시작시각이 달라 주인이 아니다.
+        other = subprocess.Popen(["sleep", "60"])
+        self.others = getattr(self, "others", []) + [other]
+        os.symlink(f"{other.pid} 1 {self.boot_id()} stop", self.folder / "aesactl.lock-owner")
+        self.start()
+        self.assertIsNone(other.poll())
+
+    def test_simultaneous_reclaim_of_abandoned_lock_never_overlaps(self):
+        # 버려진 잠금을 여러 명령이 동시에 정리해도 잠금 안에는 한 번에 하나만 들어간다.
+        for _ in range(3):
+            os.symlink(f"999999 1 {self.boot_id()} stop", self.folder / "aesactl.lock-owner")
+            codes, spans = self.run_together()
+            self.assert_no_overlap(spans)
+            self.assertGreaterEqual(codes.count(0), 1)
+            self.assertTrue(self.lock_free())
+            self.assertFalse((self.folder / "aesactl.lock-owner.reclaim").is_symlink(), "정리 잠금이 남음")
