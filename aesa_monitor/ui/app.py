@@ -487,10 +487,11 @@ class MonitorApp:
         self._sync_view_reset()
 
     def _sync_view_reset(self) -> None:
-        # 화면이 초기화되면(메뉴 또는 운용 ON 자동) 문제 목록도 새로 시작한다.
+        # 화면이 초기화되면(메뉴 또는 운용 ON 자동) 문제 목록도 새로 시작한다. 감지기는 바꾸지 않고 비운다
+        # (연결 상태를 이어 가야 초기화 뒤의 처리부 끊김을 놓치지 않는다).
         if self._live.view_resets != self._seen_view_resets:
             self._seen_view_resets = self._live.view_resets
-            self._live_problems = ProblemDetector(self._parameters)
+            self._live_problems.reset()
 
     def _toggle_reset_on_start(self) -> None:
         from dataclasses import replace

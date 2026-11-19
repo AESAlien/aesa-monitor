@@ -3,6 +3,7 @@ import unittest
 from aesa_monitor.core.events import ConnectionChanged
 from aesa_monitor.core.protocol import Beam, BeamType, MonitorStatus, OperatorControl, Track, TrackList
 from aesa_monitor.core.state import MonitorState, ViewMode
+from aesa_monitor.core.traffic import MESSAGE_TYPES
 
 
 def beam(timestamp, beam_type=BeamType.SEARCH, beam_id=0, azimuth=0.0, elevation=0.0):
@@ -261,6 +262,9 @@ class ViewResetTest(unittest.TestCase):
                 self.assertEqual(len(state.beams), 1 if enabled else 11)
                 self.assertEqual(state.beams[-1].timestamp_ms, 20000)  # 첫 빔은 남는다
                 self.assertEqual(state.operation_restarts, 1)
+                # 통신 기록에도 새 시나리오의 첫 빔이 있다(초기화가 지운 뒤 다시 넣음)
+                self.assertEqual(state.traffic.counts[MESSAGE_TYPES[Beam]], 1 if enabled else 11)
+                self.assertIsNotNone(state.traffic.age(MESSAGE_TYPES[Beam]))
 
 
 class ResetSettingTest(unittest.TestCase):

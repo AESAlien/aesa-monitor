@@ -143,9 +143,14 @@ class MonitorState:
         if isinstance(event, PeerLinkChanged):
             self._apply_peer_link(event, received_at)
             return
+        resets = self.view_resets
         self.traffic.record(event, received_at)
         if isinstance(event, Beam):
             self._apply_beam(event)
+            if self.view_resets != resets:
+                # 이 빔이 화면 초기화(운용 ON마다 화면 초기화)를 일으켰다. 초기화가 지운 통신 기록에 다시 넣는다
+                # (빔 기록에는 남는 새 시나리오의 첫 빔이다. 안 넣으면 다음 빔까지 '빔 수신 없음', 개수도 하나 적다).
+                self.traffic.record(event, received_at)
         elif isinstance(event, Detection):
             self._apply_detection(event)
         elif isinstance(event, TrackList):

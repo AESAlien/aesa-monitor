@@ -225,6 +225,42 @@ def tracking_slots(until_ms, tracks):
                                                   PARAMETERS.tracking_interval_ms) for offset in range(tracks))
 
 
+class DetectorResetTest(unittest.TestCase):
+    """화면 초기화 때 문제 목록만 새로 시작하고 연결 추적은 이어 간다."""
+
+    def connected_state(self):
+        state = MonitorState(clock=lambda: 1.0)
+        state.apply(ConnectionChanged(True))
+        state.apply(search(1000, 0))
+        return state
+
+    def test_disconnect_after_reset_is_still_recorded(self):
+        state = self.connected_state()
+        detector = ProblemDetector(PARAMETERS)
+        detector.observe(ConnectionChanged(True), state)
+        detector.update(state)
+        detector.reset()
+        event = ConnectionChanged(False, detail="연결 끊김")
+        state.apply(event)
+        detector.observe(event, state)
+        self.assertEqual([problem.kind for problem in detector.problems], ["disconnect"])
+
+    def test_reset_clears_old_problems_but_keeps_ongoing_link_problems(self):
+        state = self.connected_state()
+        detector = ProblemDetector(PARAMETERS)
+        detector.observe(ConnectionChanged(True), state)
+        detector._report("gap", "빔", WARN, "빠진 빔", "", 900, 0.5, amount=1)
+        lost = PeerLinkChanged(PEER_SIMULATOR, False)
+        state.apply(lost)
+        detector.observe(lost, state)
+        detector.reset()
+        self.assertEqual([problem.kind for problem in detector.problems], [f"peer-{PEER_SIMULATOR}"])
+        back = PeerLinkChanged(PEER_SIMULATOR, True)
+        state.apply(back)
+        detector.observe(back, state)
+        self.assertFalse(detector.problems[0].open)
+
+
 class TrackEndTest(unittest.TestCase):
     """트랙 종료 분류: 정상 종료(운용 OFF, 영역 이탈)는 문제로 남기지 않는다. 2026-11-19 시연 녹화에서 확인한 모양."""
 

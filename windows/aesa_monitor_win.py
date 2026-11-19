@@ -38,11 +38,10 @@ LOG_PATH = APP_DIR / "aesa-monitor.log"
 SERVER_KEY = "MONITOR_SERVER"
 INTERFACE_PLACEHOLDER = "{interface}"
 LOOPBACK_DEVICE = r"\Device\NPF_Loopback"
-# 랜카드 GUID와 IPv4 주소를 한 줄에 하나씩 '{GUID}|주소|접두 길이|상태|이름'으로 낸다.
-# 상태는 Get-NetAdapter의 Status(Up, Disconnected, Disabled 등). 케이블이 빠진 랜카드도 고정 주소는 남아 있을 수 있다.
 # 랜카드 주소와 브리지 구성을 읽는다. 줄 형식:
 #   ADDR|{GUID}|주소|접두 길이|상태|브리지 장치(1/0)|이름
 #   MEMBER|{GUID}|상태|이름      브리지(네트워크 어댑터 멀티플렉서)에 묶인 실제 랜카드
+# 상태는 Get-NetAdapter의 Status(Up, Disconnected, Disabled 등). 케이블이 빠진 랜카드도 고정 주소는 남아 있을 수 있다.
 # Windows 네트워크 브리지는 "Microsoft Network Adapter Multiplexor Driver" 장치에 IP를 두고,
 # 묶인 랜카드에는 "멀티플렉서 프로토콜"(ms_implat)이 켜진다.
 ADAPTER_QUERY = (

@@ -146,6 +146,19 @@ class ProblemDetector:
             self._watch_tracks(state, now_s, now_ms)
         self._close_stale(now_s, now_ms)
 
+    def reset(self) -> None:
+        """화면 초기화: 문제 목록을 새로 시작한다.
+
+        연결 추적(끊김 감지에 쓰는 _was_connected·연결 횟수·처리부 시각)은 이어 간다. 새 감지기로 바꾸면 연결된 채로
+        초기화한 뒤의 끊김을 놓친다(observe는 연결된 적이 있을 때만 끊김을 연다). 지금 이어지는 연결 문제(처리부 끊김,
+        상대 끊김)도 지금 상태라서 새 목록에 남긴다.
+        """
+        ongoing = {key: item for key, item in self._open.items()
+                   if key[0] == "disconnect" or key[0].startswith("peer-")}
+        self._open = ongoing
+        self.problems = [item.problem for item in ongoing.values()]
+        self._reset_marks()
+
     def observe(self, event: Event, state: MonitorState) -> None:
         """연결 변화를 사건마다 받는다. state.apply(event) 직후에 부른다.
 
