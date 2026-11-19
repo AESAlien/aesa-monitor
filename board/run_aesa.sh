@@ -36,7 +36,7 @@ DEFAULT_SERVER_IP=192.168.10.20
 DEFAULT_SERVER_PORT=3200
 SD_DEVICE=/dev/mmcblk0p1
 SD_MOUNT=/mnt/sd
-PID_FILE="$WORK_DIR/adp.pid"
+PID_FILE="$WORK_DIR/adp.pid"   # "PID 시작시각" (시작시각: /proc/PID/stat 22번째 칸, 부팅 후 클럭 틱)
 PORT_WAIT_SECONDS=15   # 처리부가 서버 포트를 열 때까지 기다리는 시간
 STOP_WAIT_SECONDS=10   # SIGTERM 뒤 처리부가 끝나기를 기다리는 시간
 BIN=adp
@@ -114,12 +114,34 @@ latest_log() {
     ls -t "$WORK_DIR"/logs/adp_[0-9]*.log 2>/dev/null | head -n 1
 }
 
+proc_field() {
+    # proc_field PID N : /proc/PID/stat에서 "PID (이름) " 뒤의 N번째 칸 (1=상태, 20=시작시각)
+    sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f"$2"
+}
+
+saved_pid() {
+    # PID 파일의 PID (검증하지 않음, 메시지용)
+    [ -f "$PID_FILE" ] && cut -d' ' -f1 "$PID_FILE" 2>/dev/null
+}
+
 running_pid() {
+    # PID 파일의 처리부가 지금도 살아 있으면 PID를 출력한다.
+    # 처리부가 죽은 뒤 같은 PID를 다른 프로세스가 받았을 수 있으므로, 저장한 시작시각과 같은지 확인한다.
     [ -f "$PID_FILE" ] || return 1
-    pid=$(cat "$PID_FILE" 2>/dev/null)
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ -d "/proc/$pid" ] || return 1
+    read -r pid started < "$PID_FILE" || [ -n "$pid" ] || return 1
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -d "/proc/$pid" ] || return 1
     # 끝났지만 아직 거둬지지 않은 프로세스(좀비, 상태 Z)는 실행 중이 아니다.
-    [ "$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f1)" != "Z" ] || return 1
+    [ "$(proc_field "$pid" 1)" != "Z" ] || return 1
+    if [ -n "$started" ]; then
+        [ "$(proc_field "$pid" 20)" = "$started" ] || return 1
+    else
+        # 시작시각이 없는 예전 PID 파일: 실행 파일이 작업 폴더의 adp인지로 확인한다.
+        case "$(readlink "/proc/$pid/exe" 2>/dev/null)" in
+            "$WORK_DIR/$BIN"|"$WORK_DIR/$BIN (deleted)") ;;
+            *) return 1 ;;
+        esac
+    fi
     echo "$pid"
 }
 
@@ -216,7 +238,8 @@ do_start() {
     cd "$WORK_DIR" || die "$WORK_DIR로 이동 실패"
     say "처리부 시작 ($(head -n 1 COMMIT 2>/dev/null))"
     nohup "./$BIN" >> logs/console.out 2>&1 < /dev/null &
-    echo $! > "$PID_FILE"
+    pid=$!
+    echo "$pid $(proc_field "$pid" 20)" > "$PID_FILE"
     i=0
     while [ $i -lt $PORT_WAIT_SECONDS ]; do
         sleep 1
@@ -237,14 +260,15 @@ do_stop() {
         say "종료 요청 (SIGTERM, PID $pid)"
         kill -TERM "$pid"
         i=0
-        while [ $i -lt $STOP_WAIT_SECONDS ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
-        if kill -0 "$pid" 2>/dev/null; then
+        # 기다리는 동안에도 같은 프로세스인지(시작시각) 확인해, 끝난 뒤 PID를 받은 다른 프로세스를 죽이지 않는다.
+        while [ $i -lt $STOP_WAIT_SECONDS ] && running_pid >/dev/null; do sleep 1; i=$((i + 1)); done
+        if running_pid >/dev/null; then
             say "${STOP_WAIT_SECONDS}초 안에 끝나지 않아 강제 종료 (SIGKILL)"
             kill -KILL "$pid" 2>/dev/null
         fi
     elif [ -f "$PID_FILE" ]; then
         # 처리부가 먼저 끝났다(비정상 종료 등). 이 실행의 로그가 가장 필요하므로 그래도 복사한다.
-        say "처리부가 이미 종료되어 있습니다 (PID 파일: $(cat "$PID_FILE" 2>/dev/null)). 로그는 복사합니다."
+        say "처리부가 이미 종료되어 있습니다 (PID 파일: $(saved_pid)). 로그는 복사합니다."
     else
         say "실행 중이 아닙니다."
     fi

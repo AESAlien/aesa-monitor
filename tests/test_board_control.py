@@ -147,7 +147,7 @@ class RunAesaScriptTest(unittest.TestCase):
                   f'*"addr show"*) echo "    inet 192.168.10.20/24";; esac; exit 0',
             "date": f'[ "$1" = "-s" ] && exit 0; /bin/date "$@"',
             "netstat": f'[ -f "{self.folder}/listen" ] && [ -f "{self.work}/adp.pid" ] && '
-                       f'kill -0 "$(cat "{self.work}/adp.pid")" 2>/dev/null && '
+                       f'kill -0 "$(cut -d" " -f1 "{self.work}/adp.pid")" 2>/dev/null && '
                        f'echo "tcp 0 0 0.0.0.0:3200 0.0.0.0:* LISTEN"; exit 0',
             "poweroff": f'touch "{self.folder}/powered-off"',
         }
@@ -178,7 +178,10 @@ class RunAesaScriptTest(unittest.TestCase):
     def _cleanup(self):
         pid_file = self.work / "adp.pid"
         if pid_file.is_file():
-            subprocess.run(["kill", "-9", pid_file.read_text().strip()], capture_output=True)
+            subprocess.run(["kill", "-9", pid_file.read_text().split()[0]], capture_output=True)
+        for process in getattr(self, "others", []):
+            process.kill()
+            process.wait()
         shutil.rmtree(self.folder, ignore_errors=True)
 
     def run_script(self, *arguments):
@@ -222,7 +225,7 @@ class RunAesaScriptTest(unittest.TestCase):
 
     def test_stop_after_crash_still_saves_logs(self):
         self.start()
-        subprocess.run(["kill", "-9", (self.work / "adp.pid").read_text().strip()], check=True)
+        subprocess.run(["kill", "-9", (self.work / "adp.pid").read_text().split()[0]], check=True)
         time.sleep(0.3)
         result = self.run_script("stop")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -248,3 +251,39 @@ class RunAesaScriptTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("다시 시작했지만", result.stderr)
         self.assertIn("실행 중", self.run_script("status").stdout)
+
+    def unrelated_process(self):
+        """처리부가 죽은 뒤 같은 PID를 받은 다른 프로세스 흉내."""
+        process = subprocess.Popen(["sleep", "30"])
+        self.others = getattr(self, "others", []) + [process]
+        return process
+
+    def test_pid_file_records_start_time(self):
+        self.start()
+        pid, started = (self.work / "adp.pid").read_text().split()
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        self.assertEqual(stat.rsplit(") ", 1)[1].split()[19], started)
+
+    def test_stop_does_not_signal_reused_pid(self):
+        other = self.unrelated_process()
+        (self.work / "adp.pid").write_text(f"{other.pid} 1\n", encoding="utf-8")  # 시작시각이 다름
+        result = self.run_script("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("이미 종료", result.stdout)
+        self.assertIsNone(other.poll(), "다른 프로세스에 신호를 보냈음")
+        self.assertFalse((self.work / "adp.pid").exists())
+
+    def test_start_ignores_old_pid_file_of_other_process(self):
+        other = self.unrelated_process()
+        (self.work / "adp.pid").write_text(f"{other.pid}\n", encoding="utf-8")  # 시작시각 없는 예전 형식
+        result = self.start()
+        self.assertNotIn("이미 실행 중", result.stdout)
+        self.assertIn("실행 중: PID", result.stdout)
+        self.assertIsNone(other.poll())
+
+    def test_stop_does_not_signal_reused_pid_in_old_pid_file(self):
+        other = self.unrelated_process()
+        (self.work / "adp.pid").write_text(f"{other.pid}\n", encoding="utf-8")  # 시작시각 없는 예전 형식
+        result = self.run_script("stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(other.poll(), "다른 프로세스에 신호를 보냈음")

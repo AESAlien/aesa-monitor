@@ -3,7 +3,8 @@
 # 시연 중 노트북이 잠들거나 USB 랜 어댑터 전원이 꺼지면 캡처가 끊긴다. 현재 전원 계획에서 아래를 끈다.
 #   절전·최대 절전(AC/배터리), 화면 끄기(AC), 덮개 닫을 때 동작(AC/배터리), USB 선택적 절전(AC/배터리)
 #   유선 랜카드의 "전원을 아끼기 위해 컴퓨터가 이 장치를 끌 수 있음"
-# 바꾸기 전 값은 %LOCALAPPDATA%\aesa-monitor\power-backup.json에 저장하고, 메뉴 2번으로 되돌린다.
+# 바꾸기 전 값은 바꾸기 전에 %LOCALAPPDATA%\aesa-monitor\power-backup.json에 저장하고, 메뉴 2번으로 되돌린다.
+# 바꾸다 실패하면 이번에 바꾼 값을 바로 되돌린다.
 # (랜카드 전원 관리는 되돌리지 않는다. 장치 관리자 > 랜카드 > 전원 관리에서 직접 켤 수 있다.)
 #
 # PowerShell에서 직접: .\setup_power.ps1 -Mode apply | restore
@@ -49,25 +50,50 @@ function Set-Value($Item, $Ac, $Dc) {
     if ($null -ne $Dc) { Invoke-PowerCfg @("/setdcvalueindex", "SCHEME_CURRENT", $Item.Group, $Item.Setting, "$Dc") | Out-Null }
 }
 
+function Save-Backup($Values) {
+    # 바꾸기 전 값을 먼저 저장한다. 임시 파일에 쓰고 옮겨서, 쓰다 실패해도 반쪽 파일이 남지 않게 한다.
+    New-Item -ItemType Directory -Force -Path (Split-Path $BackupPath) | Out-Null
+    $temporary = "$BackupPath.tmp"
+    $Values | ConvertTo-Json | Set-Content -Encoding UTF8 $temporary
+    Move-Item -Force $temporary $BackupPath
+}
+
 function Invoke-Apply {
-    $backup = @{}
-    if (Test-Path $BackupPath) {
-        Write-Host "이전 백업이 있어 그대로 둡니다 (처음 값 보존): $BackupPath"
-    }
+    # 1. 바꾸기 전 값을 모두 읽는다(아직 아무것도 바꾸지 않음).
+    $original = [ordered]@{}
     foreach ($item in $Settings) {
         $current = $null
         try { $current = Get-CurrentValue $item } catch { }
         if ($null -eq $current) { Write-Host ("  건너뜀: {0} (이 노트북에 없는 설정)" -f $item.Name); continue }
-        $backup[$item.Setting] = $current
-        Set-Value $item $item.Ac $item.Dc
-        Write-Host ("  {0}: AC {1} -> {2}, 배터리 {3} -> {4}" -f $item.Name, $current.Ac, $item.Ac, $current.Dc,
-            $(if ($null -eq $item.Dc) { "그대로" } else { $item.Dc }))
+        $original[$item.Setting] = $current
     }
-    Invoke-PowerCfg @("/setactive", "SCHEME_CURRENT") | Out-Null
-    if (-not (Test-Path $BackupPath)) {
-        New-Item -ItemType Directory -Force -Path (Split-Path $BackupPath) | Out-Null
-        $backup | ConvertTo-Json | Set-Content -Encoding UTF8 $BackupPath
+    # 2. 백업을 바꾸기 전에 저장한다. 저장하지 못하면 아무것도 바꾸지 않고 끝낸다.
+    if (Test-Path $BackupPath) {
+        Write-Host "이전 백업이 있어 그대로 둡니다 (처음 값 보존): $BackupPath"
+    } else {
+        Save-Backup $original
         Write-Host "바꾸기 전 값 저장: $BackupPath"
+    }
+    # 3. 바꾼다. 중간에 실패하면 이번에 바꾼 것을 읽어 둔 값으로 되돌리고 실패로 끝낸다.
+    $changed = @()
+    try {
+        foreach ($item in $Settings) {
+            $current = $original[$item.Setting]
+            if ($null -eq $current) { continue }
+            $changed += $item
+            Set-Value $item $item.Ac $item.Dc
+            Write-Host ("  {0}: AC {1} -> {2}, 배터리 {3} -> {4}" -f $item.Name, $current.Ac, $item.Ac, $current.Dc,
+                $(if ($null -eq $item.Dc) { "그대로" } else { $item.Dc }))
+        }
+        Invoke-PowerCfg @("/setactive", "SCHEME_CURRENT") | Out-Null
+    } catch {
+        $failure = $_.Exception.Message
+        foreach ($item in $changed) {
+            $saved = $original[$item.Setting]
+            try { Set-Value $item $saved.Ac $saved.Dc } catch { }
+        }
+        try { Invoke-PowerCfg @("/setactive", "SCHEME_CURRENT") | Out-Null } catch { }
+        throw "전원 설정을 바꾸다 실패해 이번에 바꾼 값을 되돌렸습니다($failure). 남은 것이 있으면 2번으로 백업 값으로 되돌리세요."
     }
     $wired = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object {
         $_.InterfaceDescription -notmatch "Wi-?Fi|Wireless|Bluetooth" })
