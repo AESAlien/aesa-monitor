@@ -48,12 +48,16 @@ SCAN_STEP_S = 0.25
 NO_BEAM_MS = 1000
 # clock 보간용 표본 수(갱신마다 하나)
 CLOCK_SAMPLES = 400
+# 미탐 한도로 사라진 트랙이 이 시간(처리부 시각) 안에 이 수 이상이면 하나의 '동시 소실'로 묶는다.
+# 시나리오 한 주기가 끝나 모의기가 표적을 없애면 모든 트랙이 함께 미탐 한도로 지워진다(2026-11-19 녹화: 10개가 1초 안에).
+MASS_LOSS_WINDOW_MS = 3000
+MASS_LOSS_MIN_TRACKS = 3
 
 CATEGORY_BEAM = "빔"
 CATEGORY_TRACK = "추적"
 CATEGORY_LINK = "통신"
 CATEGORY_LOG = "처리부 로그"
-TRACK_KINDS = ("miss", "ended", "confirm-fail")
+TRACK_KINDS = ("miss", "ended", "confirm-fail", "mass-loss")
 LINK_EVENTS = (ConnectionChanged, PeerLinkChanged)
 
 
@@ -113,6 +117,12 @@ class ProblemDetector:
     _epoch: int = 0
     _samples: Deque[Tuple[int, float]] = field(default_factory=lambda: deque(maxlen=CLOCK_SAMPLES))
     _live_tracks: Set[int] = field(default_factory=set)
+    # 최근 미탐 한도로 사라진 트랙: (마지막 사이클 시각, 트랙, 끝 미탐 구간 시작 시각)
+    _recent_losses: Deque[Tuple[int, int, int]] = field(default_factory=deque)
+    # 정상 종료(영역 이탈)나 동시 소실로 처리한 트랙. 늦게 확정되는 사이클의 미탐을 다시 기록하지 않는다.
+    _quiet_tracks: Set[int] = field(default_factory=set)
+    _mass_loss: Optional[Problem] = None
+    _mass_loss_ids: Set[int] = field(default_factory=set)
 
     # 바깥에서 쓰는 것
 
@@ -195,6 +205,58 @@ class ProblemDetector:
                 return previous[1] + (sample[1] - previous[1]) * (at_ms - previous[0]) / span
             previous = sample
         return samples[-1][1]
+
+    @staticmethod
+    def _trailing_run_start(cycles) -> Optional[int]:
+        """끝에 이어진 미탐·종료 사이클 구간의 시작 시각."""
+        start = None
+        for cycle in reversed(cycles):
+            if cycle.outcome not in (Outcome.MISSED, Outcome.ENDED):
+                break
+            start = cycle.time_ms
+        return start
+
+    def _group_loss(self, track_id: int, cycles, last_ms: int, now_s: float, grace: int) -> bool:
+        """미탐 한도로 사라진 트랙을 최근 소실과 묶는다. 묶였으면(동시 소실로 기록) True.
+
+        MASS_LOSS_WINDOW_MS 안에 MASS_LOSS_MIN_TRACKS개 이상이면 트랙마다의 '미탐'·'종료' 대신
+        '트랙 N개 동시 소실' 하나로 남긴다. 사건 하나로는 남기므로 모의기 정지 같은 이상도 사라지지 않는다.
+        """
+        run_start = self._trailing_run_start(cycles)
+        self._recent_losses.append((last_ms, track_id, run_start if run_start is not None else last_ms))
+        while self._recent_losses and self._recent_losses[0][0] < last_ms - MASS_LOSS_WINDOW_MS:
+            self._recent_losses.popleft()
+        if len(self._recent_losses) < MASS_LOSS_MIN_TRACKS:
+            return False
+        first_ms = min(item[0] for item in self._recent_losses)
+        for _at_ms, lost_id, since_ms in self._recent_losses:
+            if lost_id in self._quiet_tracks:
+                continue
+            self._quiet_tracks.add(lost_id)
+            self._retract("miss", lost_id, since_ms)
+            self._retract("ended", lost_id, since_ms)
+            problem = self._report("mass-loss", CATEGORY_TRACK, WARN, "", "", first_ms,
+                                   self._clock_for(first_ms, now_s), amount=1,
+                                   grace_ms=grace + MASS_LOSS_WINDOW_MS)
+            if problem is not self._mass_loss:
+                self._mass_loss, self._mass_loss_ids = problem, set()
+            self._mass_loss_ids.add(lost_id)
+            problem.title = f"트랙 {problem.amount}개 동시 소실"
+            problem.detail = (f"{MASS_LOSS_WINDOW_MS / 1000:g}초 안에 미탐 한도로 함께 사라짐 — 시나리오 한 주기 종료"
+                              f"(모의기 표적 제거) 또는 모의기 정지 추정 "
+                              f"(트랙 {', '.join(f'#{item}' for item in sorted(self._mass_loss_ids))})")
+        return True
+
+    def _retract(self, kind: str, track_id: int, since_ms: int) -> None:
+        """since_ms(처리부 시각) 이후에 시작한 이 트랙의 문제를 지운다. 나중에 정상으로 밝혀진 경우에 쓴다."""
+        def gone(problem: Problem) -> bool:
+            return (problem.kind == kind and problem.track_id == track_id
+                    and problem.start_ms is not None and problem.start_ms >= since_ms)
+
+        self.problems = [problem for problem in self.problems if not gone(problem)]
+        item = self._open.get((kind, track_id))
+        if item is not None and gone(item.problem):
+            del self._open[(kind, track_id)]
 
     def _report(self, kind: str, category: str, level: str, title: str, detail: str, at_ms: Optional[int],
                 at_s: float, track_id: Optional[int] = None, amount: int = 0, occurrence: bool = True,
@@ -338,9 +400,19 @@ class ProblemDetector:
         # 추적 결과는 settle_ms만큼 늦게 확정되므로 그만큼 더 기다려야 같은 트랙 미탐을 한 사건으로 묶는다.
         grace = MERGE_MS + settle_ms
 
-        # 트랙 종료: 처리부 트랙 목록에서 사라진 트랙. 마지막 사이클이 갱신이어도(다음 빔이 영역 밖 거부 등) 잡힌다.
+        # 트랙 종료: 처리부 트랙 목록에서 사라진 트랙. 정상 종료는 문제로 남기지 않는다.
+        #   - 운용 OFF: 처리부가 트랙을 모두 지운다(처리부 로그 'OFF, cleared tracks=N').
+        #   - 영역 이탈: 다음 추적 빔이 나가지 않고(처리부가 요청을 OUT_OF_COVERAGE로 거부) 4초 뒤 지운다
+        #     ('Removed unanswered track'). 미탐이 한도에 이르지 않았는데 다음 빔 없이 사라진 경우로 본다.
+        #     2026-11-19 녹화에서 처리부 로그의 영역 밖 거부 트랙과 모두 일치(미탐 0~1회, 다음 빔 없음).
+        #     다른 이유로 요청이 버려져도(예: 자세 정보 없음) 같은 모양이라 구분하지 못한다(처리부 로그로 확인).
+        # 남기는 것: 미탐 한도로 지워진 트랙(연속 미탐 = 한도 - 1, 마지막 사이클이 한도째 미탐),
+        #           다음 추적 빔은 나갔는데 결과 없이 지워진 트랙(모의기 응답 없음).
         current = set(history.latest_tracks)
+        operation_off = state.paused() is True
         for track_id in sorted(self._live_tracks - current):
+            if operation_off:
+                continue
             cycles = history.cycles(track_id)
             misses = 0
             for cycle in reversed(cycles):
@@ -349,9 +421,22 @@ class ProblemDetector:
                 if cycle.outcome != Outcome.MISSED:
                     break
                 misses += 1
-            reason = (f"직전 연속 미탐 {misses}회 (한도 {limit})" if misses else
-                      "미탐 없이 사라짐 — 영역 밖 거부 또는 결과 없음 (처리부 로그 확인)")
+            next_beam_sent = bool(cycles) and cycles[-1].next_beam is not None
+            if misses < limit - 1 and not next_beam_sent:
+                # 영역 이탈(추정). 영역 경계에서 빗나간 마지막 빔들의 미탐도 이탈 과정이라 문제에서 뺀다
+                # (트랙 생애 앞쪽의 미탐은 그대로 둔다).
+                run_start = self._trailing_run_start(cycles)
+                if run_start is not None:
+                    self._retract("miss", track_id, run_start)
+                    self._quiet_tracks.add(track_id)
+                continue
             last_ms = cycles[-1].time_ms if cycles else now_ms
+            if misses and self._group_loss(track_id, cycles, last_ms, now_s, grace):
+                continue
+            if misses:
+                reason = f"직전 연속 미탐 {misses}회 (한도 {limit})"
+            else:
+                reason = "다음 추적 빔은 나갔는데 결과 없이 사라짐 — 모의기 응답 확인 (처리부 로그 'Removed unanswered track')"
             self._report("ended", CATEGORY_TRACK, WARN, f"트랙 #{track_id} 종료", reason, last_ms,
                          self._clock_for(last_ms, now_s), track_id=track_id, grace_ms=grace)
         self._live_tracks = current
@@ -366,6 +451,8 @@ class ProblemDetector:
                 if mark in self._seen_cycles or cycle.outcome == Outcome.PENDING:
                     continue
                 self._seen_cycles.add(mark)
+                if track_id in self._quiet_tracks:
+                    continue
                 at_s = self._clock_for(cycle.time_ms, now_s)
                 if cycle.outcome == Outcome.MISSED:
                     consecutive = 0

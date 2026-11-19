@@ -3,7 +3,9 @@ import unittest
 from aesa_monitor.core.config import TrackingParameters
 from aesa_monitor.core.events import PEER_SIMULATOR, ConnectionChanged, PeerLinkChanged
 from aesa_monitor.core.problems import BAD, WARN, scan_events
-from aesa_monitor.core.protocol import Beam, BeamType, Detection, MonitorStatus, Plot, Track, TrackList
+from aesa_monitor.core.protocol import (
+    Beam, BeamType, Detection, MonitorStatus, OperatorControl, Plot, Track, TrackList,
+)
 
 PARAMETERS = TrackingParameters()
 CELLS = 4
@@ -168,17 +170,97 @@ class OffBeamTest(unittest.TestCase):
         self.assertEqual([problem for problem in problems if problem.track_id == 7], [])
 
 
+def tracked(recording, track_ids, until_ms, missed=(), unanswered_at=None):
+    """트랙들을 추적 주기마다 갱신한다. missed: {(트랙, 빔 시각)} 미탐, unanswered_at: 결과 없이 나간 마지막 빔 시각.
+
+    트랙마다 빔 슬롯을 1 ms씩 비켜 둔다. 반환: 마지막 갱신 시각 {트랙: 시각}.
+    """
+    interval = PARAMETERS.tracking_interval_ms
+    last = {track_id: 0 for track_id in track_ids}
+    for base in range(1005, until_ms, interval):
+        for offset, track_id in enumerate(track_ids):
+            beam_ms = base + offset
+            recording.add(beam_ms, Beam(BeamType.TRACKING, beam_ms, track_id, 0, 20.0, 1.5, 3.0, 3.0))
+            hit = (track_id, base) not in missed
+            plots = [Plot(50.0, 20.0, 1.5, -250.0, 80.0)] if hit else []
+            recording.add(beam_ms + 1, Detection(BeamType.TRACKING, beam_ms, track_id, plots))
+            if hit:
+                last[track_id] = beam_ms
+        recording.add(base + 50, TrackList([track(track_id, last[track_id]) for track_id in track_ids]))
+    if unanswered_at is not None:
+        for offset, track_id in enumerate(track_ids):
+            recording.add(unanswered_at + offset, Beam(BeamType.TRACKING, unanswered_at + offset, track_id, 0, 20.0,
+                                                       1.5, 3.0, 3.0))
+    return last
+
+
+def tracking_slots(until_ms, tracks):
+    return tuple(base + offset for base in range(1005, until_ms + PARAMETERS.tracking_interval_ms,
+                                                  PARAMETERS.tracking_interval_ms) for offset in range(tracks))
+
+
 class TrackEndTest(unittest.TestCase):
-    def test_track_leaving_track_list_is_recorded(self):
+    """트랙 종료 분류: 정상 종료(운용 OFF, 영역 이탈)는 문제로 남기지 않는다. 2026-11-19 시연 녹화에서 확인한 모양."""
+
+    def test_track_lost_after_next_beam_without_result_is_recorded(self):
+        # 다음 추적 빔은 나갔는데 결과가 없고(모의기 응답 없음) 처리부가 트랙을 지움
         recording = Recording()
-        recording.beams(0, 9000)
-        for time_ms in range(1000, 5000, 1000):
-            recording.add(time_ms, TrackList([track(7, time_ms)]))
-        recording.add(5000, TrackList([]))
+        recording.beams(0, 12000, skip=tracking_slots(12000, 1))
+        tracked(recording, [7], 5000, unanswered_at=5005)
+        recording.add(9000, TrackList([]))
         ended = of_kind(recording.scan(), "ended")
         self.assertEqual(len(ended), 1)
         self.assertEqual(ended[0].track_id, 7)
         self.assertIn("#7", ended[0].title)
+        self.assertIn("결과 없이", ended[0].detail)
+
+    def test_track_leaving_coverage_is_not_recorded(self):
+        # 영역 경계에서 한 번 빗나간 뒤 다음 요청이 영역 밖으로 거부되어(빔 없음) 4초 뒤 지워짐
+        recording = Recording()
+        recording.beams(0, 12000, skip=tracking_slots(12000, 1))
+        tracked(recording, [7], 6000, missed={(7, 5005)})
+        recording.add(10000, TrackList([]))
+        problems = recording.scan()
+        self.assertEqual([problem for problem in problems if problem.track_id == 7], [])
+
+    def test_tracks_cleared_by_operation_off_are_not_recorded(self):
+        recording = Recording()
+        recording.beams(0, 5500, skip=tracking_slots(5500, 2))
+        tracked(recording, [7, 8], 5000)
+        recording.add(5500, OperatorControl(0))
+        recording.add(5500, MonitorStatus(5500, 1.0, True, True, True))
+        recording.add(5600, TrackList([]))
+        self.assertEqual(of_kind(recording.scan(), "ended"), [])
+
+    def test_single_track_lost_by_miss_limit_is_recorded(self):
+        limit = PARAMETERS.max_consecutive_tracking_misses
+        interval = PARAMETERS.tracking_interval_ms
+        recording = Recording()
+        recording.beams(0, 14000, skip=tracking_slots(14000, 1))
+        misses = {(7, 3005 + interval * index) for index in range(limit)}
+        tracked(recording, [7], 3005 + interval * limit, missed=misses)
+        recording.add(3005 + interval * limit + 100, TrackList([]))
+        problems = recording.scan()
+        self.assertEqual(len(of_kind(problems, "ended")), 1)
+        self.assertEqual(len(of_kind(problems, "miss")), 1)
+        self.assertEqual(of_kind(problems, "mass-loss"), [])
+
+    def test_tracks_lost_together_become_one_incident(self):
+        # 시나리오 한 주기가 끝나 모의기가 표적을 없애면 모든 트랙이 함께 미탐 한도로 지워진다.
+        limit = PARAMETERS.max_consecutive_tracking_misses
+        interval = PARAMETERS.tracking_interval_ms
+        ids = [7, 8, 9]
+        recording = Recording()
+        recording.beams(0, 14000, skip=tracking_slots(14000, len(ids)))
+        misses = {(track_id, 3005 + interval * index) for track_id in ids for index in range(limit)}
+        tracked(recording, ids, 3005 + interval * limit, missed=misses)
+        recording.add(3005 + interval * limit + 100, TrackList([]))
+        problems = recording.scan()
+        groups = of_kind(problems, "mass-loss")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].amount, 3)
+        self.assertIn("3개 동시 소실", groups[0].title)
+        self.assertEqual([problem for problem in problems if problem.track_id in ids], [])
 
     def test_restart_does_not_count_as_track_end(self):
         recording = Recording()
