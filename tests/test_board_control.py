@@ -559,12 +559,48 @@ class RunAesaScriptLinkLockTest(RunAesaScriptTest):
         self.start()
         self.assertIsNone(other.poll())
 
+    def abandoned(self):
+        """강제 종료된 명령이 남긴 잠금 주인 신원(없는 PID)."""
+        return f"999999 1 {self.boot_id()}"
+
+    def guard(self, identity, generation):
+        return self.folder / f"aesactl.lock-owner.reclaim.{identity.replace(' ', '_')}.{generation}"
+
+    def guards_left(self):
+        return sorted(path.name for path in self.folder.glob("aesactl.lock-owner.reclaim*"))
+
     def test_simultaneous_reclaim_of_abandoned_lock_never_overlaps(self):
         # 버려진 잠금을 여러 명령이 동시에 정리해도 잠금 안에는 한 번에 하나만 들어간다.
         for _ in range(3):
-            os.symlink(f"999999 1 {self.boot_id()} stop", self.folder / "aesactl.lock-owner")
+            os.symlink(f"{self.abandoned()} stop", self.folder / "aesactl.lock-owner")
             codes, spans = self.run_together()
             self.assert_no_overlap(spans)
             self.assertGreaterEqual(codes.count(0), 1)
             self.assertTrue(self.lock_free())
-            self.assertFalse((self.folder / "aesactl.lock-owner.reclaim").is_symlink(), "정리 잠금이 남음")
+            self.assertEqual(self.guards_left(), [], "정리 잠금이 남음")
+
+    def test_reclaim_survives_a_reclaimer_killed_midway(self):
+        # 정리하던 명령이 정리 잠금을 잡은 채 강제 종료됨: 그 정리 잠금은 지우지 않고 다음 세대로 정리한다.
+        for _ in range(3):
+            os.symlink(f"{self.abandoned()} stop", self.folder / "aesactl.lock-owner")
+            os.symlink(f"999998 1 {self.boot_id()}", self.guard(self.abandoned(), 1))
+            codes, spans = self.run_together()
+            self.assert_no_overlap(spans)
+            self.assertGreaterEqual(codes.count(0), 1)
+            self.assertTrue(self.lock_free())
+            self.assertEqual(self.guards_left(), [], "정리 잠금이 남음")
+
+    def test_live_reclaimer_guard_is_never_removed(self):
+        # 리뷰의 경우: 1세대 정리 잠금의 주인은 죽었고, 다른 명령이 2세대 정리 잠금을 잡고 정리하는 중.
+        # 뒤에 온 명령은 그 정리 잠금을 지우거나 같이 정리하지 않고 기다린다(여기서는 바로 거부).
+        os.symlink(f"{self.abandoned()} stop", self.folder / "aesactl.lock-owner")
+        os.symlink(f"999998 1 {self.boot_id()}", self.guard(self.abandoned(), 1))
+        reclaimer = subprocess.Popen(["sleep", "60"])
+        self.others = getattr(self, "others", []) + [reclaimer]
+        live = f"{reclaimer.pid} {self.start_time(reclaimer.pid)} {self.boot_id()}"
+        os.symlink(live, self.guard(self.abandoned(), 2))
+        result = self.run_script("savelog")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("가져가는 중", result.stderr)
+        self.assertEqual(os.readlink(self.guard(self.abandoned(), 2)), live)
+        self.assertEqual(os.readlink(self.folder / "aesactl.lock-owner"), f"{self.abandoned()} stop")

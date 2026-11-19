@@ -439,8 +439,8 @@ acquire_link() {
     # flock이 없을 때: 심볼릭 링크 하나가 잠금이다. 내용 "PID 시작시각 부팅ID 명령"이 주인이고,
     # ln -s는 링크와 내용을 한 번에 만든다(주인이 비어 있는 순간이 없음).
     # 주인 확인은 PID만이 아니라 시작시각·부팅 ID까지 본다(강제 종료 뒤 재사용된 PID를 주인으로 보지 않음).
-    # 버려진 잠금 정리는 정리 잠금(LOCK_LINK.reclaim) 아래서 한 번에 하나만 하고, 지우기 직전 내용이
-    # 그대로일 때만 지운다. 그래서 두 명령이 같은 버려진 잠금을 동시에 정리해도 새 주인의 잠금을 지우지 않는다.
+    # 버려진 잠금 정리는 그 주인 이름의 정리 잠금을 만든 하나만 한다(reclaim_link). 그래서 여러 명령이
+    # 같은 버려진 잠금을 동시에 정리해도 새 주인의 잠금을 지우지 않는다.
     LOCK_OWNER="$(my_identity) $*"
     waited=0
     tries=0
@@ -466,20 +466,30 @@ acquire_link() {
 }
 
 reclaim_link() {
-    # reclaim_link 버려진주인 : 정리 잠금을 잡은 쪽만 버려진 잠금을 지운다. 정리 잠금을 다른 명령이
-    # 잡고 있으면(그쪽이 가져가는 중) 1을 돌려준다.
-    guard="$LOCK_LINK.reclaim"
-    if ln -s "$(my_identity)" "$guard" 2>/dev/null; then
-        [ "$(readlink "$LOCK_LINK" 2>/dev/null)" = "$1" ] && rm -f "$LOCK_LINK"
-        rm -f "$guard"
-        return 0
-    fi
-    keeper=$(readlink "$guard" 2>/dev/null)
-    [ -z "$keeper" ] && return 0   # 방금 끝났다: 다시 시도
-    owner_alive "$keeper" && return 1
-    # 정리 잠금을 잡은 쪽이 정리 도중 강제 종료되었다(아주 짧은 구간). 그 정리 잠금을 치우고 다시 시도한다.
-    [ "$(readlink "$guard" 2>/dev/null)" = "$keeper" ] && rm -f "$guard"
-    return 0
+    # reclaim_link 버려진주인 : 버려진 잠금을 지운다. 지웠거나 이미 바뀌었으면 0, 다른 명령이 정리 중이면 1.
+    # 셸에는 "내용이 그대로면 지우기"를 한 번에 하는 명령이 없다. 그래서 지우는 쪽을 하나로 만든다.
+    #   - 정리 잠금 이름에 버려진 주인의 신원을 넣는다(.reclaim.PID_시작시각_부팅ID.세대). ln -s로 만든 쪽 하나만
+    #     정리한다. 잠금이 그 주인인 동안에는 정리하는 쪽 말고는 아무도 잠금을 바꿀 수 없으므로
+    #     (주인은 죽었고, ln -s는 실패한다) '내용 확인 뒤 지우기'가 안전하다.
+    #   - 정리하던 쪽이 도중에 죽으면 그 정리 잠금은 지우지 않고(지우기가 또 같은 경쟁을 만든다) 다음 세대로 넘어간다.
+    #     같은 세대는 하나만 만들 수 있고, 다음 세대는 앞 세대가 모두 죽었을 때만 쓴다.
+    #   - 신원은 다시 나오지 않으므로, 잠금이 그 주인이 아니게 된 뒤에는 그 주인의 정리 잠금이 쓸모없다.
+    #     그때 한꺼번에 치운다(남은 쪽이 그것을 다시 만들어도 잠금이 그 주인이 아니라 아무것도 지우지 않는다).
+    key=$(echo "$1" | cut -d' ' -f1-3 | tr ' ' '_')
+    generation=1
+    while [ $generation -le 5 ]; do
+        guard="$LOCK_LINK.reclaim.$key.$generation"
+        if ln -s "$(my_identity)" "$guard" 2>/dev/null; then
+            [ "$(readlink "$LOCK_LINK" 2>/dev/null)" = "$1" ] && rm -f "$LOCK_LINK"
+            rm -f "$LOCK_LINK.reclaim.$key".*
+            return 0
+        fi
+        keeper=$(readlink "$guard" 2>/dev/null)
+        [ -z "$keeper" ] && return 0   # 정리가 끝나 치워졌다: 다시 시도
+        owner_alive "$keeper" && return 1
+        generation=$((generation + 1))
+    done
+    die "버려진 잠금 정리가 여러 번 중단되었습니다. 보드를 다시 켜거나 $LOCK_LINK* 를 지우세요."
 }
 
 release_lock() {

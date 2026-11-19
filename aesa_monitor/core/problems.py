@@ -221,17 +221,28 @@ class ProblemDetector:
 
         MASS_LOSS_WINDOW_MS 안에 MASS_LOSS_MIN_TRACKS개 이상이면 트랙마다의 '미탐'·'종료' 대신
         '트랙 N개 동시 소실' 하나로 남긴다. 사건 하나로는 남기므로 모의기 정지 같은 이상도 사라지지 않는다.
+        한 사건은 첫 소실부터 MASS_LOSS_WINDOW_MS까지만 받는다. 그 뒤의 소실은 새 묶음으로 따로 센다
+        (열린 사건의 유예 시간 안이라도 합치지 않는다: 4초 간격의 두 묶음이 '6개 동시 소실'이 되지 않게).
         """
         run_start = self._trailing_run_start(cycles)
         self._recent_losses.append((last_ms, track_id, run_start if run_start is not None else last_ms))
         while self._recent_losses and self._recent_losses[0][0] < last_ms - MASS_LOSS_WINDOW_MS:
             self._recent_losses.popleft()
-        if len(self._recent_losses) < MASS_LOSS_MIN_TRACKS:
+        group = self._mass_loss
+        item = self._open.get(("mass-loss", None))
+        if item is None or item.problem is not group:
+            group = None  # 유예 시간이 지나 이미 닫혔다
+        if group is not None and group.start_ms is not None and last_ms - group.start_ms > MASS_LOSS_WINDOW_MS:
+            self._close_mass_loss()
+            group = None
+        # 이미 어느 사건에 들어간 소실은 새 묶음의 개수에 넣지 않는다.
+        fresh = [item for item in self._recent_losses if item[1] not in self._quiet_tracks]
+        if group is None and len(fresh) < MASS_LOSS_MIN_TRACKS:
             return False
-        first_ms = min(item[0] for item in self._recent_losses)
-        for _at_ms, lost_id, since_ms in self._recent_losses:
-            if lost_id in self._quiet_tracks:
-                continue
+        first_ms = min(item[0] for item in fresh)
+        if group is not None and group.start_ms is not None:
+            first_ms = min(first_ms, group.start_ms)
+        for _at_ms, lost_id, since_ms in fresh:
             self._quiet_tracks.add(lost_id)
             self._retract("miss", lost_id, since_ms)
             self._retract("ended", lost_id, since_ms)
@@ -241,11 +252,22 @@ class ProblemDetector:
             if problem is not self._mass_loss:
                 self._mass_loss, self._mass_loss_ids = problem, set()
             self._mass_loss_ids.add(lost_id)
+            if problem.start_ms is None or first_ms < problem.start_ms:
+                problem.start_ms = first_ms
             problem.title = f"트랙 {problem.amount}개 동시 소실"
             problem.detail = (f"{MASS_LOSS_WINDOW_MS / 1000:g}초 안에 미탐 한도로 함께 사라짐 — 시나리오 한 주기 종료"
                               f"(모의기 표적 제거) 또는 모의기 정지 추정 "
                               f"(트랙 {', '.join(f'#{item}' for item in sorted(self._mass_loss_ids))})")
         return True
+
+    def _close_mass_loss(self) -> None:
+        """지금 묶고 있는 동시 소실 사건을 닫는다. 다음 소실은 새 사건으로 연다."""
+        item = self._open.get(("mass-loss", None))
+        if item is not None and item.problem is self._mass_loss:
+            item.problem.open = False
+            del self._open[("mass-loss", None)]
+        self._mass_loss = None
+        self._mass_loss_ids = set()
 
     def _retract(self, kind: str, track_id: int, since_ms: int) -> None:
         """since_ms(처리부 시각) 이후에 시작한 이 트랙의 문제를 지운다. 나중에 정상으로 밝혀진 경우에 쓴다."""
