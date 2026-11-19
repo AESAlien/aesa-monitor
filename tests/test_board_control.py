@@ -62,6 +62,17 @@ class RunActionTest(unittest.TestCase):
             run_action(SETTINGS, "start", NOW, runner)
         self.assertIn("45초", str(raised.exception))
 
+    def test_stop_timeout_points_to_saved_log_status(self):
+        runner = mock.Mock(side_effect=subprocess.TimeoutExpired("ssh", 150))
+        with self.assertRaises(BoardError) as raised:
+            run_action(SETTINGS, "stop", NOW, runner)
+        self.assertIn("마지막 로그 저장", str(raised.exception))
+
+    def test_log_saving_actions_wait_longer_than_board_stop(self):
+        # 보드 stop은 종료 대기 10초 + 복사. 복사에 2분 넘게 여유를 둔다.
+        for name in ("stop", "restart", "poweroff"):
+            self.assertGreaterEqual(ACTIONS[name].timeout, 150, name)
+
     def test_failure_keeps_board_message(self):
         runner = mock.Mock(return_value=completed(1, stderr="[aesa] 오류: eth0를 켤 수 없습니다.\n"))
         with self.assertRaises(BoardError) as raised:
@@ -249,7 +260,8 @@ class RunAesaScriptTest(unittest.TestCase):
         result = self.run_script("stop")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("복사하지 못했습니다", result.stderr)
-        self.assertNotIn("SD FAT로 복사:", result.stdout)
+        self.assertNotIn("로그 복사 완료", result.stdout)
+        self.assertIn("실패", self.run_script("status").stdout.split("마지막 로그 저장:")[1].splitlines()[0])
 
     def test_stop_after_crash_still_saves_logs(self):
         self.start()
@@ -357,3 +369,19 @@ class RunAesaScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("이미 실행 중", result.stdout)
         self.assertIn("실행 중: PID", result.stdout)
+
+    def test_second_save_skips_logs_already_on_sd(self):
+        self.start()
+        self.assertEqual(self.run_script("stop").returncode, 0)
+        result = self.run_script("savelog")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("0개 복사", result.stdout)
+        self.assertIn("완료: 복사 0개", self.run_script("status").stdout)
+
+    def test_log_saving_finishes_after_ssh_output_is_gone(self):
+        # 모니터가 제한 시간에 ssh를 끊어 출력 받을 곳이 사라져도(SIGPIPE) 복사를 끝까지 하고 결과를 남긴다.
+        self.start()
+        command = f'sh "{self.script}" stop | head -c 0'
+        subprocess.run(command, shell=True, timeout=30)
+        self.assertTrue((self.fat / "logs" / "adp_20261119_100000.log").is_file())
+        self.assertIn("완료: 복사", (self.work / "savelog.state").read_text(encoding="utf-8"))

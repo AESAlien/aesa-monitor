@@ -15,7 +15,9 @@
 #   restart [시각]  stop의 로그 복사가 실패해도 다시 시작하고, 끝에 실패(종료 코드 1)로 알린다.
 #   status          실행 여부, IP, 포트, 연결, 최근 로그
 #   log             최신 adp_*.log 실시간 보기 (Ctrl+C로 나가도 처리부는 계속 실행)
-#   savelog         로그만 SD FAT로 복사
+#   savelog         로그만 SD FAT로 복사 (SD에 같은 크기로 이미 있는 파일은 건너뜀)
+#                   로그를 복사하는 명령(stop·restart·poweroff·savelog)은 ssh가 끊겨도 끝까지 복사하고,
+#                   결과는 status의 "마지막 로그 저장"에 남는다.
 #   settime 시각    보드 시각만 맞춘다
 #   net             eth0에 처리부 IP만 넣는다
 #   boot            부팅 때 init이 부른다: net, 그리고 board.conf의 AESA_AUTOSTART=1이면 start
@@ -40,6 +42,7 @@ SD_MOUNT=/mnt/sd
 PID_FILE="$WORK_DIR/adp.pid"   # "PID 시작시각 부팅ID" (시작시각: /proc/PID/stat 22번째 칸, 부팅 후 클럭 틱)
 PORT_WAIT_SECONDS=15   # 처리부가 서버 포트를 열 때까지 기다리는 시간
 STOP_WAIT_SECONDS=10   # SIGTERM 뒤 처리부가 끝나기를 기다리는 시간
+SAVE_STATE="$WORK_DIR/savelog.state"   # 마지막 로그 저장 결과 (status에 보임)
 BIN=adp
 ENV_SRC=aesa.env
 
@@ -216,28 +219,51 @@ copy_files() {
     sync
 }
 
+save_state() {
+    # 마지막 로그 저장 결과를 남긴다(status가 보여 준다). ssh가 먼저 끊겨도 결과를 나중에 확인할 수 있게.
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" > "$SAVE_STATE" 2>/dev/null
+}
+
 save_logs() {
-    # 작업 폴더의 로그를 SD FAT로 복사한다. 하나라도 복사하지 못하면 1을 돌려준다(로그는 보드에 그대로 남는다).
+    # 작업 폴더의 로그를 SD FAT로 복사한다. SD에 같은 크기로 이미 있는 파일은 건너뛴다(로그는 덧붙이기만 한다).
+    # 하나라도 복사하지 못하면 1을 돌려준다(로그는 보드에 그대로 남는다).
     set -- "$WORK_DIR"/logs/*
     [ -e "$1" ] || { say "저장할 로그가 없습니다."; return 0; }
     if [ -z "$SRC_DIR" ]; then
+        save_state "실패: SD FAT를 찾지 못함"
         fail "SD FAT를 찾지 못해 로그를 복사하지 못했습니다 (보드: $WORK_DIR/logs)."
         return 1
     fi
     if ! mkdir -p "$SRC_DIR/logs" 2>/dev/null; then
+        save_state "실패: SD FAT에 logs 폴더를 만들지 못함"
         fail "SD FAT에 logs 폴더를 만들지 못했습니다: $SRC_DIR/logs (보드: $WORK_DIR/logs)"
         return 1
     fi
-    if ! cp "$@" "$SRC_DIR/logs/"; then
-        sync
-        fail "로그를 SD FAT로 복사하지 못했습니다 (SD가 가득 찼거나 읽기 전용일 수 있음). 보드: $WORK_DIR/logs"
-        return 1
-    fi
+    save_state "진행 중: 로그 $#개 확인·복사"
+    say "로그 $#개를 SD FAT로 복사하는 중 (이미 같은 크기로 있는 파일은 건너뜀)..."
+    copied=0
+    same=0
+    for file in "$@"; do
+        target="$SRC_DIR/logs/$(basename "$file")"
+        if [ -f "$target" ] && [ "$(wc -c < "$file")" = "$(wc -c < "$target")" ]; then
+            same=$((same + 1))
+            continue
+        fi
+        if ! cp "$file" "$target"; then
+            sync
+            save_state "실패: $(basename "$file") 복사 실패 (복사 $copied개 뒤)"
+            fail "로그를 SD FAT로 복사하지 못했습니다 (SD가 가득 찼거나 읽기 전용일 수 있음). 보드: $WORK_DIR/logs"
+            return 1
+        fi
+        copied=$((copied + 1))
+    done
     if ! sync; then
+        save_state "실패: SD FAT 쓰기(sync) 실패"
         fail "SD FAT 쓰기(sync)에 실패했습니다. 보드: $WORK_DIR/logs"
         return 1
     fi
-    say "로그 $#개를 SD FAT로 복사: $SRC_DIR/logs"
+    save_state "완료: 복사 ${copied}개, 이미 같음 ${same}개"
+    say "로그 복사 완료: ${copied}개 복사, ${same}개는 이미 같음 → $SRC_DIR/logs"
 }
 
 wait_for_port() {
@@ -306,6 +332,7 @@ do_status() {
     say "IP($IFACE): $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
     say "보드 시각: $(date '+%Y-%m-%d %H:%M:%S')"
     say "빌드: $(head -n 1 "$WORK_DIR/COMMIT" 2>/dev/null || echo '(없음)')"
+    say "마지막 로그 저장: $(cat "$SAVE_STATE" 2>/dev/null || echo '(없음)')"
     say "연결:"; netstat -tn 2>/dev/null | grep "[:.]${SERVER_PORT}[[:space:]]" || echo "  (없음)"
     log=$(latest_log)
     [ -n "$log" ] && { say "$(basename "$log") 마지막 10줄:"; tail -n 10 "$log"; }
@@ -336,6 +363,11 @@ do_restart() {
     do_start "$1"
     [ $status -eq 0 ] || die "처리부는 다시 시작했지만 이전 실행의 로그를 SD FAT로 복사하지 못했습니다. 보드: $WORK_DIR/logs"
 }
+
+# 로그를 복사하는 명령은 ssh가 먼저 끊겨도(모니터 제한 시간) 끝까지 복사하고 결과를 SAVE_STATE에 남긴다.
+case "$1" in
+    stop|restart|poweroff|savelog) trap '' HUP PIPE ;;
+esac
 
 case "$1" in
     start)    do_start "$2" ;;

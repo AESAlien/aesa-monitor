@@ -37,15 +37,18 @@ class Action:
     sends_time: bool   # 노트북 시각을 함께 보내 보드 시각을 맞춘다
 
 
-# start/restart는 보드에서 최대 10초 포트를 기다리고, stop은 최대 10초 종료를 기다린 뒤 로그를 SD로 복사한다.
+# start는 보드에서 최대 15초 포트를 기다린다. stop은 최대 10초 종료를 기다린 뒤 로그를 SD로 복사한다.
+# 로그 복사는 SD에 없거나 크기가 다른 파일만 하지만 SD가 느리면 오래 걸릴 수 있어 넉넉히 둔다.
+# 그래도 넘으면 보드는 복사를 끝까지 계속하고(ssh가 끊겨도), 결과는 [상태]의 "마지막 로그 저장"에 남는다.
 ACTIONS: Dict[str, Action] = {action.name: action for action in (
     Action("status", "상태", 20, False),
     Action("start", "시작", 45, True),
-    Action("restart", "재시작", 60, True),
-    Action("stop", "중지", 45, False),
+    Action("restart", "재시작", 180, True),
+    Action("stop", "중지", 150, False),
     Action("settime", "시각 맞추기", 20, True),
-    Action("poweroff", "보드 끄기", 45, False),
+    Action("poweroff", "보드 끄기", 150, False),
 )}
+SAVES_LOGS = ("stop", "restart", "poweroff")
 
 
 class BoardError(RuntimeError):
@@ -91,8 +94,13 @@ def run_action(settings: FetchSettings, name: str, now: Optional[datetime] = Non
         completed = runner(command, capture_output=True, text=True, timeout=action.timeout,
                            stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
     except subprocess.TimeoutExpired as error:
-        raise BoardError(f"보드가 {action.timeout:.0f}초 안에 답하지 않았습니다 ({action.label}). "
-                         "보드에서 aesactl status로 확인하세요.") from error
+        message = f"보드가 {action.timeout:.0f}초 안에 답하지 않았습니다 ({action.label})."
+        if action.name in SAVES_LOGS:
+            message += (" 보드는 SD로 로그 복사를 끝까지 계속합니다. 잠시 뒤 [상태]의 '마지막 로그 저장'에서 "
+                        "결과를 확인하세요.")
+        else:
+            message += " [상태]로 확인하세요."
+        raise BoardError(message) from error
     except OSError as error:
         raise BoardError(f"ssh를 실행하지 못했습니다: {error}") from error
     output = (completed.stdout or "").strip()
