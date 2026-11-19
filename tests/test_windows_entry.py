@@ -163,9 +163,10 @@ class PackageFilesTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "windows-exe.yml").read_text(encoding="utf-8")
         copies = [line for line in workflow.splitlines() if line.strip().startswith("Copy-Item")]
-        paths = {path for line in copies for path in re.findall(r"windows/[\w./-]+", line)
+        paths = {path for line in copies for path in re.findall(r"(?:windows|board)/[\w./-]+", line)
                  if not path.startswith("windows/dist/")}
-        self.assertIn("windows/processor.env.example", paths)
+        for expected in ("windows/processor.env.example", "windows/prepare_board_sd.ps1", "board/install_board.sh"):
+            self.assertIn(expected, paths)
         for path in sorted(paths):
             self.assertTrue((root / path).is_file(), path)
 

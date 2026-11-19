@@ -2,7 +2,7 @@
 
 명령줄에서도 따로 실행할 수 있다.
     python3 -m aesa_monitor.io.log_fetch --dest ~/aesa-records/test            # monitor.env 설정 사용
-    python3 -m aesa_monitor.io.log_fetch --source ssh --target root@192.168.10.20 --dest DIR
+    python3 -m aesa_monitor.io.log_fetch --source ssh --target petalinux@192.168.10.20 --dest DIR
     python3 -m aesa_monitor.io.log_fetch --source local --local-dir ~/aesa/logs --dest DIR
 
 가져오는 파일: adp_*.log(메시지 로그), adp_detection_*.csv(탐지 CSV).
@@ -135,10 +135,10 @@ def _explain_ssh_error(stderr: str, settings: FetchSettings) -> str:
     last = text[-1] if text else "알 수 없는 오류"
     lower = stderr.lower()
     if "permission denied" in lower:
-        hint = ("보드에 공개키가 등록되어 있지 않습니다. 비밀번호는 버튼에서 입력할 수 없으므로 "
-                "ssh-copy-id 등으로 키를 먼저 등록하세요. 보드가 재부팅되면 등록이 사라질 수 있습니다.")
+        hint = ("보드가 노트북 키를 받지 않았습니다. 비밀번호는 버튼에서 입력할 수 없으므로 "
+                "prepare_board_sd.bat으로 SD에 공개키를 넣고 보드에서 install_board.sh를 실행하세요.")
     elif "no such file" in lower:
-        hint = f"보드에 {settings.remote_dir} 폴더나 로그 파일이 없습니다. 처리부를 run_adp.sh로 실행했는지 확인하세요."
+        hint = f"보드에 {settings.remote_dir} 폴더나 로그 파일이 없습니다. 처리부를 [처리부 제어] 또는 aesactl로 실행했는지 확인하세요."
     elif "timed out" in lower or "no route" in lower or "unreachable" in lower or "refused" in lower:
         hint = f"보드({settings.ssh_target})에 접속할 수 없습니다. 이더넷 연결과 노트북 IP 설정을 확인하세요."
     else:
@@ -154,9 +154,9 @@ def main(arguments: Optional[List[str]] = None) -> int:
     parser.add_argument("--dest", type=Path, required=True, help="저장할 폴더")
     parser.add_argument("--source", choices=("local", "ssh"), help="가져오는 방식")
     parser.add_argument("--local-dir", help="local: 처리부 logs 폴더")
-    parser.add_argument("--target", help="ssh: 사용자@주소 (예: root@192.168.10.20)")
+    parser.add_argument("--target", help="ssh: 사용자@주소 (예: petalinux@192.168.10.20)")
     parser.add_argument("--port", type=int, help="ssh: 포트")
-    parser.add_argument("--remote-dir", help="ssh: 보드의 로그 폴더 (기본값 /tmp/aesa/logs)")
+    parser.add_argument("--remote-dir", help="ssh: 보드의 로그 폴더 (기본값 /opt/aesa/logs)")
     options = parser.parse_args(arguments)
 
     settings = load_settings(options.settings).fetch

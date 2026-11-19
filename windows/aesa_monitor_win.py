@@ -76,13 +76,14 @@ MONITOR_RECORD_DIR=~/aesa-records
 MONITOR_FONT_SIZE=12
 MONITOR_AUTO_RECORD=0
 
-# 처리부 로그 가져오기: local 또는 ssh(보드). ssh는 Windows 10 이상의 OpenSSH 클라이언트를 쓴다.
+# 처리부 로그 가져오기·처리부 제어: local 또는 ssh(보드). ssh는 Windows 10 이상의 OpenSSH 클라이언트를 쓴다.
+# 보드 계정·키는 prepare_board_sd.bat(노트북)과 보드의 install_board.sh가 설정한다.
 MONITOR_LOG_SOURCE=ssh
 MONITOR_LOG_LOCAL_DIR=
-MONITOR_LOG_SSH_TARGET=root@192.168.10.20
+MONITOR_LOG_SSH_TARGET=petalinux@192.168.10.20
 MONITOR_LOG_SSH_PORT=22
-MONITOR_LOG_REMOTE_DIR=/tmp/aesa/logs
-MONITOR_LOG_SSH_OPTIONS="-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL"
+MONITOR_LOG_REMOTE_DIR=/opt/aesa/logs
+MONITOR_LOG_SSH_OPTIONS="-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o IdentityFile=~/.ssh/aesa_board_ed25519"
 """
 
 

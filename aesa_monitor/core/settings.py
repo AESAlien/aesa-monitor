@@ -14,10 +14,26 @@ from aesa_monitor.core.config import ConfigError, read_env_file
 
 PROJECT_DIRECTORY = Path(__file__).resolve().parents[2]
 DEFAULT_SETTINGS_PATH = PROJECT_DIRECTORY / "monitor.env"
-DEFAULT_SSH_OPTIONS = (
+# 보드 ssh 설정. 보드는 petalinux 계정 + 공개키로 접속하고, root 작업은 sudo aesactl로 한다
+# (보드 aesa/install_board.sh가 설정, 노트북 키는 windows/prepare_board_sd.bat이 만든다).
+BOARD_ADDRESS = "192.168.10.20"
+DEFAULT_SSH_TARGET = f"petalinux@{BOARD_ADDRESS}"
+DEFAULT_REMOTE_DIR = "/opt/aesa/logs"
+BOARD_KEY_PATH = "~/.ssh/aesa_board_ed25519"
+LEGACY_SSH_OPTIONS = (
     "-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa "
     "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 )
+DEFAULT_SSH_OPTIONS = f"{LEGACY_SSH_OPTIONS} -o IdentityFile={BOARD_KEY_PATH}"
+# 예전 기본값(root로 /tmp/aesa에서 실행하던 때). 파일에 이 값이 그대로 있으면 지금 기본값으로 읽는다.
+LEGACY_FETCH_VALUES = {
+    "ssh_target": {f"root@{BOARD_ADDRESS}": DEFAULT_SSH_TARGET},
+    "remote_dir": {"/tmp/aesa/logs": DEFAULT_REMOTE_DIR},
+    "ssh_options": {
+        LEGACY_SSH_OPTIONS: DEFAULT_SSH_OPTIONS,
+        LEGACY_SSH_OPTIONS.replace("/dev/null", "NUL"): DEFAULT_SSH_OPTIONS.replace("/dev/null", "NUL"),
+    },
+}
 SOURCES = ("local", "ssh")
 # 데이터 출처. capture(기본): 처리부·모의기·운용통제기 사이 패킷을 캡처한다.
 # copy: 처리부가 보내는 복사본을 받는다. 처리부 main에는 복사본 송신 코드가 없어 feature/129-monitor-feed 처리부에서만 된다.
@@ -38,9 +54,9 @@ class FetchSettings:
 
     source: str = "local"
     local_dir: str = ""
-    ssh_target: str = "root@192.168.10.20"
+    ssh_target: str = DEFAULT_SSH_TARGET
     ssh_port: int = 22
-    remote_dir: str = "/tmp/aesa/logs"
+    remote_dir: str = DEFAULT_REMOTE_DIR
     ssh_options: str = DEFAULT_SSH_OPTIONS
 
 
@@ -101,6 +117,7 @@ def load_settings(path: Optional[Path] = None) -> MonitorSettings:
     for key, (name, kind) in FETCH_KEYS.items():
         if key in values and (values[key] != "" or name == "local_dir"):
             fetch[name] = _convert(key, values[key], kind)
+            fetch[name] = LEGACY_FETCH_VALUES.get(name, {}).get(fetch[name], fetch[name])
     fetch_settings = FetchSettings(**fetch)
     if fetch_settings.source not in SOURCES:
         raise ConfigError(f"MONITOR_LOG_SOURCE must be one of {', '.join(SOURCES)}")
