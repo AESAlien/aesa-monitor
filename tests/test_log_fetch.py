@@ -100,5 +100,16 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(loaded.fetch.local_dir, "/home/me/aesa logs")
 
 
+
+class MalformedOptionsTest(unittest.TestCase):
+    def test_unmatched_quote_is_fetch_error_before_running_scp(self):
+        settings = FetchSettings(source="ssh", ssh_options='-o "IdentityFile=C:/키 경로')
+        with tempfile.TemporaryDirectory() as target, mock.patch.object(log_fetch, "_run") as run:
+            with self.assertRaises(FetchError) as raised:
+                fetch_logs(settings, Path(target))
+        self.assertIn("ssh 옵션", str(raised.exception))
+        run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

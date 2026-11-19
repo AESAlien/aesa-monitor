@@ -87,6 +87,8 @@ class BoardDialog:
                 error = ""
             except BoardError as failure:
                 result, error = None, str(failure)
+            except Exception as failure:  # 예상하지 못한 오류도 창에 보이고 버튼을 되살린다
+                result, error = None, f"예상하지 못한 오류: {failure!r}"
             self.window.after(0, lambda: self._finish(action.label, result, error))
 
         threading.Thread(target=work, name=f"board-{name}", daemon=True).start()

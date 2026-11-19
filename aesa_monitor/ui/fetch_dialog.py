@@ -127,6 +127,10 @@ class FetchDialog:
                 message = f"파일 복사 실패: {error}"
                 self.window.after(0, lambda: self._finish(None, message))
                 return
+            except Exception as error:  # 예상하지 못한 오류도 창에 보이고 버튼을 되살린다
+                message = f"예상하지 못한 오류: {error!r}"
+                self.window.after(0, lambda: self._finish(None, message))
+                return
             self.window.after(0, lambda: self._finish(result, ""))
 
         threading.Thread(target=work, name="log-fetch", daemon=True).start()

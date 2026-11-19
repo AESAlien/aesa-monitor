@@ -9,6 +9,7 @@
 #   start [시각]    IP 설정 -> SD 원본 복사·검증 -> 백그라운드 실행 -> 포트 확인
 #                   시각("YYYY-MM-DD HH:MM:SS")을 주면 먼저 보드 시각을 맞춘다(로그 파일 이름이 이 시각을 쓴다).
 #                   PORT_WAIT_SECONDS 안에 포트가 열리지 않으면 실패(종료 코드 1). 처리부 프로세스는 남겨 둔다.
+#                   이미 실행 중이어도 포트가 열려 있는지 확인하고, 끝내 닫혀 있으면 실패다.
 #   stop            SIGTERM으로 종료 -> 로그를 SD FAT(aesa/logs)로 복사
 #                   처리부가 이미 끝나 있어도(비정상 종료) 로그는 복사한다. 복사에 실패하면 종료 코드 1.
 #   restart [시각]  stop의 로그 복사가 실패해도 다시 시작하고, 끝에 실패(종료 코드 1)로 알린다.
@@ -239,9 +240,33 @@ save_logs() {
     say "로그 $#개를 SD FAT로 복사: $SRC_DIR/logs"
 }
 
+wait_for_port() {
+    # wait_for_port PID : 처리부가 서버 포트를 열 때까지 PORT_WAIT_SECONDS 기다린다.
+    # 프로세스가 살아 있어도 포트가 끝내 닫혀 있으면(멈춤·설정 오류) 실패로 끝낸다.
+    # 성공으로 알리면 접속을 받지 못하는 처리부로 실험을 시작해 버린다.
+    i=0
+    while :; do
+        if listening; then
+            say "실행 중: PID $1, $SERVER_IP:$SERVER_PORT 대기"
+            return 0
+        fi
+        [ $i -lt $PORT_WAIT_SECONDS ] || break
+        sleep 1
+        i=$((i + 1))
+        running_pid >/dev/null || { fail "처리부가 종료되었습니다. 최근 로그:"; tail -n 15 "$WORK_DIR/logs/console.out" "$(latest_log)" >&2 2>/dev/null; exit 1; }
+    done
+    tail -n 15 "$WORK_DIR/logs/console.out" "$(latest_log)" >&2 2>/dev/null
+    die "${PORT_WAIT_SECONDS}초가 지나도 $SERVER_PORT 포트가 열리지 않았습니다. 처리부(PID $1)는 남아 있습니다. 위 로그를 확인하고 stop 후 다시 시작하세요."
+}
+
 do_start() {
     [ -n "$1" ] && set_time "$1"
-    pid=$(running_pid) && { say "이미 실행 중 (PID $pid)"; return 0; }
+    if pid=$(running_pid); then
+        # 이미 떠 있는 처리부도 포트가 열려 있어야 성공이다(이전 start가 시간 초과로 남긴 처리부일 수 있음).
+        say "이미 실행 중 (PID $pid)"
+        wait_for_port "$pid"
+        return 0
+    fi
     setup_ip
     copy_files
     cd "$WORK_DIR" || die "$WORK_DIR로 이동 실패"
@@ -249,19 +274,9 @@ do_start() {
     nohup "./$BIN" >> logs/console.out 2>&1 < /dev/null &
     pid=$!
     echo "$pid $(proc_field "$pid" 20) $(boot_id)" > "$PID_FILE"
-    i=0
-    while [ $i -lt $PORT_WAIT_SECONDS ]; do
-        sleep 1
-        pid=$(running_pid) || { fail "처리부가 바로 종료되었습니다. 최근 로그:"; tail -n 15 logs/console.out "$(latest_log)" >&2 2>/dev/null; exit 1; }
-        if listening; then
-            say "실행 중: PID $pid, $SERVER_IP:$SERVER_PORT 대기"
-            return 0
-        fi
-        i=$((i + 1))
-    done
-    # 프로세스는 살아 있지만 접속을 받지 못한다(멈춤·설정 오류). 성공으로 알리면 실험을 시작해 버리므로 실패로 끝낸다.
-    tail -n 15 logs/console.out "$(latest_log)" >&2 2>/dev/null
-    die "${PORT_WAIT_SECONDS}초가 지나도 $SERVER_PORT 포트가 열리지 않았습니다. 처리부(PID $pid)는 남아 있습니다. 위 로그를 확인하고 stop 후 다시 시작하세요."
+    sleep 1
+    running_pid >/dev/null || { fail "처리부가 바로 종료되었습니다. 최근 로그:"; tail -n 15 logs/console.out "$(latest_log)" >&2 2>/dev/null; exit 1; }
+    wait_for_port "$pid"
 }
 
 do_stop() {

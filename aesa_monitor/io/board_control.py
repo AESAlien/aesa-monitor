@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from aesa_monitor.core.settings import DEFAULT_SETTINGS_PATH, FetchSettings, load_settings
+from aesa_monitor.io.log_fetch import ssh_option_arguments
 
 AESACTL = "/usr/local/sbin/aesactl"
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -66,8 +67,12 @@ def remote_command(action: Action, now: Optional[datetime] = None) -> str:
 
 
 def ssh_command(settings: FetchSettings, action: Action, now: Optional[datetime] = None) -> List[str]:
+    """ssh 명령. ssh 옵션이 잘못되었으면 BoardError."""
     command = ["ssh", "-p", str(settings.ssh_port), "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
-    command += shlex.split(settings.ssh_options)
+    try:
+        command += ssh_option_arguments(settings.ssh_options)
+    except ValueError as error:
+        raise BoardError(f"{error}. [로그 가져오기] 창의 ssh 옵션을 고치세요.") from error
     command += [settings.ssh_target, remote_command(action, now)]
     return command
 
@@ -77,11 +82,11 @@ def run_action(settings: FetchSettings, name: str, now: Optional[datetime] = Non
     action = ACTIONS.get(name)
     if action is None:
         raise BoardError(f"알 수 없는 명령: {name}")
+    command = ssh_command(settings, action, now)
     if runner is None:
         if shutil.which("ssh") is None:
             raise BoardError("ssh 명령이 없습니다 (Windows: 선택적 기능 'OpenSSH 클라이언트', 리눅스: openssh-client)")
         runner = subprocess.run
-    command = ssh_command(settings, action, now)
     try:
         completed = runner(command, capture_output=True, text=True, timeout=action.timeout,
                            stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")

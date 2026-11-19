@@ -86,6 +86,14 @@ def _fetch_local(settings: FetchSettings, destination: Path, report: Progress) -
     return result
 
 
+def ssh_option_arguments(options: str) -> List[str]:
+    """ssh·scp 옵션 문자열을 인자로 나눈다. 따옴표 짝이 맞지 않는 등 잘못된 값이면 ValueError."""
+    try:
+        return shlex.split(options)
+    except ValueError as error:
+        raise ValueError(f"ssh 옵션을 해석할 수 없습니다 ({error}): {options}") from error
+
+
 def scp_command(settings: FetchSettings, destination: Path, legacy_protocol: bool = True) -> List[str]:
     """보드 로그를 가져오는 scp 명령. 보드 dropbear는 SFTP가 없어 -O(옛 SCP 방식)가 필요하다."""
     remote = settings.remote_dir.rstrip("/") or "/"
@@ -93,7 +101,10 @@ def scp_command(settings: FetchSettings, destination: Path, legacy_protocol: boo
     if legacy_protocol:
         command.append("-O")
     command += ["-P", str(settings.ssh_port), "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
-    command += shlex.split(settings.ssh_options)
+    try:
+        command += ssh_option_arguments(settings.ssh_options)
+    except ValueError as error:
+        raise FetchError(f"{error}. [로그 가져오기] 창의 ssh 옵션을 고치세요.") from error
     # 원격 셸이 *를 펼친다. 두 종류를 한 번에 가져온다.
     command.append(f"{settings.ssh_target}:{remote}/adp_*")
     command.append(str(destination) + "/")
@@ -101,6 +112,7 @@ def scp_command(settings: FetchSettings, destination: Path, legacy_protocol: boo
 
 
 def _fetch_ssh(settings: FetchSettings, destination: Path, report: Progress) -> FetchResult:
+    scp_command(settings, destination)  # 옵션이 잘못되었으면 scp를 찾기 전에 FetchError
     if shutil.which("scp") is None:
         raise FetchError("scp 명령이 없습니다 (openssh-client 설치 필요)")
     before = {path.name: path.stat().st_size for path in _log_files(destination)}

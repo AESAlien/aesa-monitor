@@ -44,6 +44,14 @@ class RunActionTest(unittest.TestCase):
         self.assertEqual(result.output, "[aesa] 처리부: 실행 중 (PID 12)")
         self.assertEqual(runner.call_args.kwargs["timeout"], ACTIONS["status"].timeout)
 
+    def test_malformed_ssh_options_is_board_error(self):
+        runner = mock.Mock()
+        settings = FetchSettings(source="ssh", ssh_options='-o "IdentityFile=C:/키 경로')  # 따옴표 짝이 안 맞음
+        with self.assertRaises(BoardError) as raised:
+            run_action(settings, "status", NOW, runner)
+        self.assertIn("ssh 옵션", str(raised.exception))
+        runner.assert_not_called()
+
     def test_unknown_action(self):
         with self.assertRaises(BoardError):
             run_action(SETTINGS, "rm", NOW, mock.Mock())
@@ -335,3 +343,17 @@ class RunAesaScriptTest(unittest.TestCase):
         result = self.run_script("stop")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(other.poll(), "다른 프로세스에 신호를 보냈음")
+
+    def test_second_start_fails_while_hung_processor_keeps_port_closed(self):
+        self.assertNotEqual(self.run_script("start").returncode, 0)  # 포트가 열리지 않아 실패, 처리부는 남음
+        result = self.run_script("start")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("이미 실행 중", result.stdout)
+        self.assertIn("포트가 열리지 않았습니다", result.stderr)
+
+    def test_second_start_succeeds_when_running_and_listening(self):
+        self.start()
+        result = self.run_script("start")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("이미 실행 중", result.stdout)
+        self.assertIn("실행 중: PID", result.stdout)
