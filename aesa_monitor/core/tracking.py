@@ -238,6 +238,18 @@ class TrackingHistory:
         result.reverse()
         return result
 
+    def change_mark(self, track_id: int) -> Tuple[int, int, str, int, bool]:
+        """트랙 그림이 바뀌었는지 싸게 알아보는 값: 사이클 수, 마지막 사이클 시각·결과, 마지막 트랙 시각, 살아 있는지.
+
+        추정 위치는 트랙 목록을 받을 때 정해지고 그때 마지막 트랙 시각도 바뀌므로, 이 값이 같으면 경로·기호가 같다.
+        (실시간은 사이클을 300개까지만 남겨 수가 늘지 않으므로 수만으로는 알 수 없다.)
+        """
+        cycles = self._cycles.get(track_id)
+        last = cycles[-1] if cycles else None
+        track = self.latest_tracks.get(track_id)
+        return (len(cycles) if cycles else 0, last.time_ms if last else -1, last.outcome if last else "",
+                track.timestamp_ms if track else -1, track is not None)
+
     def last_cycle(self, track_id: int) -> Optional[TrackingCycle]:
         cycles = self._cycles.get(track_id)
         return cycles[-1] if cycles else None

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import time
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -44,6 +45,15 @@ OUTCOME_COLORS = {Outcome.PENDING: UNKNOWN, Outcome.UPDATED: OK, Outcome.MISSED:
 MAP_TRAIL_CYCLES = 30         # 실시간 꼬리 사이클 수. 재생 중에는 처음부터 다 그린다
 TRAIL_DOT_SPACING_PX = 6      # 재생 경로의 갱신 점 사이 최소 간격(점이 겹쳐 뭉개지지 않게, 그리는 개수도 줄인다)
 TRAIL_LINE_STEP_PX = 1.5      # 이보다 가까운 경로 점은 선에서 건너뛴다(긴 녹화에서 그리기 비용을 줄인다)
+# 갱신 주기. 앱은 MAP_REFRESH_SECONDS마다 refresh()를 부른다(ui/app.py TAB_REFRESH_SECONDS).
+# 전시기(빔 부채꼴)는 그때마다, 판정·상태 줄·잔차·사이클 상세는 PANEL_REFRESH_SECONDS마다 그린다.
+# 탐색 빔은 10 ms마다 약 4°씩 돌므로 0.2초마다 그리면 한 장면에 약 80°씩 건너뛰어 끊겨 보였다.
+MAP_REFRESH_SECONDS = 0.05
+PANEL_REFRESH_SECONDS = 0.2
+# 전시기 층(바뀐 층만 다시 그린다. _draw_map 참고)
+MAP_TAG_BACKGROUND = "map-background"
+MAP_TAG_BEAMS = "map-beams"
+MAP_TAG_TRACKS = "map-tracks"
 TREND_CYCLES = 60            # 추이 그래프 사이클 수
 SECTOR_HALF_SPAN = 70.0      # 섹터 보기: 레이더 정면 ±70°
 SEARCH_GLOW_MS = 50          # 탐색 빔 잔상. 10 ms마다 약 4°씩 움직여 길게 두면 넓은 부채꼴이 화면을 덮는다
@@ -615,6 +625,13 @@ class TrackTab:
         self._trend_cycles: List[Tuple[float, int]] = []
         self._state: Optional[MonitorState] = None
         self._rows: List[TrackStatusRow] = []
+        self._panels_at: Optional[float] = None     # 판정·상태 줄·잔차를 마지막으로 그린 때(monotonic)
+        # 전시기 층을 다시 그릴지 가리는 값과 그때 계산한 것
+        self._trail_key: Optional[tuple] = None
+        self._trails: dict = {}
+        self._background_key: Optional[tuple] = None
+        self._track_layer_key: Optional[tuple] = None
+        self._map_geometry: Optional[tuple] = None
 
         top = tk.Frame(self.frame, background=BACKGROUND)
         top.pack(fill=tk.X)
@@ -700,6 +717,18 @@ class TrackTab:
     # 갱신
 
     def refresh(self, state: MonitorState) -> None:
+        """MAP_REFRESH_SECONDS마다 불린다. 전시기는 매번, 나머지는 PANEL_REFRESH_SECONDS마다 그린다."""
+        now = time.monotonic()
+        if (state is not self._state or self._panels_at is None
+                or now - self._panels_at >= PANEL_REFRESH_SECONDS - 0.005):
+            self._panels_at = now
+            self._update_rows(state)
+            self._draw(state)
+        elif not self._detail.is_open:
+            self._draw_map(state)  # 빔 부채꼴만 바뀐 경우가 대부분이라 바뀐 층만 다시 그린다
+
+    def _update_rows(self, state: MonitorState) -> None:
+        """판정, 상태 줄 행, 고른 트랙을 정한다."""
         self._state = state
         self._verdict.set(track_verdict(state, self._parameters))
         history = state.tracking
@@ -725,7 +754,6 @@ class TrackTab:
         if self._track_id != previous:
             # 열려 있는 사이클 상세도 새 트랙으로 옮긴다(안 하면 왼쪽은 옛 트랙, 오른쪽은 새 트랙을 보인다).
             self._detail.focus(self._track_id)
-        self._draw(state)
 
     def _draw(self, state: MonitorState) -> None:
         # 패널을 먼저 갱신해야 잔차 그래프가 패널이 보는 사이클(세로 점선)을 안다.
@@ -877,19 +905,46 @@ class TrackTab:
         섹터: 레이더 정면(yaw)을 위로 두고 yaw ±70°만 그린다(같은 크기에서 축척이 약 1.7배).
         360°: 북쪽을 위로 둔 원판.
         Tk 호 각도는 화면 동쪽 0°·반시계라 start = 90 − (방위 − 회전 + 폭/2)이다.
+
+        탐색 빔은 10 ms마다 약 4°씩 돌므로 자주(MAP_REFRESH_SECONDS) 그려야 고르게 움직인다. 그래서 세 층으로 나눠
+        바뀐 층만 다시 그린다(빔 탭과 같은 방식).
+        - 바탕(MAP_TAG_BACKGROUND): 범례, 바탕 원판·부채꼴, 추적 영역, 거리 고리, 방위 눈금. 창 크기·보기·자세·축척이
+          바뀔 때만.
+        - 트랙(MAP_TAG_TRACKS): 경로, 속도 벡터, 기호, 이름표, 레이더 점. 트랙 데이터나 고른 트랙이 바뀔 때만.
+        - 빔(MAP_TAG_BEAMS): 탐색·확인·추적 빔 부채꼴. 갱신마다. 트랙 층 아래에 둔다.
         """
         canvas = self._map
-        canvas.delete("all")
         width, height = canvas_size(canvas, 200, 160)
         history = state.tracking
         attitude = state.attitude
         yaw = attitude.yaw_deg if attitude is not None else 0.0
         sector = self._map_mode.get() == "sector"
         rotation = yaw if sector else 0.0
-        line = text_height()
+        full = state.full_tracking_history
+
+        # 그릴 트랙 경로(km). 실시간: 상태 줄과 같은 트랙(살아 있는 트랙 + 최근 종료)의 최근 사이클만(오래 켜 두면
+        # 지도를 어지럽힌다). 재생: 재생 위치까지 나온 모든 트랙의 처음부터 지금까지(사후 분석).
+        # 트랙 데이터가 그대로면 다시 모으지 않는다.
+        track_ids = history.track_ids() if full else [row.track_id for row in self._rows]
+        trail_key = (id(history), full, tuple((track_id, history.change_mark(track_id)) for track_id in track_ids))
+        if trail_key != self._trail_key:
+            trails = {}
+            for track_id in track_ids:
+                cycles = history.cycles(track_id) if full else history.recent_cycles(track_id, MAP_TRAIL_CYCLES)
+                points = [cycle.estimate_position for cycle in cycles if cycle.estimate_position is not None]
+                if track_id in history.latest_tracks:
+                    points.append(track_position(history.latest_tracks[track_id]))
+                if points:
+                    trails[track_id] = [(point[0] / 1000, point[1] / 1000) for point in points]
+            self._trails = trails
+            self._trail_key = trail_key
+        trails = self._trails
+        farthest = max([max(math.hypot(*point) for point in points) for points in trails.values()] + [20.0])
+        ticks = nice_ticks(0, farthest * 1.1, 4)
+        step_km = ticks[1] - ticks[0] if len(ticks) > 1 else farthest
+        extent = ticks[-1] if ticks[-1] >= farthest * 1.05 else ticks[-1] + step_km
 
         # 위쪽 범례 줄(넘치면 다음 줄로).
-        full = state.full_tracking_history
         if attitude is None:
             info = "레이더 자세 없음 · 정면 0°로 가정" if sector else "북쪽 위 · 레이더 자세 없음"
         else:
@@ -901,12 +956,71 @@ class TrackTab:
                   ("┅ 추적 영역 ±60°", MUTED), (f"■ 트랙 ─ {VECTOR_SECONDS}초 속도 벡터", TEXT)]
         if full:
             legend.append(("●─ 지나온 경로(처음부터)", TEXT))
+        line = text_height()
+        background_key = (width, height, sector, round(yaw, 3), attitude is None, tuple(legend), extent,
+                          tuple(ticks), line)
+        if background_key != self._background_key:
+            canvas.delete("all")
+            self._background_key = background_key
+            self._track_layer_key = None
+            self._map_geometry = self._draw_map_background(
+                canvas, width, height, legend, line, sector, yaw, rotation, attitude is not None, ticks, extent)
+        center_x, center_y, radius_px, scale, area_top, reserved = self._map_geometry
+
+        def arc(azimuth: float, width_deg: float, r_px: float, **options) -> None:
+            canvas.create_arc(center_x - r_px, center_y - r_px, center_x + r_px, center_y + r_px,
+                              start=90 - (azimuth - rotation + width_deg / 2), extent=width_deg, style=tk.PIESLICE,
+                              **options)
+
+        def visible(azimuth: float) -> bool:
+            return not sector or abs(wrap_degrees(azimuth - yaw)) <= SECTOR_HALF_SPAN
+
+        # 빔 부채꼴: 갱신마다 다시 그린다. 오래된 것부터 그려 최근 빔이 위에 오게 한다.
+        canvas.delete(MAP_TAG_BEAMS)
+        now = state.now_ms()
+        if now is not None:
+            search_color = BEAM_COLORS[BeamType.SEARCH]
+            recent = state.recent_beams(SEARCH_GLOW_MS)
+            for beam in recent:
+                if beam.beam_type != BeamType.SEARCH or not visible(beam.azimuth_deg):
+                    continue
+                ratio = max(0.0, 1.0 - (now - beam.timestamp_ms) / SEARCH_GLOW_MS)
+                arc(beam.azimuth_deg, max(beam.azimuth_width_deg, 1.0), radius_px,
+                    fill=blend(search_color, 0.08 + ratio * 0.25, PANEL), outline="", tags=MAP_TAG_BEAMS)
+            latest = next((beam for beam in reversed(recent) if beam.beam_type == BeamType.SEARCH), None)
+            if latest is not None and visible(latest.azimuth_deg):
+                arc(latest.azimuth_deg, max(latest.azimuth_width_deg, 1.0), radius_px, fill="",
+                    outline=search_color, width=2, tags=MAP_TAG_BEAMS)
+            for beam in state.recent_beams(REQUEST_GLOW_MS):
+                if beam.beam_type == BeamType.SEARCH or not visible(beam.azimuth_deg):
+                    continue
+                ratio = max(0.0, 1.0 - (now - beam.timestamp_ms) / REQUEST_GLOW_MS)
+                color = BEAM_COLORS.get(beam.beam_type, MUTED)
+                arc(beam.azimuth_deg, max(beam.azimuth_width_deg, 1.0), radius_px,
+                    fill=blend(color, 0.10 + ratio * 0.45, PANEL), outline=blend(color, 0.3 + ratio * 0.7, PANEL),
+                    tags=MAP_TAG_BEAMS)
+
+        # 트랙 층: 트랙 데이터·고른 트랙·바탕이 그대로면 그대로 둔다(빔 위로만 올린다).
+        track_layer_key = (background_key, trail_key, self._track_id)
+        if track_layer_key != self._track_layer_key:
+            canvas.delete(MAP_TAG_TRACKS)
+            self._track_layer_key = track_layer_key
+            self._draw_map_tracks(canvas, state, trails, full, sector, yaw, rotation, width, height,
+                                  center_x, center_y, radius_px, scale, area_top, reserved)
+        canvas.tag_raise(MAP_TAG_TRACKS)
+
+    def _draw_map_background(self, canvas: tk.Canvas, width: int, height: int,
+                             legend: Sequence[Tuple[str, str]], line: int, sector: bool, yaw: float, rotation: float,
+                             has_attitude: bool, ticks: Sequence[float], extent: float
+                             ) -> Tuple[float, float, float, float, float, List[Tuple[float, float, float, float]]]:
+        """바탕 층을 그리고 (가운데 x, y, 반지름 px, 축척 px/km, 지도 위쪽 y, 이름표가 피할 상자들)을 돌려준다."""
+        tag = MAP_TAG_BACKGROUND
         x, y = 4.0, 2.0
         for text, color in legend:
             text_w = text_width(text)
             if x > 4 and x + text_w > width - 4:
                 x, y = 4.0, y + line
-            canvas.create_text(x, y, text=text, anchor="nw", fill=color, font=FONT_SMALL)
+            canvas.create_text(x, y, text=text, anchor="nw", fill=color, font=FONT_SMALL, tags=tag)
             x += text_w + 14
         area_top = y + line + 4
 
@@ -925,66 +1039,36 @@ class TrackTab:
             center_x, center_y = width / 2, (area_top + height) / 2
             radius_px = min(width / 2 - pad_x, (height - area_top) / 2 - pad_y)
         radius_px = max(radius_px, 40.0)
-
-        # 실시간: 상태 줄과 같은 트랙(살아 있는 트랙 + 최근 종료)의 최근 사이클만 그린다(오래 켜 두면 지도를 어지럽힌다).
-        # 재생: 재생 위치까지 나온 모든 트랙의 처음부터 지금까지 경로를 그린다(사후 분석).
-        trails = {}
-        for track_id in (history.track_ids() if full else [row.track_id for row in self._rows]):
-            cycles = history.cycles(track_id)
-            if not full:
-                cycles = cycles[-MAP_TRAIL_CYCLES:]
-            points = [cycle.estimate_position for cycle in cycles if cycle.estimate_position is not None]
-            if track_id in history.latest_tracks:
-                points.append(track_position(history.latest_tracks[track_id]))
-            if points:
-                trails[track_id] = [(point[0] / 1000, point[1] / 1000) for point in points]
-        farthest = max([max(math.hypot(*point) for point in points) for points in trails.values()] + [20.0])
-        ticks = nice_ticks(0, farthest * 1.1, 4)
-        step_km = ticks[1] - ticks[0] if len(ticks) > 1 else farthest
-        extent = ticks[-1] if ticks[-1] >= farthest * 1.05 else ticks[-1] + step_km
         scale = radius_px / extent
+        reserved: List[Tuple[float, float, float, float]] = []
 
         def polar(azimuth: float, r_px: float) -> Tuple[float, float]:
             angle = math.radians(azimuth - rotation)
             return center_x + r_px * math.sin(angle), center_y - r_px * math.cos(angle)
 
-        def to_xy(east: float, north: float) -> Tuple[float, float]:
-            return polar(math.degrees(math.atan2(east, north)), math.hypot(east, north) * scale)
-
         def arc(azimuth: float, width_deg: float, r_px: float, style: str = tk.PIESLICE, **options) -> None:
             canvas.create_arc(center_x - r_px, center_y - r_px, center_x + r_px, center_y + r_px,
                               start=90 - (azimuth - rotation + width_deg / 2), extent=width_deg, style=style,
-                              **options)
+                              tags=tag, **options)
 
-        def visible(azimuth: float) -> bool:
-            return not sector or abs(wrap_degrees(azimuth - yaw)) <= SECTOR_HALF_SPAN
-
-        # 경로 점은 많으므로(재생은 처음부터) 삼각함수 없이 회전만으로 화면 좌표를 낸다. to_xy·visible과 같은 결과다.
-        cos_r, sin_r = math.cos(math.radians(rotation)), math.sin(math.radians(rotation))
-        tan_half = math.tan(math.radians(SECTOR_HALF_SPAN))
-
-        def project(east: float, north: float) -> Optional[Tuple[float, float]]:
-            """km 좌표의 화면 위치. 섹터 보기에서 섹터 밖이면 None."""
-            right = east * cos_r - north * sin_r      # 화면 오른쪽(회전한 동쪽)
-            ahead = north * cos_r + east * sin_r      # 화면 위쪽(회전한 북쪽 = 섹터 가운데)
-            if sector and (ahead <= 0 or abs(right) > ahead * tan_half):
-                return None
-            return center_x + right * scale, center_y - ahead * scale
-
-        placer = LabelPlacer(canvas, (0, area_top, width, height))
+        def keep_box(item: int) -> None:
+            box = canvas.bbox(item)
+            if box:
+                reserved.append(box)
 
         # 바탕, 추적 영역
         if sector:
             arc(yaw, 2 * SECTOR_HALF_SPAN, radius_px, fill=PANEL, outline=BORDER)
         else:
             canvas.create_oval(center_x - radius_px, center_y - radius_px, center_x + radius_px,
-                               center_y + radius_px, fill=PANEL, outline=BORDER)
-        if attitude is not None:
+                               center_y + radius_px, fill=PANEL, outline=BORDER, tags=tag)
+        if has_attitude:
             low, high = COVERAGE_AZIMUTH
             if not sector:
                 arc(yaw + (low + high) / 2, high - low, radius_px, fill=COVERAGE_FILL, outline="")
             for edge in (yaw + low, yaw + high):
-                canvas.create_line(center_x, center_y, *polar(edge, radius_px), fill=MUTED, dash=(5, 4), width=2)
+                canvas.create_line(center_x, center_y, *polar(edge, radius_px), fill=MUTED, dash=(5, 4), width=2,
+                                   tags=tag)
 
         # 거리 고리
         for ring in ticks[1:]:
@@ -996,13 +1080,11 @@ class TrackTab:
                 position = polar(yaw - SECTOR_HALF_SPAN + 5, r - 2)
                 anchor = "n"
             else:
-                canvas.create_oval(center_x - r, center_y - r, center_x + r, center_y + r, outline=GRID_LINE)
+                canvas.create_oval(center_x - r, center_y - r, center_x + r, center_y + r, outline=GRID_LINE, tags=tag)
                 position = polar(rotation + 135, r)
                 anchor = "nw"
-            item = canvas.create_text(*position, text=f"{ring:g} km", fill=MUTED, font=FONT_SMALL, anchor=anchor)
-            box = canvas.bbox(item)
-            if box:
-                placer.reserve(box)
+            keep_box(canvas.create_text(*position, text=f"{ring:g} km", fill=MUTED, font=FONT_SMALL, anchor=anchor,
+                                        tags=tag))
 
         # 방위 눈금: 섹터는 10°마다 선, 20°마다 글자. 360°는 30°마다.
         step = 10 if sector else 30
@@ -1012,43 +1094,43 @@ class TrackTab:
         else:
             azimuth, last = 0, 359
         while azimuth <= last + 1e-9:
-            canvas.create_line(*polar(azimuth, radius_px * 0.04), *polar(azimuth, radius_px), fill=GRID_LINE)
+            canvas.create_line(*polar(azimuth, radius_px * 0.04), *polar(azimuth, radius_px), fill=GRID_LINE,
+                               tags=tag)
             if not sector or round(azimuth) % 20 == 0:
                 value = round(azimuth) % 360
                 text = {0: "N", 90: "E", 180: "S", 270: "W"}.get(value, f"{value}°")
-                item = canvas.create_text(*polar(azimuth, radius_px + label_gap), text=text, fill=MUTED,
-                                          font=FONT_SMALL)
-                box = canvas.bbox(item)
-                if box:
-                    placer.reserve(box)
+                keep_box(canvas.create_text(*polar(azimuth, radius_px + label_gap), text=text, fill=MUTED,
+                                            font=FONT_SMALL, tags=tag))
             azimuth += step
+        return center_x, center_y, radius_px, scale, area_top, reserved
 
-        # 빔 부채꼴: 오래된 것부터 그려 최근 빔이 위에 오게 한다.
-        now = state.now_ms()
-        if now is not None:
-            search_color = BEAM_COLORS[BeamType.SEARCH]
-            recent = state.recent_beams(SEARCH_GLOW_MS)
-            for beam in recent:
-                if beam.beam_type != BeamType.SEARCH or not visible(beam.azimuth_deg):
-                    continue
-                ratio = max(0.0, 1.0 - (now - beam.timestamp_ms) / SEARCH_GLOW_MS)
-                arc(beam.azimuth_deg, max(beam.azimuth_width_deg, 1.0), radius_px,
-                    fill=blend(search_color, 0.08 + ratio * 0.25, PANEL), outline="")
-            latest = next((beam for beam in reversed(recent) if beam.beam_type == BeamType.SEARCH), None)
-            if latest is not None and visible(latest.azimuth_deg):
-                arc(latest.azimuth_deg, max(latest.azimuth_width_deg, 1.0), radius_px, fill="",
-                    outline=search_color, width=2)
-            for beam in state.recent_beams(REQUEST_GLOW_MS):
-                if beam.beam_type == BeamType.SEARCH or not visible(beam.azimuth_deg):
-                    continue
-                ratio = max(0.0, 1.0 - (now - beam.timestamp_ms) / REQUEST_GLOW_MS)
-                color = BEAM_COLORS.get(beam.beam_type, MUTED)
-                arc(beam.azimuth_deg, max(beam.azimuth_width_deg, 1.0), radius_px,
-                    fill=blend(color, 0.10 + ratio * 0.45, PANEL), outline=blend(color, 0.3 + ratio * 0.7, PANEL))
+    def _draw_map_tracks(self, canvas: tk.Canvas, state: MonitorState, trails, full: bool, sector: bool,
+                         yaw: float, rotation: float, width: int, height: int, center_x: float, center_y: float,
+                         radius_px: float, scale: float, area_top: float,
+                         reserved: Sequence[Tuple[float, float, float, float]]) -> None:
+        """트랙 층: 경로(재생은 갱신 점 포함), 속도 벡터, 기호, 이름표. 고른 트랙을 마지막에 그려 위에 오게 한다."""
+        tag = MAP_TAG_TRACKS
+        history = state.tracking
+        placer = LabelPlacer(canvas, (0, area_top, width, height))
+        for box in reserved:
+            placer.reserve(box)
+        canvas.create_oval(center_x - 4, center_y - 4, center_x + 4, center_y + 4, fill=TEXT, outline="", tags=tag)
 
-        canvas.create_oval(center_x - 4, center_y - 4, center_x + 4, center_y + 4, fill=TEXT, outline="")
+        # 경로 점은 많으므로(재생은 처음부터) 삼각함수 없이 회전만으로 화면 좌표를 낸다.
+        cos_r, sin_r = math.cos(math.radians(rotation)), math.sin(math.radians(rotation))
+        tan_half = math.tan(math.radians(SECTOR_HALF_SPAN))
 
-        # 트랙: 꼬리, 속도 벡터, 기호, 이름표. 고른 트랙을 마지막에 그려 위에 오게 한다.
+        def project(east: float, north: float) -> Optional[Tuple[float, float]]:
+            """km 좌표의 화면 위치. 섹터 보기에서 섹터 밖이면 None."""
+            right = east * cos_r - north * sin_r      # 화면 오른쪽(회전한 동쪽)
+            ahead = north * cos_r + east * sin_r      # 화면 위쪽(회전한 북쪽 = 섹터 가운데)
+            if sector and (ahead <= 0 or abs(right) > ahead * tan_half):
+                return None
+            return center_x + right * scale, center_y - ahead * scale
+
+        def visible(azimuth: float) -> bool:
+            return not sector or abs(wrap_degrees(azimuth - yaw)) <= SECTOR_HALF_SPAN
+
         self._map_points = []
         outside = 0
         order = sorted(trails, key=lambda track_id: track_id == self._track_id)
@@ -1067,7 +1149,7 @@ class TrackTab:
                 if point is None:
                     if len(segment) >= 4:
                         canvas.create_line(*segment, fill=color, width=2 if chosen else 1,
-                                           dash=() if alive else (3, 3))
+                                           dash=() if alive else (3, 3), tags=tag)
                     segment = []
                 elif (segment and index < len(coordinates) - 1 and abs(point[0] - segment[-2]) < TRAIL_LINE_STEP_PX
                       and abs(point[1] - segment[-1]) < TRAIL_LINE_STEP_PX):
@@ -1083,7 +1165,7 @@ class TrackTab:
                                          < TRAIL_DOT_SPACING_PX):
                         continue
                     canvas.create_oval(point[0] - dot, point[1] - dot, point[0] + dot, point[1] + dot,
-                                       fill=color, outline="")
+                                       fill=color, outline="", tags=tag)
                     last = point
             x, y = coordinates[-1]
             track = history.latest_tracks.get(track_id)
@@ -1091,15 +1173,16 @@ class TrackTab:
                 heading = math.radians(track.heading_deg - rotation)
                 length = track.speed_mps * VECTOR_SECONDS / 1000 * scale
                 canvas.create_line(x, y, x + length * math.sin(heading), y - length * math.cos(heading),
-                                   fill=color, width=2)
+                                   fill=color, width=2, tags=tag)
             size = 7 if chosen else 5
             if alive:
-                canvas.create_rectangle(x - size, y - size, x + size, y + size, fill=color, outline=BACKGROUND)
+                canvas.create_rectangle(x - size, y - size, x + size, y + size, fill=color, outline=BACKGROUND,
+                                        tags=tag)
             else:
-                canvas.create_line(x - size, y - size, x + size, y + size, fill=color, width=2)
-                canvas.create_line(x - size, y + size, x + size, y - size, fill=color, width=2)
+                canvas.create_line(x - size, y - size, x + size, y + size, fill=color, width=2, tags=tag)
+                canvas.create_line(x - size, y + size, x + size, y - size, fill=color, width=2, tags=tag)
             if chosen:
-                canvas.create_oval(x - 12, y - 12, x + 12, y + 12, outline=TEXT, width=2)
+                canvas.create_oval(x - 12, y - 12, x + 12, y + 12, outline=TEXT, width=2, tags=tag)
             placer.reserve((x - size, y - size, x + size, y + size))
             self._map_points.append((x, y, track_id))
         # 이름표는 기호를 다 그린 뒤에 놓아야 다른 기호와 겹치지 않는다. 고른 트랙부터 자리를 잡는다.
@@ -1109,10 +1192,12 @@ class TrackTab:
             if track is not None:
                 label += f" {track.slant_range_km:.1f} km · {track.speed_mps:.0f} m/s"
             gap = (12 if track_id == self._track_id else 5) + 4
-            if placer.place(x, y, label, gap=gap, color=TEXT if track is not None else MUTED) is None:
-                placer.place(x, y, f"#{track_id}", gap=gap, color=TEXT if track is not None else MUTED)
+            color = TEXT if track is not None else MUTED
+            if placer.place(x, y, label, gap=gap, color=color, tags=tag) is None:
+                placer.place(x, y, f"#{track_id}", gap=gap, color=color, tags=tag)
         if not trails:
-            canvas.create_text(center_x, center_y - radius_px / 2, text="트랙 없음", fill=MUTED, font=FONT_BODY)
+            canvas.create_text(center_x, center_y - radius_px / 2, text="트랙 없음", fill=MUTED, font=FONT_BODY,
+                               tags=tag)
         if outside:
             canvas.create_text(4, height - 4, text=f"섹터 밖 트랙 {outside}개 → 360°에서 보기", fill=WARN,
-                               anchor="sw", font=FONT_SMALL)
+                               anchor="sw", font=FONT_SMALL, tags=tag)
