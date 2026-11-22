@@ -35,7 +35,7 @@ from aesa_monitor.ui.style import (
     ACCENT, ACCENT_SOFT, BACKGROUND, BAD, BORDER, DEFAULT_FONT_SIZE, FONT_BODY, FONT_TITLE, Fonts, MUTED, OK, PANEL, TEXT,
     UNKNOWN, WARN, apply_theme, format_bytes, format_duration, format_scale, format_time,
 )
-from aesa_monitor.ui.track_tab import TrackTab
+from aesa_monitor.ui.track_tab import MAP_REFRESH_SECONDS, TrackTab
 from aesa_monitor.ui.widgets import Tooltip
 from aesa_monitor.ui.window import initial_window_size
 
@@ -43,7 +43,8 @@ REFRESH_MS = 50
 # 실시간 문제 감지 간격(초). 녹화를 다시 계산할 때(core/problems.SCAN_STEP_S)와 같다.
 PROBLEM_UPDATE_SECONDS = 0.25
 MAX_EVENTS_PER_REFRESH = 20000
-TAB_REFRESH_SECONDS = {"beam": 0.05, "track": 0.2, "comm": 0.25, "analysis": 0.25}
+# 추적 탭은 전시기(탐색 빔)를 0.05 s마다, 상태 줄·잔차는 0.2 s마다 그린다(track_tab.MAP_REFRESH_SECONDS).
+TAB_REFRESH_SECONDS = {"beam": 0.05, "track": MAP_REFRESH_SECONDS, "comm": 0.25, "analysis": 0.25}
 TAB_TITLES = {"beam": " 빔 ", "track": " 추적 ", "comm": " 통신 ", "analysis": " 분석 "}
 # 상단 바 연결 상태: 키 -> (툴팁에 쓰는 이름, 바에 쓰는 짧은 이름)
 CONNECTION_NAMES = {"processor": ("처리부", "처리부"), "console": ("운용통제기", "통제"),
