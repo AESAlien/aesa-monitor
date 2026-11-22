@@ -10,6 +10,7 @@ from aesa_monitor.core.protocol import Message
 # 데이터 출처
 SOURCE_COPY = "copy"        # 처리부가 모니터에 보내는 복사본(0xAD01 포함)을 받는다
 SOURCE_CAPTURE = "capture"  # 처리부·모의기·운용통제기 사이 패킷을 캡처한다
+SOURCE_LOG = "log"          # 녹화 없이 처리부 로그(탐지 CSV·메시지 로그)로 만든 재생(io/log_replay.py)
 
 # 처리부와 통신하는 상대
 PEER_CONSOLE = "console"

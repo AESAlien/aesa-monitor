@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -81,6 +82,8 @@ class TrackingCycle:
     outcome: str = Outcome.PENDING
     estimate: Optional[Track] = None
     next_beam: Optional[Beam] = None
+    # estimate의 ENU 위치(m). 지도에서 경로를 그릴 때마다 다시 계산하지 않게 갱신할 때 한 번 계산한다.
+    estimate_position: Optional[Vector] = None
 
     @property
     def selected(self) -> Optional[PlotView]:
@@ -194,6 +197,7 @@ class TrackingHistory:
             elif track.timestamp_ms == cycle.time_ms:
                 cycle.outcome = Outcome.UPDATED
                 cycle.estimate = track
+                cycle.estimate_position = track_position(track)
             else:
                 cycle.outcome = Outcome.MISSED
         self.latest_tracks = latest
@@ -226,6 +230,32 @@ class TrackingHistory:
 
     def cycles(self, track_id: int) -> List[TrackingCycle]:
         return list(self._cycles.get(track_id, ()))
+
+    def recent_cycles(self, track_id: int, count: int) -> List[TrackingCycle]:
+        """최근 count개 사이클(오래된 것 → 최신). 재생은 사이클을 모두 남기므로 전체를 복사하지 않고 뒤에서 센다."""
+        cycles = self._cycles.get(track_id, ())
+        result = list(itertools.islice(reversed(cycles), count))
+        result.reverse()
+        return result
+
+    def last_cycle(self, track_id: int) -> Optional[TrackingCycle]:
+        cycles = self._cycles.get(track_id)
+        return cycles[-1] if cycles else None
+
+    def consecutive_misses(self, track_id: int) -> int:
+        """지금까지 이어진 미탐 수(마지막 사이클부터 센다)."""
+        count = 0
+        for cycle in reversed(self._cycles.get(track_id, ())):
+            if cycle.outcome != Outcome.MISSED:
+                break
+            count += 1
+        return count
+
+    def last_updated_ms(self, track_id: int) -> Optional[int]:
+        for cycle in reversed(self._cycles.get(track_id, ())):
+            if cycle.outcome == Outcome.UPDATED:
+                return cycle.time_ms
+        return None
 
     def all_cycles(self) -> List[TrackingCycle]:
         result = [cycle for cycles in self._cycles.values() for cycle in cycles]
@@ -301,16 +331,12 @@ def beam_offset_level(offset: Optional[float], warn: Optional[float] = None) -> 
 
 def track_status_row(history: TrackingHistory, track_id: int, now_ms: Optional[int],
                      result_count: int = STATUS_RESULT_CYCLES) -> Optional[TrackStatusRow]:
-    cycles = history.cycles(track_id)
+    cycles = history.recent_cycles(track_id, result_count)
     if not cycles:
         return None
     last = cycles[-1]
     alive = track_id in history.latest_tracks
-    misses = 0
-    for cycle in reversed(cycles):
-        if cycle.outcome != Outcome.MISSED:
-            break
-        misses += 1
+    misses = history.consecutive_misses(track_id)
     offset: Optional[float] = None
     note = ""
     if last.predicted is None:
@@ -323,9 +349,9 @@ def track_status_row(history: TrackingHistory, track_id: int, now_ms: Optional[i
         offset = last.selected.beam_offset
     since: Optional[int] = None
     if alive and now_ms is not None:
-        updated = [cycle.time_ms for cycle in cycles if cycle.outcome == Outcome.UPDATED]
-        if updated:
-            since = max(now_ms - updated[-1], 0)
+        updated_ms = history.last_updated_ms(track_id)
+        if updated_ms is not None:
+            since = max(now_ms - updated_ms, 0)
     return TrackStatusRow(
         track_id=track_id,
         alive=alive,

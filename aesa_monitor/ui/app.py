@@ -536,12 +536,19 @@ class MonitorApp:
         self._root.configure(cursor="watch")
         self._root.update_idletasks()
         try:
-            session = load_session(path, self._config.tracking if self._config else TrackingParameters())
+            session = load_session(path, self._config.tracking if self._config else TrackingParameters(),
+                                   self._config.beam if self._config else None)
         finally:
             self._root.configure(cursor="")
         self._session = session
         self._tabs["analysis"].set_session(session)
-        if session.player is not None:
+        self._attach_player()
+        self.select_tab("analysis")
+
+    def _attach_player(self) -> None:
+        """세션의 재생기(녹화, 없으면 처리부 로그로 만든 재생)를 재생 바에 붙인다. 없으면 실시간으로 돌아간다."""
+        session = self._session
+        if session is not None and session.player is not None:
             self._slider.configure(to=max(session.player.duration_s, 0.001))
             # 녹화 첫 빔까지 넣어 둬야 처리부 시각과 연결 상태가 바로 보인다.
             session.player.seek(session.player.first_beam_s())
@@ -549,13 +556,16 @@ class MonitorApp:
             self._show_replay_bar()
         else:
             self.show_live()
-        self.select_tab("analysis")
 
     def select_run(self, index: int) -> None:
         if self._session is None or index < 0:
             return
+        log_replay = self._session.is_log_replay
         self._session.select_run(index)
         self._tabs["analysis"].set_session(self._session)
+        if log_replay or self._session.is_log_replay:
+            # 로그 재생은 실행마다 재생기를 새로 만든다.
+            self._attach_player()
 
     def show_live(self) -> None:
         if self._session is not None and self._session.player is not None:
@@ -684,7 +694,8 @@ class MonitorApp:
 
     def _draw_top_bar(self, state: MonitorState) -> None:
         if self._replaying:
-            self._mode_label.configure(text="재생", background=WARN)
+            log_replay = self._session is not None and self._session.is_log_replay
+            self._mode_label.configure(text="로그 재생" if log_replay else "재생", background=WARN)
         else:
             live_text = "캡처" if state.source == SOURCE_CAPTURE else "실시간"
             self._mode_label.configure(text=live_text if self._connection else "오프라인",

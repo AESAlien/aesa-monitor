@@ -14,7 +14,7 @@ from __future__ import annotations
 import tkinter as tk
 from typing import Optional, Sequence
 
-from aesa_monitor.core.events import PEER_CONSOLE, PEER_SIMULATOR, SOURCE_CAPTURE
+from aesa_monitor.core.events import PEER_CONSOLE, PEER_SIMULATOR, SOURCE_CAPTURE, SOURCE_LOG
 from aesa_monitor.core.protocol import MessageId
 from aesa_monitor.core.state import MonitorState
 from aesa_monitor.core.traffic import CAPTURE_ONLY_MESSAGES, MESSAGE_NAMES, MESSAGE_ROUTES
@@ -130,7 +130,14 @@ class CommTab:
             lines.append(f"사유: {state.connection_detail or '-'}")
         if status_age is not None:
             lines.append(f"상태 메시지 {status_age * 1000:.0f} ms 전" + ("  (처리부 정지)" if status and status.paused else ""))
-        self._processor.set(state.connected, lines)
+        if state.source == SOURCE_LOG:
+            # 처리부 로그 재생: 연결·통신 기록이 없다. 아래 메시지 수는 탐지 CSV로 만든 값이다.
+            self._processor.title.configure(text="처리부 로그 재생")
+            lines = ["통신 기록 없음 (녹화가 없어 처리부 로그로 재생)",
+                     "메시지 수: 탐지 CSV로 만든 빔·탐지·트랙 목록"]
+            self._processor.set(None, lines, "기록 없음")
+        else:
+            self._processor.set(state.connected, lines)
 
         unknown_text = "알 수 없음"
         if capture and not traffic.counts[MessageId.MONITOR_STATUS]:

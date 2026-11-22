@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from aesa_monitor.core.config import TrackingParameters
-from aesa_monitor.core.events import PEER_CONSOLE, PEER_NAMES, PEER_SIMULATOR, SOURCE_CAPTURE
+from aesa_monitor.core.events import PEER_CONSOLE, PEER_NAMES, PEER_SIMULATOR, SOURCE_CAPTURE, SOURCE_LOG
 from aesa_monitor.core.protocol import BeamType, MessageId
 from aesa_monitor.core.state import BEAM_SLOT_MS, MonitorState
 from aesa_monitor.core.tracking import Outcome
@@ -145,18 +145,19 @@ def track_verdict(state: MonitorState, parameters: TrackingParameters) -> Verdic
     problems = []
     level = OK
     for track_id in active:
-        summary = history.summary(track_id)
-        if summary.consecutive_misses >= max(limit - 1, 1):
-            problems.append(f"#{track_id} 연속 미탐 {summary.consecutive_misses}/{limit}")
+        # 재생은 사이클을 모두 남기므로 전체 요약(summary) 대신 뒤에서 센 연속 미탐만 쓴다.
+        misses = history.consecutive_misses(track_id)
+        if misses >= max(limit - 1, 1):
+            problems.append(f"#{track_id} 연속 미탐 {misses}/{limit}")
             level = worst([level, BAD])
-        elif summary.consecutive_misses > 0:
-            problems.append(f"#{track_id} 미탐 {summary.consecutive_misses}회")
+        elif misses > 0:
+            problems.append(f"#{track_id} 미탐 {misses}회")
             level = worst([level, WARN])
     ended = []
     for track_id in track_ids:
-        cycles = history.cycles(track_id)
-        if (cycles and cycles[-1].outcome == Outcome.ENDED and now is not None and
-                now - cycles[-1].time_ms <= RECENT_END_MS):
+        last = history.last_cycle(track_id)
+        if (last is not None and last.outcome == Outcome.ENDED and now is not None and
+                now - last.time_ms <= RECENT_END_MS):
             ended.append(f"#{track_id}")
     if ended:
         problems.append(f"최근 종료 {', '.join(ended)}")
@@ -180,6 +181,9 @@ def expected_beam_rate(state: MonitorState) -> float:
 
 
 def comm_verdict(state: MonitorState) -> Verdict:
+    if state.source == SOURCE_LOG:
+        return Verdict(IDLE, "처리부 로그 재생 — 통신 기록이 없어 통신 상태를 판정하지 않습니다 "
+                             "(메시지 수는 탐지 CSV로 만든 빔·탐지·트랙 목록)")
     capture = state.source == SOURCE_CAPTURE
     if not state.connected:
         detail = f" ({state.connection_detail})" if state.connection_detail else ""

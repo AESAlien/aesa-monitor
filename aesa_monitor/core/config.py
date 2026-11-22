@@ -45,12 +45,58 @@ TRACKING_KEYS = {
 
 
 @dataclass(frozen=True)
+class BeamGeometry:
+    """처리부 탐색 격자와 빔 폭(.env의 BEAM_* 값). 기본값은 처리부 .env.example과 같다.
+
+    녹화 없이 처리부 로그만으로 재생할 때(io/log_replay.py) 탐색 빔 번호를 격자 방향으로 바꾸는 데 쓴다.
+    격자 번호는 처리부 SearchGrid와 같이 고각 행마다 방위를 처음부터 끝까지 도는 순서다(번호 = 행 × 방위 수 + 열).
+    """
+
+    search_azimuth_count: int = 21
+    search_elevation_count: int = 9
+    search_azimuth_start_deg: float = -42.0
+    search_azimuth_step_deg: float = 4.2
+    search_elevation_start_deg: float = 3.0
+    search_elevation_step_deg: float = 4.4
+    search_width_deg: float = 6.0
+    confirmation_width_deg: float = 3.0
+    tracking_width_deg: float = 3.0
+
+    @property
+    def search_cell_count(self) -> int:
+        return self.search_azimuth_count * self.search_elevation_count
+
+    def search_cell(self, beam_id: int) -> Optional[Tuple[float, float]]:
+        """탐색 빔 번호의 안테나 기준 (방위, 고각). 격자 밖 번호면 None이다."""
+        if not 0 <= beam_id < self.search_cell_count:
+            return None
+        row, column = divmod(beam_id, self.search_azimuth_count)
+        return (self.search_azimuth_start_deg + column * self.search_azimuth_step_deg,
+                self.search_elevation_start_deg + row * self.search_elevation_step_deg)
+
+
+# BeamGeometry 필드와 .env 키의 대응
+BEAM_KEYS = {
+    "search_azimuth_count": "BEAM_SEARCH_AZIMUTH_COUNT",
+    "search_elevation_count": "BEAM_SEARCH_ELEVATION_COUNT",
+    "search_azimuth_start_deg": "BEAM_SEARCH_AZIMUTH_START_DEG",
+    "search_azimuth_step_deg": "BEAM_SEARCH_AZIMUTH_STEP_DEG",
+    "search_elevation_start_deg": "BEAM_SEARCH_ELEVATION_START_DEG",
+    "search_elevation_step_deg": "BEAM_SEARCH_ELEVATION_STEP_DEG",
+    "search_width_deg": "BEAM_SEARCH_WIDTH_DEG",
+    "confirmation_width_deg": "BEAM_CONFIRMATION_WIDTH_DEG",
+    "tracking_width_deg": "BEAM_TRACKING_WIDTH_DEG",
+}
+
+
+@dataclass(frozen=True)
 class MonitorConfig:
     server: Endpoint
     local: Optional[Endpoint]   # COMM_MONITOR_*. 복사본 수신에만 필요하고 없으면 None이다.
     tracking: TrackingParameters = TrackingParameters()
     console: Optional[Endpoint] = None
     simulator: Optional[Endpoint] = None
+    beam: BeamGeometry = BeamGeometry()
 
 
 class ConfigError(ValueError):
@@ -110,6 +156,22 @@ def read_tracking_parameters(values: Dict[str, str]) -> TrackingParameters:
     return TrackingParameters(**fields)
 
 
+def read_beam_geometry(values: Dict[str, str]) -> BeamGeometry:
+    """값이 있는 BEAM_* 키만 읽고 나머지는 기본값을 쓴다."""
+    defaults = BeamGeometry()
+    fields = {}
+    for name, key in BEAM_KEYS.items():
+        text = values.get(key, "")
+        if not text:
+            continue
+        value_type = type(getattr(defaults, name))
+        try:
+            fields[name] = value_type(text)
+        except ValueError as error:
+            raise ConfigError(f"invalid {key}: {text}") from error
+    return BeamGeometry(**fields)
+
+
 def _require(values: Dict[str, str], key: str) -> str:
     value = values.get(key, "")
     if not value:
@@ -145,7 +207,7 @@ def load_config(
 
     return MonitorConfig(server_endpoint, local_endpoint, read_tracking_parameters(values),
                          _optional_endpoint(values, "COMM_OPERATOR_CONSOLE"),
-                         _optional_endpoint(values, "COMM_SCENARIO_SIMULATOR"))
+                         _optional_endpoint(values, "COMM_SCENARIO_SIMULATOR"), read_beam_geometry(values))
 
 
 def _optional_endpoint(values: Dict[str, str], prefix: str) -> Optional[Endpoint]:

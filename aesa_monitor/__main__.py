@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from aesa_monitor.core.config import ConfigError, MonitorConfig, TrackingParameters, load_config
+from aesa_monitor.core.config import BeamGeometry, ConfigError, MonitorConfig, TrackingParameters, load_config
 from aesa_monitor.core.events import PEER_CONSOLE, PEER_SIMULATOR, Event
 from aesa_monitor.core.protocol import BeamType, MessageId
 from aesa_monitor.core.settings import DATA_SOURCES, DEFAULT_SETTINGS_PATH, load_settings
@@ -97,10 +97,10 @@ def summarize(state: MonitorState) -> str:
     )
 
 
-def print_stats(path: Path, parameters: TrackingParameters) -> int:
+def print_stats(path: Path, parameters: TrackingParameters, beam: Optional[BeamGeometry] = None) -> int:
     from aesa_monitor.io.session import load_session
 
-    session = load_session(path, parameters)
+    session = load_session(path, parameters, beam)
     for line in session.describe():
         print(line)
     report = session.report
@@ -150,7 +150,8 @@ def main(arguments: Optional[List[str]] = None) -> int:
         offline = True
 
     if options.stats is not None:
-        return print_stats(options.stats, config.tracking if config else TrackingParameters())
+        return print_stats(options.stats, config.tracking if config else TrackingParameters(),
+                           config.beam if config else None)
 
     from aesa_monitor.io.connection import create_source
 

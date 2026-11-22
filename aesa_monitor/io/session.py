@@ -5,6 +5,9 @@
 - 아무 폴더: *.aesarec, adp_*.log, adp_detection_*.csv, logs/ 아래 파일
 - 녹화 파일 하나, 처리부 로그 파일 하나
 - 캡처 파일 하나(*.pcap, *.pcapng, *.cap): 통신 캡처로 받은 것처럼 재생한다
+
+녹화가 없고 탐지 CSV가 있으면 처리부 로그로 재생 이벤트를 만들어(io/log_replay.py) 녹화처럼 재생한다.
+이때 빔 방향·트랙 목록·레이더 정면은 모니터 추정이고, 통계는 탐지 CSV에서 바로 계산한다.
 """
 
 from __future__ import annotations
@@ -13,11 +16,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from aesa_monitor.core.config import TrackingParameters
+from aesa_monitor.core.config import BeamGeometry, TrackingParameters
 from aesa_monitor.core.problems import BAD, CATEGORY_LOG, WARN, Problem, level_counts, scan_events
 from aesa_monitor.core.stats import StatsReport, compute_stats, records_from_csv, records_from_events
 from aesa_monitor.io.bookmarks import Bookmark, BookmarkError, bookmark_path, load_bookmarks, save_bookmarks
 from aesa_monitor.io.capture import is_capture_file, read_capture_file
+from aesa_monitor.io.log_replay import LogRecording, build_log_recording
 from aesa_monitor.io.pcap import PcapError
 from aesa_monitor.io.processor_log import (
     CATEGORY_PROBLEM, CATEGORY_REJECTED, DetectionLog, MessageLog, ProcessorRun, group_runs, read_detection_log,
@@ -31,6 +35,7 @@ from aesa_monitor.io.replay import ReplayPlayer
 class Session:
     path: Path
     parameters: TrackingParameters
+    beam: BeamGeometry = field(default_factory=BeamGeometry)
     recording: Optional[Recording] = None
     player: Optional[ReplayPlayer] = None
     runs: List[ProcessorRun] = field(default_factory=list)
@@ -43,6 +48,11 @@ class Session:
     # 녹화를 처음부터 다시 계산해 찾은 문제(core/problems.py). 녹화가 없으면 비어 있다.
     recording_problems: List[Problem] = field(default_factory=list)
     _problems: Optional[List[Problem]] = field(default=None, repr=False)
+
+    @property
+    def is_log_replay(self) -> bool:
+        """녹화 없이 처리부 로그로 만든 재생인지."""
+        return isinstance(self.recording, LogRecording)
 
     def compute_problems(self) -> None:
         if self.player is None:
@@ -122,10 +132,22 @@ class Session:
                     self.detection_log = read_detection_log(self.run.detection_log)
                 except (OSError, ValueError) as error:
                     self.errors.append(f"탐지 CSV를 읽지 못함: {error}")
+        if self.recording is None or self.is_log_replay:
+            self._build_log_replay()
         self.compute()
 
+    def _build_log_replay(self) -> None:
+        """녹화가 없으면 고른 실행의 탐지 CSV(와 메시지 로그)로 재생을 만든다. 실행을 바꾸면 다시 만든다."""
+        self.recording = None
+        self.player = None
+        if self.detection_log is None or not self.detection_log.detections:
+            return
+        self.recording = build_log_recording(self.detection_log, self.message_log, self.beam, self.parameters)
+        self.player = ReplayPlayer(self.recording)
+        self.compute_problems()
+
     def compute(self) -> None:
-        if self.player is not None:
+        if self.player is not None and not self.is_log_replay:
             records, extra = records_from_events(self.player.events)
             kind = "캡처 파일" if is_capture_file(self.recording.path) else "모니터 녹화"
             source = f"{kind} {self.recording.path.name}"
@@ -139,7 +161,7 @@ class Session:
 
     def describe(self) -> List[str]:
         lines = [f"세션: {self.path}"]
-        if self.recording is not None:
+        if self.recording is not None and not self.is_log_replay:
             truncated = " (끝이 잘림: 녹화 중이었거나 비정상 종료)" if self.recording.truncated else ""
             lines.append(f"녹화: {self.recording.path.name}, {self.recording.duration_s:.1f} s, "
                          f"레코드 {len(self.recording.records)}개{truncated}")
@@ -153,6 +175,12 @@ class Session:
                                  f"뺀 모니터 연결 {meta['excluded_monitor_connections']}")
                 elif "capture_command" in meta:
                     lines.append(f"  통신 캡처: {meta['capture_command']}")
+        elif self.is_log_replay:
+            lines.append("녹화: 없음 — 처리부 로그로 재생 (빔 방향·트랙 위치는 탐지 CSV로 만든 모니터 추정, 통신 기록 없음)")
+            assert isinstance(self.recording, LogRecording)
+            if self.recording.fit is not None:
+                lines.append(f"  {self.recording.fit.describe()}")
+            lines.extend(f"  {note}" for note in self.recording.notes)
         else:
             lines.append("녹화: 없음 (재생은 할 수 없고 처리부 로그로만 분석)")
         if self.run is not None:
@@ -166,9 +194,9 @@ class Session:
         return lines
 
 
-def load_session(path: Path, parameters: TrackingParameters) -> Session:
+def load_session(path: Path, parameters: TrackingParameters, beam: Optional[BeamGeometry] = None) -> Session:
     path = Path(path).expanduser()
-    session = Session(path, parameters)
+    session = Session(path, parameters, beam or BeamGeometry())
     recording_path: Optional[Path] = None
     log_files: List[Path] = []
     if path.is_dir():
@@ -211,6 +239,7 @@ def load_session(path: Path, parameters: TrackingParameters) -> Session:
         session.select_run(index)
     else:
         session.compute()
-    session.compute_problems()
+    if not session.is_log_replay:  # 로그 재생은 select_run()에서 이미 계산했다
+        session.compute_problems()
     session.load_bookmarks()
     return session
