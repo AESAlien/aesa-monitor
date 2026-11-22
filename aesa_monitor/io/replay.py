@@ -58,7 +58,7 @@ class ReplayPlayer:
             self._processor_index.append((processor_ms, time_s, segment))
 
     def _new_state(self) -> MonitorState:
-        return MonitorState(clock=lambda: self.position_s)
+        return MonitorState(clock=lambda: self.position_s, full_tracking_history=True)
 
     # 조작
 

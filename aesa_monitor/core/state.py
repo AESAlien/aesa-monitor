@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 from aesa_monitor.core.events import (
-    PEER_CONSOLE, PEER_NAMES, PEER_SIMULATOR, SOURCE_CAPTURE, SOURCE_COPY, ConnectionChanged, Event,
+    PEER_CONSOLE, PEER_NAMES, PEER_SIMULATOR, SOURCE_CAPTURE, SOURCE_COPY, SOURCE_LOG, ConnectionChanged, Event,
     PeerLinkChanged,
 )
 from aesa_monitor.core.frames import FrameCounter
@@ -24,7 +24,7 @@ from aesa_monitor.core.protocol import (
     Beam, BeamType, Detection, MonitorStatus, OperatorControl, RadarAttitude, SimulatorAttitude, Track,
     TrackDeletion, TrackList,
 )
-from aesa_monitor.core.tracking import TrackingHistory
+from aesa_monitor.core.tracking import CYCLE_HISTORY_SIZE, TrackingHistory
 from aesa_monitor.core.traffic import MessageTraffic
 
 BEAM_HISTORY_SIZE = 5000
@@ -88,8 +88,11 @@ class ViewMode:
 
 
 class MonitorState:
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, clock: Callable[[], float] = time.monotonic, full_tracking_history: bool = False) -> None:
         self.clock = clock
+        # True면 트랙마다 추적 사이클을 버리지 않고 모두 남긴다(재생용: 추적 탭이 처음부터 재생 위치까지 경로를 그린다).
+        # 실시간은 오래 켜 두므로 트랙마다 최근 CYCLE_HISTORY_SIZE개만 남긴다.
+        self.full_tracking_history = full_tracking_history
         self.connected = False
         self.connection_detail = "connecting"
         # 데이터 출처(복사본/캡처). ConnectionChanged가 알려준다.
@@ -108,7 +111,7 @@ class MonitorState:
         self._azimuth_reference: Optional[float] = None
         self._last_search_interval_ms: Optional[int] = None
         self._latest_beam_ms: Optional[int] = None
-        self.tracking = TrackingHistory()
+        self.tracking = TrackingHistory(None if full_tracking_history else CYCLE_HISTORY_SIZE)
         self.traffic = MessageTraffic(clock)
         self.connect_count = 0
         self.connected_since: Optional[float] = None
@@ -158,7 +161,10 @@ class MonitorState:
             self.tracking.apply_tracks(event.tracks)
         elif isinstance(event, RadarAttitude):
             if self.attitude is None or self.attitude != event:
-                self._log(f"레이더 자세 수신 (yaw {event.yaw_deg:.2f}°)", "info", received_at)
+                if self.source == SOURCE_LOG:
+                    self._log(f"레이더 정면 {event.yaw_deg:.2f}° (탐색 탐지로 추정, 로그에 자세 없음)", "info", received_at)
+                else:
+                    self._log(f"레이더 자세 수신 (yaw {event.yaw_deg:.2f}°)", "info", received_at)
             self.attitude = event
         elif isinstance(event, MonitorStatus):
             self._apply_status(event, received_at)
@@ -196,7 +202,10 @@ class MonitorState:
             self.operator_control = None
             self.connect_count += 1
             self.connected_since = self._now(received_at)
-            self._log("캡처 시작" if capture else "처리부에 연결됨", "ok", received_at)
+            text = "캡처 시작" if capture else "처리부에 연결됨"
+            if event.source == SOURCE_LOG:
+                text = "처리부 로그 재생 시작 (녹화 없음, 탐지 CSV로 만든 빔·탐지·트랙 목록)"
+            self._log(text, "ok", received_at)
         elif not event.connected:
             if self.connected or self.connect_count == 0:
                 detail = f" ({event.detail})" if event.detail else ""

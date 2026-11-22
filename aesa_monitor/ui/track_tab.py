@@ -6,16 +6,21 @@
 사이클 상세(① 예측 ② 관측·연관 ③ 결과, 빔 단면)는 모니터 추정이 섞여 있어 접어 두고, 열면 전시기 칸만 덮는다(사후 분석용).
 
 처리부 내부 값(예측 거리, 공분산, NDS 점수)은 받지 않으므로 잔차와 연관 탐지는 모니터의 추정이다.
+
+재생(분석) 중에는 재생 위치까지 나온 모든 트랙(종료 포함)의 처음부터 지금까지 경로를 선과 갱신 점으로 그린다.
+처리부 로그 재생(io/log_replay.py)은 빔 방향을 탐지 방향으로 대신하므로 잔차·빔 안 위치를 계산하지 않는다.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from aesa_monitor.core.config import TrackingParameters
+from aesa_monitor.core.events import SOURCE_LOG
 from aesa_monitor.core.geometry import wrap_degrees
 from aesa_monitor.core.protocol import BeamType
 from aesa_monitor.core.state import MonitorState
@@ -36,7 +41,9 @@ from aesa_monitor.ui.widgets import (
 )
 
 OUTCOME_COLORS = {Outcome.PENDING: UNKNOWN, Outcome.UPDATED: OK, Outcome.MISSED: WARN, Outcome.ENDED: BAD}
-MAP_TRAIL_CYCLES = 30
+MAP_TRAIL_CYCLES = 30         # 실시간 꼬리 사이클 수. 재생 중에는 처음부터 다 그린다
+TRAIL_DOT_SPACING_PX = 6      # 재생 경로의 갱신 점 사이 최소 간격(점이 겹쳐 뭉개지지 않게, 그리는 개수도 줄인다)
+TRAIL_LINE_STEP_PX = 1.5      # 이보다 가까운 경로 점은 선에서 건너뛴다(긴 녹화에서 그리기 비용을 줄인다)
 TREND_CYCLES = 60            # 추이 그래프 사이클 수
 SECTOR_HALF_SPAN = 70.0      # 섹터 보기: 레이더 정면 ±70°
 SEARCH_GLOW_MS = 50          # 탐색 빔 잔상. 10 ms마다 약 4°씩 움직여 길게 두면 넓은 부채꼴이 화면을 덮는다
@@ -56,6 +63,10 @@ HELP_MAP = (
     f"탐색은 최근 {SEARCH_GLOW_MS} ms, 확인·추적은 최근 {REQUEST_GLOW_MS / 1000:g}초를 그립니다.\n"
     f"• ■ 트랙(처리부 트랙 목록 위치), 꼬리는 최근 {MAP_TRAIL_CYCLES}사이클의 갱신 위치, "
     f"선은 {VECTOR_SECONDS}초 뒤 위치(속도 벡터). 글자는 #ID 거리(경사 거리)·속력입니다. × 는 종료된 트랙입니다.\n"
+    "• 재생(분석) 중에는 재생 위치까지 나온 모든 트랙(종료된 트랙은 점선)의 처음부터 지금까지 경로를 선과 갱신 점(●)으로 "
+    "그립니다. 재생 위치를 뒤로 옮기면 그 시점까지로 줄어듭니다. 종료된 트랙도 눌러 고를 수 있습니다.\n"
+    "• 처리부 로그 재생(녹화 없음)에서는 트랙 위치가 처리부 추정이 아니라 탐지(측정) 위치이고, 레이더 정면은 탐색 탐지로 "
+    "맞춘 추정입니다.\n"
     "• 고각은 표현하지 않습니다(빔 탭의 빔 방향 지도에서 봅니다).\n\n"
     "트랙을 누르면 그 트랙을 고릅니다."
 )
@@ -422,7 +433,11 @@ class CycleDetailPanel:
     def refresh(self, state: MonitorState) -> None:
         history = state.tracking
         cycles = history.cycles(self.track_id) if self.track_id is not None else []
-        self._title.configure(text="사이클 상세" if self.track_id is None else f"사이클 상세 — 트랙 #{self.track_id}")
+        title = "사이클 상세" if self.track_id is None else f"사이클 상세 — 트랙 #{self.track_id}"
+        if state.source == SOURCE_LOG:
+            # 로그 재생의 '예측'은 처리부 빔 방향이 아니라 탐지 방향(탐지가 없으면 등속 외삽)이다.
+            title += " · 로그 재생: ① 빔 방향은 탐지로 대신한 추정"
+        self._title.configure(text=title)
         if not cycles:
             self.cycle_time_ms = None
             self._cycle_label.configure(text="트랙을 기다리는 중 (확인·추적 빔의 탐지 결과가 필요합니다)",
@@ -689,10 +704,18 @@ class TrackTab:
         self._verdict.set(track_verdict(state, self._parameters))
         history = state.tracking
         self._rows = track_status_rows(history, state.now_ms())
+        if state.source == SOURCE_LOG:
+            # 로그 재생의 빔 방향은 탐지 방향이라 빔 안 위치가 늘 0이다. 처리부 값처럼 보이지 않게 뺀다.
+            self._rows = [dataclasses.replace(row, beam_offset=None, offset_note="로그")
+                          if row.beam_offset is not None else row for row in self._rows]
         shown = [row.track_id for row in self._rows]
         previous = self._track_id
+        keep = set(shown)
+        if state.full_tracking_history:
+            # 재생 중에는 지도에 모든 트랙 경로가 있으므로 종료된 트랙을 골라도 그대로 둔다.
+            keep.update(history.track_ids())
         # 고른 트랙이 상태 줄에서 빠지면(종료 뒤 1분, 재생 위치 이동) 맨 위 살아 있는 트랙으로 옮긴다.
-        if self._track_id not in shown:
+        if self._track_id not in keep:
             active = [row.track_id for row in self._rows if row.alive]
             track_ids = history.track_ids()
             if active or shown:
@@ -740,6 +763,11 @@ class TrackTab:
         if not all_cycles:
             self._trend_title.configure(text="잔차 추이 (예측−측정, 참값 오차 아님)")
             empty_message(canvas, "트랙을 기다리는 중 (확인·추적 빔의 탐지 결과가 필요합니다)")
+            return
+        if state.source == SOURCE_LOG:
+            self._trend_title.configure(text=f"트랙 #{self._track_id} 잔차 (예측−측정, 참값 오차 아님)")
+            empty_message(canvas, "처리부 로그 재생: 로그에 처리부 예측 방향이 없어 잔차를 그리지 않습니다. "
+                                  "사이클별 갱신·미탐은 상태 줄과 '사이클 상세 ▸'에서 봅니다.")
             return
         start = max(len(all_cycles) - TREND_CYCLES, 0)
         cycles = all_cycles[start:]
@@ -861,13 +889,18 @@ class TrackTab:
         line = text_height()
 
         # 위쪽 범례 줄(넘치면 다음 줄로).
+        full = state.full_tracking_history
         if attitude is None:
             info = "레이더 자세 없음 · 정면 0°로 가정" if sector else "북쪽 위 · 레이더 자세 없음"
         else:
             info = f"레이더 정면 {yaw:.1f}° 위쪽" if sector else f"북쪽 위 · 레이더 정면 {yaw:.1f}°"
-        legend = [(info, MUTED), ("▬ 탐색", BEAM_COLORS[BeamType.SEARCH]),
+        if state.source == SOURCE_LOG:
+            info = f"로그 재생(추정) · {info}"
+        legend = [(info, WARN if state.source == SOURCE_LOG else MUTED), ("▬ 탐색", BEAM_COLORS[BeamType.SEARCH]),
                   ("▬ 확인", BEAM_COLORS[BeamType.CONFIRMATION]), ("▬ 추적", BEAM_COLORS[BeamType.TRACKING]),
                   ("┅ 추적 영역 ±60°", MUTED), (f"■ 트랙 ─ {VECTOR_SECONDS}초 속도 벡터", TEXT)]
+        if full:
+            legend.append(("●─ 지나온 경로(처음부터)", TEXT))
         x, y = 4.0, 2.0
         for text, color in legend:
             text_w = text_width(text)
@@ -893,11 +926,14 @@ class TrackTab:
             radius_px = min(width / 2 - pad_x, (height - area_top) / 2 - pad_y)
         radius_px = max(radius_px, 40.0)
 
-        # 상태 줄과 같은 트랙(살아 있는 트랙 + 최근 종료)만 그린다. 오래전 종료된 트랙은 지도를 어지럽힌다.
+        # 실시간: 상태 줄과 같은 트랙(살아 있는 트랙 + 최근 종료)의 최근 사이클만 그린다(오래 켜 두면 지도를 어지럽힌다).
+        # 재생: 재생 위치까지 나온 모든 트랙의 처음부터 지금까지 경로를 그린다(사후 분석).
         trails = {}
-        for track_id in [row.track_id for row in self._rows]:
-            points = [track_position(cycle.estimate) for cycle in history.cycles(track_id)[-MAP_TRAIL_CYCLES:]
-                      if cycle.estimate is not None]
+        for track_id in (history.track_ids() if full else [row.track_id for row in self._rows]):
+            cycles = history.cycles(track_id)
+            if not full:
+                cycles = cycles[-MAP_TRAIL_CYCLES:]
+            points = [cycle.estimate_position for cycle in cycles if cycle.estimate_position is not None]
             if track_id in history.latest_tracks:
                 points.append(track_position(history.latest_tracks[track_id]))
             if points:
@@ -922,6 +958,18 @@ class TrackTab:
 
         def visible(azimuth: float) -> bool:
             return not sector or abs(wrap_degrees(azimuth - yaw)) <= SECTOR_HALF_SPAN
+
+        # 경로 점은 많으므로(재생은 처음부터) 삼각함수 없이 회전만으로 화면 좌표를 낸다. to_xy·visible과 같은 결과다.
+        cos_r, sin_r = math.cos(math.radians(rotation)), math.sin(math.radians(rotation))
+        tan_half = math.tan(math.radians(SECTOR_HALF_SPAN))
+
+        def project(east: float, north: float) -> Optional[Tuple[float, float]]:
+            """km 좌표의 화면 위치. 섹터 보기에서 섹터 밖이면 None."""
+            right = east * cos_r - north * sin_r      # 화면 오른쪽(회전한 동쪽)
+            ahead = north * cos_r + east * sin_r      # 화면 위쪽(회전한 북쪽 = 섹터 가운데)
+            if sector and (ahead <= 0 or abs(right) > ahead * tan_half):
+                return None
+            return center_x + right * scale, center_y - ahead * scale
 
         placer = LabelPlacer(canvas, (0, area_top, width, height))
 
@@ -1013,16 +1061,30 @@ class TrackTab:
                 continue
             color = track_color(track_id) if alive else CANDIDATE_COLOR
             chosen = track_id == self._track_id
-            coordinates = [to_xy(e, n) if visible(math.degrees(math.atan2(e, n))) else None for e, n in points]
+            coordinates = [project(e, n) for e, n in points]
             segment: List[float] = []
-            for point in coordinates + [None]:
+            for index, point in enumerate(coordinates + [None]):
                 if point is None:
                     if len(segment) >= 4:
                         canvas.create_line(*segment, fill=color, width=2 if chosen else 1,
                                            dash=() if alive else (3, 3))
                     segment = []
+                elif (segment and index < len(coordinates) - 1 and abs(point[0] - segment[-2]) < TRAIL_LINE_STEP_PX
+                      and abs(point[1] - segment[-1]) < TRAIL_LINE_STEP_PX):
+                    continue  # 화면에서 거의 같은 자리(마지막 점은 늘 남긴다)
                 else:
                     segment.extend(point)
+            if full:
+                # 갱신 위치 점. 가까운 점은 건너뛰어 겹쳐 뭉개지지 않게 한다(마지막 위치는 트랙 기호가 덮는다).
+                dot = 3 if chosen else 2
+                last: Optional[Tuple[float, float]] = None
+                for point in coordinates[:-1]:
+                    if point is None or (last is not None and math.hypot(point[0] - last[0], point[1] - last[1])
+                                         < TRAIL_DOT_SPACING_PX):
+                        continue
+                    canvas.create_oval(point[0] - dot, point[1] - dot, point[0] + dot, point[1] + dot,
+                                       fill=color, outline="")
+                    last = point
             x, y = coordinates[-1]
             track = history.latest_tracks.get(track_id)
             if track is not None:

@@ -324,7 +324,9 @@ class AnalysisTab:
         recording = session.recording
         text = session.path.name
         if recording is not None:
-            text += f" · 녹화 {recording.duration_s:.1f} s"
+            # 녹화가 없으면 처리부 로그(탐지 CSV)로 만든 재생이다(io/log_replay.py).
+            kind = "로그 재생(녹화 없음)" if session.is_log_replay else "녹화"
+            text += f" · {kind} {recording.duration_s:.1f} s"
         if not session.runs:
             text += " · 처리부 로그 없음"
         # 자세한 내용은 (?)에 두지만, 놓치면 안 되는 경고는 한 줄에 남긴다(예전에는 세션 정보 4~5줄에 늘 보였다).
@@ -655,8 +657,11 @@ class AnalysisTab:
         counts = level_counts(source)
         title = f"문제 ({counts['bad'] + counts['warn']})" if source else "문제"
         self._lists.tab(self._problem_page, text=title)
-        origin = "녹화에서 다시 계산" if self._session is not None and self._session.player is not None else (
-            "처리부 로그" if self._session is not None else "실시간")
+        if self._session is not None and self._session.is_log_replay:
+            origin = "처리부 로그로 만든 재생에서 다시 계산"
+        else:
+            origin = "녹화에서 다시 계산" if self._session is not None and self._session.player is not None else (
+                "처리부 로그" if self._session is not None else "실시간")
         self._problem_summary.configure(text=f"이상 {counts['bad']} · 주의 {counts['warn']} · {origin}")
         self._set_page_titles()
         self._draw_timeline()
@@ -837,7 +842,8 @@ class AnalysisTab:
         if recording_range:
             canvas.create_rectangle(to_x(recording_range[0]), 2, to_x(recording_range[1]), band - 2,
                                     fill=GRID_LINE, outline="")
-            canvas.create_text(left - 8, band / 2, text="녹화", anchor="e", fill=MUTED, font=FONT_SMALL)
+            canvas.create_text(left - 8, band / 2, text="로그" if self._session is not None and self._session.is_log_replay
+                               else "녹화", anchor="e", fill=MUTED, font=FONT_SMALL)
         for index, lane in enumerate(TIMELINE_LANES):
             top = lanes_top + index * lane_height
             canvas.create_rectangle(left, top + 1, right, top + lane_height - 1, fill=PANEL, outline="")
